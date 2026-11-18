@@ -9,6 +9,7 @@
     "cargo_manifests": [
       "Cargo.toml",
       "crates/barge-cli/Cargo.toml",
+      "crates/barged/Cargo.toml",
       "crates/barge-machine/Cargo.toml",
       "crates/barge/Cargo.toml"
     ],

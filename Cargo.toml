@@ -1,7 +1,7 @@
 # Barge's workspace: one library that holds every mechanic and one thin CLI
 # over it (docs/knowledge/architecture.md, "Library surface").
 [workspace]
-members = ["crates/barge", "crates/barge-cli", "crates/barge-machine"]
+members = ["crates/barge", "crates/barge-cli", "crates/barge-machine", "crates/barged"]
 resolver = "2"
 
 [workspace.package]

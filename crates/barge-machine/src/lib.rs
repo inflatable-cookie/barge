@@ -1,5 +1,5 @@
-//! Machine records, Wake-on-LAN and the JSON types shared with `barged`.
-
+//! Machine records, Wake-on-LAN, the JSON types shared with `barged` and the
+//! daemon client.
 #![cfg_attr(
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
@@ -13,13 +13,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+pub mod daemon;
+
+pub use daemon::{request_power, AssumeYes, Confirmation, DaemonClient};
+
 pub const REGISTRY_SCHEMA: &str = "barge.machines/1";
 pub const STATE_SCHEMA: &str = "barge.machine-state/1";
 pub const POWER_ACTION_SCHEMA: &str = "barge.power-action/1";
 pub const POWER_REQUEST_SCHEMA: &str = "barge.power-request/1";
+pub const POWER_RESULT_SCHEMA: &str = "barge.power-result/1";
 pub const CANCEL_SCHEMA: &str = "barge.power-cancel/1";
+pub const CANCEL_RESULT_SCHEMA: &str = "barge.power-cancel-result/1";
+pub const DAEMON_ERROR_SCHEMA: &str = "barge.daemon-error/1";
 const DEFAULT_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
 const DEFAULT_PORT: u16 = 9;
+/// `barged`'s default port. The daemon's config names the address it binds; the
+/// registry names the port it dials, so either side can be moved deliberately.
+pub const DEFAULT_DAEMON_PORT: u16 = 9777;
+/// Power commands default to the countdown MoonDeck Remote used.
+pub const DEFAULT_POWER_DELAY_S: u32 = 15;
+/// A countdown longer than this is a mistake, not a schedule.
+pub const MAX_POWER_DELAY_S: u32 = 3600;
 static PUBLISH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// One registered machine and its LAN wake destination.
@@ -32,6 +46,14 @@ pub struct Machine {
     pub mac: String,
     pub broadcast: Ipv4Addr,
     pub port: u16,
+    /// The port `barged` listens on. Records written before step 2 read as the
+    /// default, so an existing registry keeps working.
+    #[serde(default = "default_daemon_port")]
+    pub daemon_port: u16,
+}
+
+fn default_daemon_port() -> u16 {
+    DEFAULT_DAEMON_PORT
 }
 
 impl Machine {
@@ -49,6 +71,7 @@ impl Machine {
             mac: format_mac(parse_mac(mac)?),
             broadcast: DEFAULT_BROADCAST,
             port: DEFAULT_PORT,
+            daemon_port: DEFAULT_DAEMON_PORT,
         })
     }
 
@@ -66,15 +89,28 @@ impl Machine {
         self.port = value;
         self
     }
+
+    pub fn daemon_port(mut self, value: u16) -> Self {
+        self.daemon_port = value;
+        self
+    }
+
+    /// The host a client dials: the tailnet name when one is recorded.
+    pub fn daemon_host(&self) -> &str {
+        self.tailscale_name.as_deref().unwrap_or(&self.hostname)
+    }
 }
 
-/// Machine state reported by the future daemon.
+/// Machine state reported by `barged`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
     pub schema: String,
     pub power: PowerState,
     pub observed_at_unix_ms: u64,
+    /// The action counting down, when one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Pending>,
 }
 
 impl State {
@@ -83,8 +119,22 @@ impl State {
             schema: STATE_SCHEMA.to_string(),
             power,
             observed_at_unix_ms,
+            pending: None,
         }
     }
+
+    pub fn with_pending(mut self, pending: Option<Pending>) -> Self {
+        self.pending = pending;
+        self
+    }
+}
+
+/// A power action that will fire when its deadline passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pending {
+    pub action: PowerActionKind,
+    pub deadline_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +168,72 @@ pub enum PowerActionKind {
     Sleep,
     Restart,
     Shutdown,
+}
+
+impl PowerActionKind {
+    /// The stable snake_case name used in documents and messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sleep => "sleep",
+            Self::Restart => "restart",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// The daemon's acceptance of a power request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PowerResult {
+    pub schema: String,
+    pub action: PowerActionKind,
+    pub deadline_unix_ms: u64,
+}
+
+impl PowerResult {
+    pub fn new(action: PowerActionKind, deadline_unix_ms: u64) -> Self {
+        Self {
+            schema: POWER_RESULT_SCHEMA.to_string(),
+            action,
+            deadline_unix_ms,
+        }
+    }
+}
+
+/// The daemon's answer to a cancel: whether a countdown was stopped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelResult {
+    pub schema: String,
+    pub cancelled: bool,
+}
+
+impl CancelResult {
+    pub fn new(cancelled: bool) -> Self {
+        Self {
+            schema: CANCEL_RESULT_SCHEMA.to_string(),
+            cancelled,
+        }
+    }
+}
+
+/// The daemon's error document; every non-2xx response carries one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonError {
+    pub schema: String,
+    pub error: String,
+    pub message: String,
+}
+
+impl DaemonError {
+    pub fn new(error: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            schema: DAEMON_ERROR_SCHEMA.to_string(),
+            error: error.into(),
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +314,9 @@ pub enum ErrorKind {
     NotFound,
     Io,
     UnknownState,
+    /// The machine's daemon could not be reached. Distinct from every state a
+    /// daemon can report, so an absent daemon is never read as asleep.
+    Unreachable,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -362,6 +481,12 @@ fn validate_machine(machine: &Machine) -> Result<()> {
         return Err(Error::new(
             ErrorKind::UnknownState,
             "registered WoL port must be 1-65535",
+        ));
+    }
+    if machine.daemon_port == 0 {
+        return Err(Error::new(
+            ErrorKind::UnknownState,
+            "registered daemon port must be 1-65535",
         ));
     }
     let parsed = parse_mac(&machine.mac)
@@ -625,25 +750,76 @@ mod tests {
     #[test]
     fn protocol_documents_round_trip_with_schema() {
         let docs = [
-            serde_json::to_value(State::new(PowerState::Awake, 42)).unwrap(),
+            serde_json::to_value(
+                State::new(PowerState::Awake, 42).with_pending(Some(Pending {
+                    action: PowerActionKind::Sleep,
+                    deadline_unix_ms: 15_042,
+                })),
+            )
+            .unwrap(),
+            serde_json::to_value(State::new(PowerState::Asleep, 42)).unwrap(),
             serde_json::to_value(PowerAction::new(PowerActionKind::Sleep)).unwrap(),
             serde_json::to_value(PowerRequest::new(PowerActionKind::Shutdown, 15)).unwrap(),
+            serde_json::to_value(PowerResult::new(PowerActionKind::Restart, 15_000)).unwrap(),
             serde_json::to_value(Cancel::default()).unwrap(),
+            serde_json::to_value(CancelResult::new(true)).unwrap(),
+            serde_json::to_value(DaemonError::new("not_authorized", "no")).unwrap(),
         ];
         for document in &docs {
             assert!(document.get("schema").is_some());
         }
         let state: State = serde_json::from_value(docs[0].clone()).unwrap();
-        let action: PowerAction = serde_json::from_value(docs[1].clone()).unwrap();
-        let request: PowerRequest = serde_json::from_value(docs[2].clone()).unwrap();
-        let cancel: Cancel = serde_json::from_value(docs[3].clone()).unwrap();
+        let no_pending: State = serde_json::from_value(docs[1].clone()).unwrap();
+        let action: PowerAction = serde_json::from_value(docs[2].clone()).unwrap();
+        let request: PowerRequest = serde_json::from_value(docs[3].clone()).unwrap();
+        let result: PowerResult = serde_json::from_value(docs[4].clone()).unwrap();
+        let cancel: Cancel = serde_json::from_value(docs[5].clone()).unwrap();
+        let cancelled: CancelResult = serde_json::from_value(docs[6].clone()).unwrap();
+        let error: DaemonError = serde_json::from_value(docs[7].clone()).unwrap();
+        assert_eq!(state.schema, STATE_SCHEMA);
         assert_eq!(state.observed_at_unix_ms, 42);
+        assert_eq!(
+            state.pending,
+            Some(Pending {
+                action: PowerActionKind::Sleep,
+                deadline_unix_ms: 15_042,
+            })
+        );
+        assert_eq!(no_pending.pending, None);
+        assert!(docs[1].get("pending").is_none());
         assert_eq!(action.action, PowerActionKind::Sleep);
         assert_eq!(request.delay_s, 15);
+        assert_eq!(result.schema, POWER_RESULT_SCHEMA);
+        assert_eq!(result.action, PowerActionKind::Restart);
         assert_eq!(cancel, Cancel::default());
+        assert_eq!(cancelled.schema, CANCEL_RESULT_SCHEMA);
+        assert!(cancelled.cancelled);
+        assert_eq!(error.schema, DAEMON_ERROR_SCHEMA);
+        assert_eq!(error.error, "not_authorized");
         assert_eq!(serde_json::to_value(state).unwrap(), docs[0]);
-        assert_eq!(serde_json::to_value(action).unwrap(), docs[1]);
-        assert_eq!(serde_json::to_value(request).unwrap(), docs[2]);
-        assert_eq!(serde_json::to_value(cancel).unwrap(), docs[3]);
+        assert_eq!(serde_json::to_value(no_pending).unwrap(), docs[1]);
+        assert_eq!(serde_json::to_value(action).unwrap(), docs[2]);
+        assert_eq!(serde_json::to_value(request).unwrap(), docs[3]);
+        assert_eq!(serde_json::to_value(result).unwrap(), docs[4]);
+        assert_eq!(serde_json::to_value(cancel).unwrap(), docs[5]);
+        assert_eq!(serde_json::to_value(cancelled).unwrap(), docs[6]);
+        assert_eq!(serde_json::to_value(error).unwrap(), docs[7]);
+    }
+
+    #[test]
+    fn a_record_written_before_step_two_reads_the_default_daemon_port() {
+        let document = serde_json::json!({
+            "name": "living-room",
+            "hostname": "pc.local",
+            "tailscale_name": null,
+            "mac": "00:11:22:33:44:ff",
+            "broadcast": "255.255.255.255",
+            "port": 9,
+        });
+        let machine: Machine = serde_json::from_value(document).unwrap();
+        assert_eq!(machine.daemon_port, DEFAULT_DAEMON_PORT);
+        assert_eq!(machine.daemon_host(), "pc.local");
+        let round_trip = serde_json::to_value(&machine).unwrap();
+        assert_eq!(round_trip["daemon_port"], DEFAULT_DAEMON_PORT);
     }
 }

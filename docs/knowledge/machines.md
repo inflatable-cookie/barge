@@ -1,7 +1,7 @@
 # Machines
 
-Status: design outline approved by Tom, 2026-11-18. Build step 1 is complete;
-later steps remain unbuilt.
+Status: design outline approved by Tom, 2026-11-18. Build steps 1 and 2 are
+complete; later steps remain unbuilt.
 
 Barge manages the machines it distributes resources across. The first is the
 Bazzite PC: wake it, see its state, and sleep, restart or shut it down. This
@@ -13,9 +13,11 @@ Remote menu-bar app ([vision](vision.md#direction)).
 - **`barge` CLI on the Mac:** `barge machine list|status|wake|sleep|restart|shutdown|cancel`.
   Wake-on-LAN is a client operation and needs nothing running on the PC.
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
-  power actions. On Bazzite it runs as a systemd service and asks logind over
+  power actions. On Bazzite it runs as a systemd user unit and asks logind over
   D-Bus for sleep, restart and shutdown, with a polkit rule granting only those
-  actions. It never runs a shell command it was sent.
+  actions. It never runs a shell command it was sent. It binds one configured
+  address — the machine's Tailscale address — and answers only nodes on the
+  allowlist in its config. [Install guide](../install-barged.md).
 - **Barge UI:** a fresh Tauri app (Tom, 2026-11-18). Machine control comes
   first. Storage, worktrees and resources join later in the same app.
 
@@ -37,14 +39,25 @@ for visual design:
 
 ## Protocol and trust
 
-- HTTP with JSON over the tailnet. `barged` listens only on its Tailscale
-  address, so the network decides who can reach it.
-- Authorisation: Tailscale identifies the caller's node and user. `barged`
-  accepts only nodes on an allowlist written at pairing, so no PIN flow is
-  needed. A paired client stores nothing secret beyond its tailnet identity.
+- HTTP with JSON over the tailnet. `barged` binds only the single address in
+  its config — the machine's Tailscale address — so the network decides who can
+  reach it. It refuses a wildcard bind.
+- Authorisation: Tailscale identifies the caller's node. `barged` asks
+  tailscaled's local API (`whois`) for the peer's node and accepts only nodes on
+  an allowlist written at pairing — by stable node ID or MagicDNS name — so no
+  PIN flow is needed. A paired client stores nothing secret beyond its tailnet
+  identity. An unidentifiable caller and a node off the allowlist are both
+  refused with `403`, before an endpoint runs.
 - Endpoints: `GET /v1/state`, `POST /v1/power` (`{action, delay_s}`),
   `POST /v1/power/cancel`. Every response carries a `schema` field, under the
-  same contract as the CLI's JSON.
+  same contract as the CLI's JSON; a non-2xx response is a
+  `barge.daemon-error/1` document. State reports the action counting down and
+  its deadline when one is pending, and a second action is refused `409` until
+  that countdown fires or is cancelled. The daemon's default port is `9777`, and
+  a registered machine records its own `daemon_port`.
+- Power never names a method: a request carries one of sleep, restart or
+  shutdown, and the daemon maps that closed set onto logind's `Suspend`,
+  `Reboot` and `PowerOff`. Countdowns are bounded at one hour.
 - Wake-on-LAN goes out on the LAN broadcast. Waking over Tailscale from
   outside the LAN is out of scope until a relay exists, for example another
   always-on device.
@@ -77,8 +90,11 @@ the build brief.
 
 1. **Built:** machine registry, Wake-on-LAN and protocol types in
    `barge-machine`; `barge machine add|list|remove|wake`.
-2. `barged`: state and power with countdown and cancel; systemd unit and
-   polkit rule; an install guide for Bazzite.
+2. **Built:** `barged`: state and power with countdown and cancel, the
+   allowlist and Tailscale `whois`, logind over D-Bus, the client in
+   `barge-machine`, `barge machine status|sleep|restart|shutdown|cancel`, the
+   systemd unit and polkit rule in `packaging/barged/`, and the
+   [install guide](../install-barged.md) for Bazzite.
 3. UI design pass: information architecture and visual system, for Tom's
    review.
 4. The Tauri app: Machines plus the menu-bar entry.

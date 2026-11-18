@@ -1,0 +1,24 @@
+// Grant barged exactly three logind actions, and nothing else.
+//
+// Install to /etc/polkit-1/rules.d/50-barged-power.rules (root) and replace
+// USER with the account the barged user unit runs as (docs/install-barged.md).
+//
+// logind authorises sleep, restart and shutdown through polkit. The daemon
+// calls each with interactive=false, so a rule is the only way to answer: this
+// one answers yes for those three action ids and leaves every other action to
+// polkit's normal handling.
+//
+// If the machine has a second active session, logind checks the
+// "-multiple-sessions" variant of each action (org.freedesktop.login1.suspend
+// -multiple-sessions, …). Add those three ids here in that case; do not widen
+// the rule to other actions.
+polkit.addRule(function (action, subject) {
+    var allowed = [
+        "org.freedesktop.login1.suspend",
+        "org.freedesktop.login1.reboot",
+        "org.freedesktop.login1.power-off"
+    ];
+    if (subject.user === "USER" && allowed.indexOf(action.id) !== -1) {
+        return polkit.Result.YES;
+    }
+});
