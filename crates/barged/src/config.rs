@@ -103,6 +103,21 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_example_is_valid_json_this_parser_accepts() {
+        // The guide says `cp packaging/barged/config.example.json …` and edit
+        // the values, so the shipped file has to be a document `Config::parse`
+        // takes as-is: JSON has no comments.
+        let example = include_bytes!("../../../packaging/barged/config.example.json");
+        let config = Config::parse(example).expect("the shipped example config parses");
+        assert_eq!(config.allowed_nodes.len(), 1);
+        assert!(!config.listen.ip().is_unspecified());
+        assert_eq!(
+            config.tailscale_socket,
+            PathBuf::from(DEFAULT_TAILSCALE_SOCKET)
+        );
+    }
+
+    #[test]
     fn a_wildcard_bind_an_empty_allowlist_and_stray_fields_are_refused() {
         for bytes in [
             document("0.0.0.0:9777", r#"["macbook"]"#),

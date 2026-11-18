@@ -20,10 +20,18 @@ pub struct PeerNode {
 impl PeerNode {
     pub fn new(stable_id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
-            stable_id: stable_id.into(),
-            name: name.into(),
+            stable_id: stable_id.into().trim().to_string(),
+            name: name.into().trim().trim_end_matches('.').to_string(),
         }
     }
+}
+
+/// The comparison form of a node identity: trimmed, lower case, and without
+/// the FQDN's terminal dot. tailcfg's `Node.Name` is an FQDN with a dot
+/// (`mac.tail1234.ts.net.`); configs and the install guide write it without
+/// one, so both sides meet here.
+fn canonical(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_lowercase()
 }
 
 /// Why the caller could not be identified.
@@ -68,7 +76,7 @@ impl Allowlist {
         Self {
             entries: entries
                 .into_iter()
-                .map(|entry| entry.trim().to_lowercase())
+                .map(|entry| canonical(&entry))
                 .filter(|entry| !entry.is_empty())
                 .collect(),
         }
@@ -79,8 +87,8 @@ impl Allowlist {
     }
 
     pub fn accepts(&self, node: &PeerNode) -> bool {
-        let stable_id = node.stable_id.to_lowercase();
-        let name = node.name.to_lowercase();
+        let stable_id = canonical(&node.stable_id);
+        let name = canonical(&node.name);
         self.entries
             .iter()
             .any(|entry| entry == &stable_id || entry == &name)
@@ -102,7 +110,13 @@ impl TailscaleLookup {
         }
     }
 
-    /// The local API answers with `{"Node": {"StableID": …, "Name": …}}`.
+    /// The local API answers with a `WhoIsResponse`:
+    /// `{"Node": {"StableID": "n1234ABCD", "ID": 1234, "Name": "pc.tail.ts.net."}, "User": {…}}`.
+    /// `ID` is `tailcfg.NodeID`, an integer; `StableID` is the string a config
+    /// lists. Both are optional here so a shape change cannot fail the whole
+    /// document, and the numeric ID is only a last resort: it is not stable
+    /// across tailscaled restarts, so an allowlist should use `StableID` or the
+    /// name.
     fn parse_whois(body: &[u8], peer: SocketAddr) -> Result<PeerNode, PeerError> {
         #[derive(serde::Deserialize)]
         struct Whois {
@@ -114,7 +128,7 @@ impl TailscaleLookup {
             #[serde(rename = "StableID", default)]
             stable_id: String,
             #[serde(rename = "ID", default)]
-            id: String,
+            id: Option<i64>,
             #[serde(rename = "Name", default)]
             name: String,
         }
@@ -126,16 +140,18 @@ impl TailscaleLookup {
         let node = whois
             .node
             .ok_or_else(|| PeerError::new(format!("tailscaled does not know {peer}")))?;
-        let stable_id = if node.stable_id.is_empty() {
-            node.id
+        let stable_id = if node.stable_id.trim().is_empty() {
+            match node.id {
+                Some(id) => id.to_string(),
+                None => {
+                    return Err(PeerError::new(format!(
+                        "tailscaled's whois answer for {peer} names no node"
+                    )))
+                }
+            }
         } else {
             node.stable_id
         };
-        if stable_id.is_empty() {
-            return Err(PeerError::new(format!(
-                "tailscaled's whois answer for {peer} names no node"
-            )));
-        }
         Ok(PeerNode::new(stable_id, node.name))
     }
 }
@@ -210,22 +226,50 @@ mod tests {
         assert!(Allowlist::default().entries().is_empty());
     }
 
+    #[test]
+    fn a_magicdns_name_matches_with_or_without_its_terminal_dot() {
+        // tailcfg's Node.Name is an FQDN with a dot; the config and the install
+        // guide write it without one, in either direction.
+        let from_config = Allowlist::new([config_name()]);
+        assert!(from_config.accepts(&whois_name()));
+        let from_whois = Allowlist::new(["macbook.tail1234.ts.net.".to_string()]);
+        assert!(from_whois.accepts(&PeerNode::new("n1", "MACBOOK.tail1234.ts.net")));
+        assert!(!from_whois.accepts(&PeerNode::new("n1", "other.tail1234.ts.net.")));
+        // Stable IDs are compared exactly, modulo case.
+        let ids = Allowlist::new(["n1234ABCD".to_string()]);
+        assert!(ids.accepts(&PeerNode::new(" n1234abcd ", "whatever.tail.ts.net")));
+        assert!(!ids.accepts(&PeerNode::new("n1234ABCE", "whatever.tail.ts.net")));
+    }
+
+    fn config_name() -> String {
+        "macbook.tail1234.ts.net".to_string()
+    }
+
+    fn whois_name() -> PeerNode {
+        PeerNode::new("n1234ABCD", "macbook.tail1234.ts.net.")
+    }
+
     #[cfg(unix)]
     #[test]
-    fn whois_documents_name_the_node_and_parse_or_fail_cleanly() {
+    fn a_real_whois_document_parses_with_a_numeric_node_id() {
+        // tailcfg.Node.ID is an integer (NodeID) and Name is an FQDN with a
+        // trailing dot; StableID is the string an allowlist may name.
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)), 5000);
-        let node = TailscaleLookup::parse_whois(
-            br#"{"Node":{"ID":"n123","StableID":"n123","Name":"mac.tail.ts.net"},"User":{}}"#,
+        let body = br#"{"Node":{"ID":1234,"StableID":"n1234ABCD","Name":"macbook.tail1234.ts.net.","User":7,"Key":"nodekey:abc"},"User":{"ID":7,"LoginName":"tom@example.com"}}"#;
+        let node = TailscaleLookup::parse_whois(body, peer).unwrap();
+        assert_eq!(node, whois_name());
+        assert_eq!(node.stable_id, "n1234ABCD");
+
+        // A node with no StableID still parses: the numeric ID is the last
+        // resort, and never a whole-document failure.
+        let without_stable = TailscaleLookup::parse_whois(
+            br#"{"Node":{"ID":456,"Name":"pc.tail1234.ts.net."}}"#,
             peer,
         )
         .unwrap();
-        assert_eq!(node, PeerNode::new("n123", "mac.tail.ts.net"));
-        let fallback = TailscaleLookup::parse_whois(
-            br#"{"Node":{"ID":"n456","Name":"pc.tail.ts.net"}}"#,
-            peer,
-        )
-        .unwrap();
-        assert_eq!(fallback.stable_id, "n456");
+        assert_eq!(without_stable.stable_id, "456");
+        assert_eq!(without_stable.name, "pc.tail1234.ts.net");
+
         assert!(TailscaleLookup::parse_whois(br#"{"Node":null}"#, peer).is_err());
         assert!(TailscaleLookup::parse_whois(b"not json", peer).is_err());
     }

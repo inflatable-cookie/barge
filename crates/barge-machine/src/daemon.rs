@@ -13,7 +13,8 @@ use serde::Serialize;
 
 use crate::{
     Cancel, CancelResult, DaemonError, Error, ErrorKind, Machine, PowerActionKind, PowerRequest,
-    PowerResult, Result, State, MAX_POWER_DELAY_S,
+    PowerResult, Result, State, CANCEL_RESULT_SCHEMA, MAX_POWER_DELAY_S, POWER_RESULT_SCHEMA,
+    STATE_SCHEMA,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,7 +64,7 @@ impl DaemonClient {
     /// `GET /v1/state`.
     pub fn state(&self) -> Result<State> {
         let (status, body) = self.get(STATE_PATH)?;
-        self.decode(status, &body)
+        self.decode(status, &body, STATE_SCHEMA)
     }
 
     /// `POST /v1/power`.
@@ -74,13 +75,13 @@ impl DaemonClient {
             )));
         }
         let (status, body) = self.post(POWER_PATH, &PowerRequest::new(action, delay_s))?;
-        self.decode(status, &body)
+        self.decode(status, &body, POWER_RESULT_SCHEMA)
     }
 
     /// `POST /v1/power/cancel`.
     pub fn cancel(&self) -> Result<CancelResult> {
         let (status, body) = self.post(CANCEL_PATH, &Cancel::default())?;
-        self.decode(status, &body)
+        self.decode(status, &body, CANCEL_RESULT_SCHEMA)
     }
 
     fn get(&self, path: &str) -> Result<(u16, String)> {
@@ -119,19 +120,45 @@ impl DaemonClient {
         format!("{}{path}", self.base)
     }
 
-    fn decode<T: DeserializeOwned>(&self, status: u16, body: &str) -> Result<T> {
-        if (200..300).contains(&status) {
-            return serde_json::from_str(body).map_err(|error| {
-                Error::new(
-                    ErrorKind::UnknownState,
-                    format!(
-                        "barged at {} answered HTTP {status} with a document that is not valid JSON: {error}",
-                        self.base
-                    ),
-                )
-            });
+    /// A successful answer is decoded into its document only when the
+    /// document's `schema` is the one this client knows: a later version with
+    /// the same fields must be refused, not acted on as version 1
+    /// (docs/knowledge/contracts/consumption.md).
+    fn decode<T: DeserializeOwned>(&self, status: u16, body: &str, expected: &str) -> Result<T> {
+        if !(200..300).contains(&status) {
+            return Err(self.refusal(status, body));
         }
-        Err(self.refusal(status, body))
+        let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+            Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "barged at {} answered HTTP {status} with a document that is not valid JSON: {error}",
+                    self.base
+                ),
+            )
+        })?;
+        let actual = value
+            .get("schema")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if actual != expected {
+            return Err(Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "barged at {} answered with schema {actual:?}, not {expected}",
+                    self.base
+                ),
+            ));
+        }
+        serde_json::from_value(value).map_err(|error| {
+            Error::new(
+                ErrorKind::UnknownState,
+                format!(
+                    "barged at {} answered with a malformed {expected}: {error}",
+                    self.base
+                ),
+            )
+        })
     }
 
     /// The daemon answered, and refused. Its error document names why.
@@ -393,6 +420,46 @@ mod tests {
         .unwrap();
         assert_eq!(result.action, PowerActionKind::Shutdown);
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_response_with_an_unknown_schema_is_refused_not_acted_on() {
+        // Same fields, later version: the contract says refuse, not assume.
+        let (base, _) = stub(
+            200,
+            r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42}"#,
+        );
+        let error = DaemonClient::at(base).state().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(error.message().contains("barge.machine-state/2"), "{error}");
+        assert!(error.message().contains(STATE_SCHEMA), "{error}");
+
+        let (base, _) = stub(
+            202,
+            r#"{"schema":"barge.power-result/2","action":"sleep","deadline_unix_ms":0}"#,
+        );
+        assert_eq!(
+            DaemonClient::at(base)
+                .power(PowerActionKind::Sleep, 0)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::UnknownState
+        );
+
+        let (base, _) = stub(
+            200,
+            r#"{"schema":"barge.power-cancel-result/2","cancelled":true}"#,
+        );
+        assert_eq!(
+            DaemonClient::at(base).cancel().unwrap_err().kind(),
+            ErrorKind::UnknownState
+        );
+
+        // No schema at all is not the known schema either.
+        let (base, _) = stub(200, r#"{"power":"awake","observed_at_unix_ms":42}"#);
+        let error = DaemonClient::at(base).state().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+        assert!(error.message().contains("\"\""), "{error}");
     }
 
     #[test]

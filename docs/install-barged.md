@@ -56,6 +56,9 @@ cp packaging/barged/config.example.json ~/.config/barged/config.json
 $EDITOR ~/.config/barged/config.json
 ```
 
+The example is valid JSON as shipped — replace the address and the allowlist
+entry, and add nothing else: the parser is strict and refuses unknown fields.
+
 ```json
 {
   "listen": "100.101.102.103:9777",
@@ -64,13 +67,17 @@ $EDITOR ~/.config/barged/config.json
 }
 ```
 
+Field meanings:
+
 - `listen` is the machine's own Tailscale address and the port the Mac dials.
   `barged` refuses to start on `0.0.0.0` or `[::]`: reaching the daemon is
   supposed to require the tailnet.
-- `allowed_nodes` is the allowlist. A node matches by stable ID or by MagicDNS
-  name, case-insensitively. An empty list is refused: an open daemon is not a
-  useful default.
-- `tailscale_socket` defaults to `/var/run/tailscale/tailscaled.sock`.
+- `allowed_nodes` is the allowlist. A node matches by stable ID (`n1234ABCD`)
+  or by MagicDNS name (`pc.tail1234.ts.net`), case-insensitively, with or
+  without the name's terminal dot. An empty list is refused: an open daemon is
+  not a useful default.
+- `tailscale_socket` is optional and defaults to
+  `/var/run/tailscale/tailscaled.sock`.
 
 ## 5. Install the systemd user unit
 

@@ -1,15 +1,3 @@
-# barged's example config. Copy to ~/.config/barged/config.json and edit.
-#
-# listen is a single address: the machine's own Tailscale address, never 0.0.0.0
-# or [::]. Get it with `tailscale ip -4`; barged refuses a wildcard bind.
-#
-# allowed_nodes lists the tailnet nodes allowed to control this machine, by
-# Tailscale stable node ID (n1234ABCD, from `tailscale status --json`) or by
-# MagicDNS name (pc.tail1234.ts.net). barged refuses to start with an empty list.
-#
-# tailscale_socket is tailscaled's local API socket, used to resolve a caller
-# with whois. The default is right for a system tailscaled; a user-installed
-# tailscaled keeps it under $XDG_RUNTIME_DIR.
 {
   "listen": "100.101.102.103:9777",
   "allowed_nodes": ["macbook-pro.tail1234.ts.net"],
