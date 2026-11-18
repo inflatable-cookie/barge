@@ -2,8 +2,13 @@
 //! the verbs the brief lists. Every fixture is a temporary directory; the
 //! registered mount is a folder inside it, so nothing touches a real drive.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use barge::testing::TempDir;
 use serde_json::Value;
@@ -295,6 +300,261 @@ fn env_rejects_json_output() {
     assert_eq!(output.status.code(), Some(2));
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("does not support --json"));
+}
+
+/// A canned `barged` on loopback: one answer for up to four requests, each
+/// recorded so a test can prove whether anything was sent at all.
+fn stub_daemon(status: u16, body: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+    stub_daemon_routes(vec![("/", status, body)])
+}
+
+/// The same stub, with one answer per endpoint (first matching prefix wins).
+type Routes = Vec<(&'static str, u16, &'static str)>;
+
+fn stub_daemon_routes(routes: Routes) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&requests);
+    thread::spawn(move || {
+        for stream in listener.incoming().take(4) {
+            let Ok(mut stream) = stream else { break };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let Some((head, sent)) = text.split_once("\r\n\r\n") else {
+                    continue;
+                };
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if sent.len() >= length {
+                    recorded.lock().unwrap().push(text);
+                    break;
+                }
+            }
+            let request = recorded.lock().unwrap().last().cloned().unwrap_or_default();
+            let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let (status, body) = routes
+                .iter()
+                .find(|(path, _, _)| target.starts_with(path))
+                .map(|(_, status, body)| (*status, *body))
+                .unwrap_or((404, "{}"));
+            let response = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (port, requests)
+}
+
+/// Register a machine whose daemon is the fixture's loopback stub.
+fn register_machine(fixture: &Fixture, daemon_port: u16) {
+    let output = fixture.run(&[
+        "machine",
+        "add",
+        "--name",
+        "pc",
+        "--hostname",
+        "127.0.0.1",
+        "--mac",
+        "00:11:22:33:44:ff",
+        "--daemon-port",
+        &daemon_port.to_string(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+fn run_with_stdin(fixture: &Fixture, arguments: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_barge"))
+        .args(arguments)
+        .env("BARGE_STATE_DIR", &fixture.state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the barge binary");
+    child
+        .stdin
+        .as_mut()
+        .expect("a piped stdin")
+        .write_all(input.as_bytes())
+        .expect("write the answer");
+    child.wait_with_output().expect("collect the run")
+}
+
+#[test]
+fn machine_power_confirms_restart_and_shutdown_unless_yes_is_given() {
+    let fixture = Fixture::new();
+    let (port, requests) = stub_daemon(
+        202,
+        r#"{"schema":"barge.power-result/1","action":"shutdown","deadline_unix_ms":15000}"#,
+    );
+    register_machine(&fixture, port);
+
+    let declined = run_with_stdin(&fixture, &["machine", "restart", "pc"], "n\n");
+    assert_eq!(declined.status.code(), Some(1), "{}", stderr(&declined));
+    assert!(
+        stderr(&declined).contains("restart pc in 15s? [y/N]"),
+        "{}",
+        stderr(&declined)
+    );
+    assert!(
+        stderr(&declined).contains("was not confirmed"),
+        "{}",
+        stderr(&declined)
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a declined confirmation sends nothing"
+    );
+
+    let confirmed = run_with_stdin(&fixture, &["machine", "shutdown", "pc"], "yes\n");
+    assert_eq!(confirmed.status.code(), Some(0), "{}", stderr(&confirmed));
+    assert!(
+        stdout(&confirmed).contains("shutdown of pc will fire at 15000 (in 15s)"),
+        "{}",
+        stdout(&confirmed)
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    let sent = requests.lock().unwrap()[0].clone();
+    assert!(sent.starts_with("POST /v1/power "), "{sent}");
+    assert!(sent.contains(r#""action":"shutdown""#), "{sent}");
+
+    let assume_yes = fixture.run(&["machine", "restart", "pc", "--yes", "--delay", "5"]);
+    assert_eq!(assume_yes.status.code(), Some(0), "{}", stderr(&assume_yes));
+    assert!(
+        stderr(&assume_yes).is_empty(),
+        "--yes asks nothing: {}",
+        stderr(&assume_yes)
+    );
+    let sent = requests.lock().unwrap()[1].clone();
+    assert!(sent.contains(r#""delay_s":5"#), "{sent}");
+}
+
+#[test]
+fn machine_sleep_sends_at_once_and_status_reports_what_the_daemon_said() {
+    let fixture = Fixture::new();
+    let (port, requests) = stub_daemon_routes(vec![
+        (
+            "/v1/power/cancel",
+            200,
+            r#"{"schema":"barge.power-cancel-result/1","cancelled":true}"#,
+        ),
+        (
+            "/v1/power",
+            202,
+            r#"{"schema":"barge.power-result/1","action":"sleep","deadline_unix_ms":15042}"#,
+        ),
+        (
+            "/v1/state",
+            200,
+            r#"{"schema":"barge.machine-state/1","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042}}"#,
+        ),
+    ]);
+    register_machine(&fixture, port);
+
+    let sleep = fixture.run(&["machine", "sleep", "pc"]);
+    assert_eq!(sleep.status.code(), Some(0), "{}", stderr(&sleep));
+    assert!(
+        requests.lock().unwrap()[0].contains(r#""action":"sleep","delay_s":15"#),
+        "{:?}",
+        requests.lock().unwrap()
+    );
+
+    let status = fixture.json(&["machine", "status", "pc"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let document = parse_document(&status);
+    assert_eq!(document["schema"], "barge.machine-status/1");
+    assert_eq!(document["data"]["state"]["power"], "awake");
+    assert_eq!(document["data"]["state"]["pending"]["action"], "sleep");
+
+    let cancel = fixture.json(&["machine", "cancel", "pc"]);
+    assert_eq!(cancel.status.code(), Some(0), "{}", stderr(&cancel));
+    let document = parse_document(&cancel);
+    assert_eq!(document["schema"], "barge.machine-cancel/1");
+    assert_eq!(document["data"]["cancelled"], true);
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .starts_with("POST /v1/power/cancel "),
+        "{:?}",
+        requests.lock().unwrap()
+    );
+}
+
+#[test]
+fn an_unreachable_daemon_is_reported_as_unreachable() {
+    let fixture = Fixture::new();
+    let closed = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    register_machine(&fixture, port);
+
+    let status = fixture.run(&["machine", "status", "pc"]);
+    assert_eq!(status.status.code(), Some(3), "{}", stderr(&status));
+    assert!(
+        stderr(&status).contains("is unreachable"),
+        "{}",
+        stderr(&status)
+    );
+    assert!(!stderr(&status).contains("asleep"), "{}", stderr(&status));
+
+    let shutdown = fixture.run(&["machine", "shutdown", "pc", "--yes"]);
+    assert_eq!(shutdown.status.code(), Some(3), "{}", stderr(&shutdown));
+    assert!(
+        stderr(&shutdown).contains("unreachable"),
+        "{}",
+        stderr(&shutdown)
+    );
+
+    let json = fixture.json(&["machine", "status", "pc"]);
+    assert_eq!(json.status.code(), Some(3));
+    let error: Value = serde_json::from_slice(&json.stderr).expect("a JSON error document");
+    assert_eq!(error["schema"], "barge.error/1");
+    assert_eq!(error["error"]["kind"], "io");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unreachable"));
+}
+
+#[test]
+fn machine_power_refuses_an_out_of_range_delay() {
+    let fixture = Fixture::new();
+    let (port, requests) = stub_daemon(
+        202,
+        r#"{"schema":"barge.power-result/1","action":"sleep","deadline_unix_ms":0}"#,
+    );
+    register_machine(&fixture, port);
+    let delayed = fixture.run(&["machine", "sleep", "pc", "--delay", "99999"]);
+    assert_eq!(delayed.status.code(), Some(2), "{}", stderr(&delayed));
+    assert!(
+        stderr(&delayed).contains("delay must be"),
+        "{}",
+        stderr(&delayed)
+    );
+    assert!(requests.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -20,7 +20,11 @@ Repository: `inflatable-cookie/barge`. Since 2026-11-17 Barge has its own planne
 `crates/barge` is the library: every mechanic, no argv. `crates/barge-cli` is
 the thin binary named `barge`: argument parsing, JSON output, exit codes and
 the human summary. `crates/barge-machine` contains machine registry,
-Wake-on-LAN and daemon protocol types, separate from storage. Toolchain
+Wake-on-LAN, daemon protocol types and the `barged` client, separate from
+storage. `crates/barged` is the machine daemon: state and power over HTTP, with
+Tailscale `whois` and logind behind seams; `packaging/barged/` holds its unit,
+polkit rule and example config. Linux is its only power backend, but it builds
+on macOS so the workspace checks cover it. Toolchain
 `1.97.1` and edition 2021 are pinned in `rust-toolchain.toml`; `Cargo.lock` is
 committed. Oxide depends on the library at an exact Git commit.
 

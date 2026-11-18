@@ -9,6 +9,10 @@ description = "Barge's machine registry, Wake-on-LAN and daemon protocol types"
 [dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+# The client for `barged`. Default features are off, so this is plain blocking
+# HTTP/1.1 with no TLS stack: the daemon speaks plain HTTP over the tailnet
+# (docs/knowledge/machines.md, "Protocol and trust").
+ureq = { version = "=3.4.2", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"

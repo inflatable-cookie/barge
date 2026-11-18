@@ -16,7 +16,10 @@ use barge::{
     DoctorReport, Durability, Error, ErrorKind, Placement, Result, RootInfo, VolumeRegistration,
     VolumeState, VolumeStatus,
 };
-use barge_machine::{DatagramSender, Machine, Registry, UdpSender};
+use barge_machine::{
+    request_power, AssumeYes, Confirmation, DaemonClient, DatagramSender, Machine, PowerActionKind,
+    PowerState, Registry, UdpSender, DEFAULT_POWER_DELAY_S,
+};
 use serde_json::{json, Value};
 
 fn main() -> ExitCode {
@@ -114,8 +117,13 @@ usage: barge [--json] <command>
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
   machine add --name N --hostname H --mac MAC [--tailscale-name N]
-    [--broadcast IPv4] [--port PORT]
+    [--broadcast IPv4] [--port PORT] [--daemon-port PORT]
   machine list | remove <name> | wake <name>
+  machine status <name>                   what barged on that machine reports
+  machine sleep <name> [--delay SECONDS]  start the countdown at once
+  machine restart <name> [--delay S] [--yes]
+  machine shutdown <name> [--delay S] [--yes]
+  machine cancel <name>                   stop a pending countdown
 
 SIZES: integer bytes, or KiB, MiB, GiB, TiB.
 "
@@ -148,6 +156,7 @@ fn machine_with(
                     "mac",
                     "broadcast",
                     "port",
+                    "daemon-port",
                 ],
                 &[],
             )?;
@@ -174,6 +183,15 @@ fn machine_with(
                     return Err(Error::usage("--port must be between 1 and 65535"));
                 }
                 machine = machine.port(port);
+            }
+            if let Some(port) = options.get("daemon-port") {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| Error::usage("--daemon-port must be between 1 and 65535"))?;
+                if port == 0 {
+                    return Err(Error::usage("--daemon-port must be between 1 and 65535"));
+                }
+                machine = machine.daemon_port(port);
             }
             registry.add(machine.clone()).map_err(machine_error)?;
             if json {
@@ -231,9 +249,152 @@ fn machine_with(
             }
             Ok(())
         }
+        "status" => {
+            let options = Options::parse(rest, &[], &[])?;
+            let name = options.single("machine status", "name")?;
+            let machine = registry.get(&name).map_err(machine_error)?;
+            let client = DaemonClient::for_machine(&machine);
+            let state = client.state().map_err(machine_error)?;
+            if json {
+                document(
+                    "barge.machine-status/1",
+                    vec![("machine", json!(machine.name)), ("state", json!(state))],
+                )?;
+            } else {
+                println!(
+                    "{}: {}, observed at {}",
+                    machine.name,
+                    power_name(state.power),
+                    state.observed_at_unix_ms
+                );
+                if let Some(pending) = state.pending {
+                    println!(
+                        "  {} pending until {}",
+                        pending.action.as_str(),
+                        pending.deadline_unix_ms
+                    );
+                }
+            }
+            Ok(())
+        }
+        "sleep" => machine_power(
+            PowerActionKind::Sleep,
+            "sleep",
+            rest,
+            json,
+            registry,
+        ),
+        "restart" => machine_power(
+            PowerActionKind::Restart,
+            "restart",
+            rest,
+            json,
+            registry,
+        ),
+        "shutdown" => machine_power(
+            PowerActionKind::Shutdown,
+            "shutdown",
+            rest,
+            json,
+            registry,
+        ),
+        "cancel" => {
+            let options = Options::parse(rest, &[], &[])?;
+            let name = options.single("machine cancel", "name")?;
+            let machine = registry.get(&name).map_err(machine_error)?;
+            let result = DaemonClient::for_machine(&machine)
+                .cancel()
+                .map_err(machine_error)?;
+            if json {
+                document(
+                    "barge.machine-cancel/1",
+                    vec![
+                        ("machine", json!(machine.name)),
+                        ("cancelled", json!(result.cancelled)),
+                    ],
+                )?;
+            } else if result.cancelled {
+                println!("cancelled the pending action on {}", machine.name);
+            } else {
+                println!("nothing was pending on {}", machine.name);
+            }
+            Ok(())
+        }
         other => Err(Error::usage(format!(
-            "unknown machine command {other:?}; use add, list, remove or wake"
+            "unknown machine command {other:?}; use add, list, remove, wake, status, sleep, restart, shutdown or cancel"
         ))),
+    }
+}
+
+/// `machine sleep|restart|shutdown <name> [--delay SECONDS] [--yes]`.
+///
+/// Sleep starts its countdown at once; restart and shutdown ask first unless
+/// `--yes` was given (docs/knowledge/machines.md, "Behaviour").
+fn machine_power(
+    action: PowerActionKind,
+    command: &str,
+    arguments: &[String],
+    json: bool,
+    registry: &Registry,
+) -> Result<()> {
+    let options = Options::parse(arguments, &["delay"], &["yes"])?;
+    let name = options.single(&format!("machine {command}"), "name")?;
+    let delay = match options.get("delay") {
+        Some(value) => value
+            .parse::<u32>()
+            .map_err(|_| Error::usage("--delay must be whole seconds"))?,
+        None => DEFAULT_POWER_DELAY_S,
+    };
+    let machine = registry.get(&name).map_err(machine_error)?;
+    let client = DaemonClient::for_machine(&machine);
+    let result = if options.flag("yes") {
+        request_power(&client, &machine.name, action, delay, &AssumeYes)
+    } else {
+        request_power(&client, &machine.name, action, delay, &Prompt)
+    }
+    .map_err(machine_error)?;
+    if json {
+        document(
+            "barge.machine-power/1",
+            vec![
+                ("machine", json!(machine.name)),
+                ("action", json!(result.action.as_str())),
+                ("deadline_unix_ms", json!(result.deadline_unix_ms)),
+            ],
+        )?;
+    } else {
+        println!(
+            "{} of {} will fire at {} (in {}s); cancel with `barge machine cancel {}`",
+            result.action.as_str(),
+            machine.name,
+            result.deadline_unix_ms,
+            delay,
+            machine.name
+        );
+    }
+    Ok(())
+}
+
+/// The interactive confirmation: one line from stdin, anything but yes is no.
+struct Prompt;
+
+impl Confirmation for Prompt {
+    fn confirm(&self, action: PowerActionKind, machine: &str, delay_s: u32) -> bool {
+        eprint!("{} {} in {delay_s}s? [y/N] ", action.as_str(), machine);
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            return false;
+        }
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    }
+}
+
+fn power_name(power: PowerState) -> &'static str {
+    match power {
+        PowerState::Awake => "awake",
+        PowerState::Asleep => "asleep",
+        PowerState::Unknown => "unknown",
     }
 }
 
@@ -244,6 +405,9 @@ fn machine_error(error: barge_machine::Error) -> Error {
         barge_machine::ErrorKind::NotFound => ErrorKind::NotFound,
         barge_machine::ErrorKind::Io => ErrorKind::Io,
         barge_machine::ErrorKind::UnknownState => ErrorKind::UnknownState,
+        // An absent daemon is not a state the storage library knows: the
+        // message says "unreachable" and the CLI exits 3.
+        barge_machine::ErrorKind::Unreachable => ErrorKind::Io,
     };
     Error::new(kind, error.message())
 }

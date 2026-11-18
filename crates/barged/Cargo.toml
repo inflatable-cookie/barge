@@ -1,0 +1,28 @@
+[package]
+name = "barged"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Barge's machine daemon: state and power control for one tailnet machine"
+
+[[bin]]
+name = "barged"
+path = "src/main.rs"
+
+[dependencies]
+barge-machine = { path = "../barge-machine" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+# The server. Blocking, one thread, no async runtime: the daemon answers three
+# endpoints for one operator (docs/knowledge/machines.md, "Protocol and trust").
+tiny_http = "=0.12.0"
+
+# logind over D-Bus, Linux only. `zbus` is the maintained D-Bus crate and its
+# blocking API is enough; the macOS workspace checks never build it, so the
+# daemon still compiles (and reports state) on the Mac.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "=5.19.0"
+
+[lints]
+workspace = true

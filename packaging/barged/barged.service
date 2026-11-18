@@ -1,0 +1,37 @@
+# barged as a systemd *user* unit, so Bazzite needs no layered package.
+#
+# Install (docs/install-barged.md):
+#   ~/.local/bin/barged and ~/.config/barged/config.json exist
+#   cp packaging/barged/barged.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now barged
+[Unit]
+Description=Barge machine daemon (barged)
+Documentation=file:%h/.config/barged/config.json
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/barged --config %h/.config/barged/config.json
+Restart=on-failure
+RestartSec=5s
+
+# The daemon answers HTTP on one address and calls logind. It needs nothing
+# else: no shell, no writable system paths, no new privileges.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target
