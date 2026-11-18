@@ -248,9 +248,11 @@ pub(crate) fn flock(file: &File, mode: Mode, wait: bool) -> Result<bool> {
         if !wait && source.kind() == std::io::ErrorKind::WouldBlock {
             return Ok(false);
         }
-        return Err(Error::io_message(format!(
-            "cannot take a file lock: {source}"
-        )));
+        return Err(Error::io(
+            "cannot take a file lock on",
+            Path::new("<descriptor>"),
+            &source,
+        ));
     }
 }
 
@@ -261,10 +263,11 @@ pub(crate) fn set_inheritable(file: &File, inheritable: bool) -> Result<()> {
     #[allow(unsafe_code)]
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
     if flags < 0 {
-        return Err(Error::io_message(format!(
-            "cannot read the hold descriptor flags: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(Error::io(
+            "cannot read hold descriptor flags on",
+            Path::new("<descriptor>"),
+            &std::io::Error::last_os_error(),
+        ));
     }
     let wanted = if inheritable {
         flags & !libc::FD_CLOEXEC
@@ -275,21 +278,24 @@ pub(crate) fn set_inheritable(file: &File, inheritable: bool) -> Result<()> {
     #[allow(unsafe_code)]
     let result = unsafe { libc::fcntl(descriptor, libc::F_SETFD, wanted) };
     if result < 0 {
-        return Err(Error::io_message(format!(
-            "cannot set the hold descriptor flags: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(Error::io(
+            "cannot set hold descriptor flags on",
+            Path::new("<descriptor>"),
+            &std::io::Error::last_os_error(),
+        ));
     }
     Ok(())
 }
 
 /// Open a persistent lock file without truncating it.
 pub(crate) fn open_lock(path: &Path, context: &str) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|e| Error::io(context, path, &e))
 }

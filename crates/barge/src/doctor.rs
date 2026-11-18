@@ -157,7 +157,17 @@ impl Barge {
         }
         let mut bindings = Vec::new();
         for record in self.bindings().list()? {
-            bindings.push(binding_report(&layout, &facts, &record)?);
+            let binding =
+                binding_report(&layout, &facts, &record).unwrap_or_else(|error| BindingReport {
+                    consumer: record.consumer.clone(),
+                    class: record.class,
+                    kind: record.kind,
+                    path: record.owned_path(),
+                    state: BindingState::Unavailable {
+                        reason: error.message().to_string(),
+                    },
+                });
+            bindings.push(binding);
         }
         let ok = volumes.iter().all(VolumeReport::ok)
             && bindings.iter().all(|binding| binding.state.is_ok());
@@ -208,6 +218,14 @@ fn binding_report(
     facts: &BTreeMap<String, Facts>,
     record: &BindingRecord,
 ) -> Result<BindingReport> {
+    #[cfg(test)]
+    if FAIL_BINDING.with(|flag| flag.replace(false)) {
+        return Err(crate::Error::io(
+            "cannot inspect",
+            &record.owned_path(),
+            &std::io::Error::other("injected binding error"),
+        ));
+    }
     let path = record.owned_path();
     let report = |state| BindingReport {
         consumer: record.consumer.clone(),
@@ -341,4 +359,52 @@ fn workflow_state(layout: &Layout, volume: &Facts, record: &BindingRecord) -> Re
         },
     };
     Ok(state)
+}
+
+#[cfg(test)]
+thread_local! { static FAIL_BINDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    #[test]
+    fn binding_error_does_not_abort_doctor() {
+        let temp = crate::testing::TempDir::new("doctor-errors").unwrap();
+        let mount = temp.folder("mount").unwrap();
+        let state = temp.folder("state").unwrap();
+        let os = Arc::new(crate::FakeOs::with_volume(
+            &mount,
+            "11111111-2222-3333-4444-555555555555",
+            100,
+        ));
+        let b = Barge::open_with(state, os, Arc::new(crate::ManualClock::new(1))).unwrap();
+        b.register_volume(crate::VolumeRegistration::new("disk", &mount).floor_bytes(0))
+            .unwrap();
+        b.set_layout(
+            Class::Caches,
+            crate::Placement {
+                volume: "disk".into(),
+                path: "caches".into(),
+                absent: crate::Absent::Fail,
+            },
+        )
+        .unwrap();
+        let dest = mount.join("caches");
+        std::fs::create_dir(&dest).unwrap();
+        for name in ["one", "two"] {
+            let link = temp.child(name);
+            std::os::unix::fs::symlink(&dest, &link).unwrap();
+            b.bindings()
+                .adopt(&crate::Binding::link(name, Class::Caches, link))
+                .unwrap();
+        }
+        FAIL_BINDING.with(|flag| flag.set(true));
+        let report = b.doctor().unwrap();
+        assert_eq!(report.binding_reports.len(), 2);
+        assert!(
+            matches!(&report.binding_reports[0].state, BindingState::Unavailable { reason } if reason.contains("injected binding error"))
+        );
+        assert!(matches!(report.binding_reports[1].state, BindingState::Ok));
+    }
 }

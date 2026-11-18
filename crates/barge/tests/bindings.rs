@@ -822,3 +822,32 @@ fn doctor_reports_a_replaced_file_destination_as_drift() {
         other => panic!("expected drifted, got {other:?}"),
     }
 }
+
+#[test]
+fn undo_works_when_the_volume_is_absent() {
+    let fixture = Fixture::new();
+    fixture.register();
+    layout(&fixture);
+    let destination = class_folder(&fixture, "cargo/registry");
+    let link = home(&fixture).join("registry");
+    let binding = Binding::link("cargo-registry", Class::Caches, &link).to(&destination);
+    let bindings = fixture.barge.bindings();
+    let plan = bindings.plan(&binding).unwrap();
+    bindings
+        .apply(&binding, &plan, ApplyOptions::default())
+        .unwrap();
+    fs::rename(&destination, destination.with_extension("away")).unwrap();
+    bindings.undo("cargo-registry").unwrap();
+    assert!(fs::symlink_metadata(link).is_err());
+}
+
+#[test]
+fn registration_rejects_a_folder_inside_a_mount() {
+    let fixture = Fixture::new();
+    let folder = fixture.mount.join("ordinary-folder");
+    fs::create_dir(&folder).unwrap();
+    assert!(fixture
+        .barge
+        .register_volume(barge::VolumeRegistration::new("fake", folder))
+        .is_err());
+}

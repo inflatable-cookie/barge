@@ -26,7 +26,7 @@ destination that was replaced since it was reviewed; a version 1 plan is refused
 the same way. A plan lists the links at [known link locations](../resources.md#known-link-locations)
 that no binding records, and applying it needs `--retarget-unrecorded` while it
 lists any. Successful JSON apply output is a `barge.move/1` envelope containing
-the plan and doctor report.
+the plan and doctor report, or the doctor error if that subsequent check fails. The move is already committed in either case.
 
 ## Success documents
 
@@ -125,7 +125,7 @@ shell assignments and refuses `--json`.
 | `class-folder` | `class: string`, `path: string`, `exists: bool` |
 | `binding-report` | `consumer: string`, `class: string`, `kind: string`, `path: string`, `state: string`, `observed?: string?`, `expected?: string`, `reason?: string` |
 | `doctor-report` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]` |
-| `move-report` | `plan: move-plan`, `doctor: doctor-report` |
+| `move-report` | `plan: move-plan`, `doctor: doctor-report?`, `doctor_error: string?` |
 | `move-plan` | `schema: string`, `volume: string`, `volume_spec: volume-spec`, `class: string`, `source: string`, `source_identity: move-identity`, `destination: string`, `destination_parent_identity: move-identity`, `create_directory?: string`, `bindings: [move-binding]`, `unrecorded_links: [unrecorded-link]`, `layout: move-layout?`, `areas: [move-area]`, `consumers: [string]`, `manual_steps: [string]` |
 | `move-identity` | `dev: int`, `ino: int` |
 | `move-binding` | `record: binding-record`, `before: observed`, `after: string`, `link_after: string` |

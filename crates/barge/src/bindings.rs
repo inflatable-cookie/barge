@@ -522,9 +522,9 @@ impl Bindings {
         let link = record.owned_path();
         match observe(&link)? {
             Observed::Absent => {}
-            Observed::Link { .. } => {
-                let resolved = fs::canonicalize(&link)
-                    .map_err(|source| Error::io("cannot resolve the link at", &link, &source))?;
+            Observed::Link {
+                destination: resolved,
+            } => {
                 if resolved != record.applied.value {
                     return Err(Error::refused(format!(
                         "the link at {} now points at {}, not the applied {}; refusing to undo it",
@@ -709,7 +709,7 @@ fn make_way(link: &Path, prior: &Prior) -> Result<()> {
     match prior {
         Prior::Absent => Ok(()),
         Prior::Link { .. } => remove_link(link),
-        Prior::Preserved { path, .. } => fs::rename(link, path)
+        Prior::Preserved { path, .. } => crate::os::rename_no_replace(link, path)
             .map_err(|source| Error::io("cannot preserve the entry at", link, &source)),
         Prior::InPlace => Err(Error::refused(
             "an in-place change has no entry to move aside",
@@ -734,7 +734,7 @@ fn restore_prior(link: &Path, prior: &Prior) -> Result<()> {
                 }
                 Err(source) => return Err(Error::io("cannot inspect", path, &source)),
             }
-            fs::rename(path, link)
+            crate::os::rename_no_replace(path, link)
                 .map_err(|source| Error::io("cannot restore the preserved entry to", link, &source))
         }
         Prior::InPlace => Err(Error::refused(
@@ -764,7 +764,7 @@ fn reapply_applied(link: &Path, record: &BindingRecord) -> Result<()> {
                         path.display()
                     )));
                 }
-                fs::rename(link, path).map_err(|source| {
+                crate::os::rename_no_replace(link, path).map_err(|source| {
                     Error::io("cannot move the restored entry back to", path, &source)
                 })?;
             }
@@ -972,7 +972,8 @@ pub(crate) fn write(core: &Core, records: &[BindingRecord]) -> Result<()> {
 pub(crate) fn validate_record(record: &BindingRecord) -> Result<()> {
     match (&record.kind, &record.target) {
         (BindingKind::Link, BindingTarget::Link { path }) => {
-            validate_name("binding consumer", &record.consumer)?;
+            validate_name("binding consumer", &record.consumer)
+                .map_err(|error| Error::unknown_state(error.message()))?;
             if !path.is_absolute() {
                 return Err(Error::unknown_state(format!(
                     "binding {} has a relative link path {}",
@@ -1066,6 +1067,21 @@ pub(crate) fn validate_record(record: &BindingRecord) -> Result<()> {
 #[cfg(test)]
 mod rollback_kind_tests {
     use super::*;
+    #[test]
+    fn preservation_refuses_a_new_destination() {
+        let temp = crate::testing::TempDir::new("binding-race").unwrap();
+        let link = temp.child("entry");
+        let preserved = temp.child("preserved");
+        std::fs::write(&link, b"original").unwrap();
+        std::fs::write(&preserved, b"concurrent").unwrap();
+        let prior = Prior::Preserved {
+            path: preserved.clone(),
+            entry: EntryKind::File,
+        };
+        assert!(make_way(&link, &prior).is_err());
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"concurrent");
+        assert_eq!(std::fs::read(&link).unwrap(), b"original");
+    }
     #[test]
     fn failed_reapply_reports_unknown_state() {
         let error = failed_undo(

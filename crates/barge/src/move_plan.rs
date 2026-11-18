@@ -479,7 +479,8 @@ fn shell_word(path: &Path) -> String {
 #[derive(Debug, Serialize)]
 pub struct MoveReport {
     pub plan: MovePlan,
-    pub doctor: crate::DoctorReport,
+    pub doctor: Option<crate::DoctorReport>,
+    pub doctor_error: Option<String>,
 }
 
 impl Barge {
@@ -743,9 +744,22 @@ impl Barge {
         drop(_lock);
         drop(root_locks);
         drop(area_locks);
+        #[cfg(test)]
+        let doctor_result = if FAIL_DOCTOR.with(|flag| flag.replace(false)) {
+            Err(Error::refused("injected doctor failure"))
+        } else {
+            self.doctor()
+        };
+        #[cfg(not(test))]
+        let doctor_result = self.doctor();
+        let (doctor, doctor_error) = match doctor_result {
+            Ok(report) => (Some(report), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         Ok(MoveReport {
             plan: plan.clone(),
-            doctor: self.doctor()?,
+            doctor,
+            doctor_error,
         })
     }
 }
@@ -780,6 +794,8 @@ fn replace_link(path: &Path, destination: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+thread_local! { static FAIL_DOCTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
 thread_local! { static FAIL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(test)]
@@ -788,6 +804,45 @@ mod tests {
     use crate::{Absent, Binding, FakeOs, ManualClock, VolumeRegistration};
     use std::os::unix::fs::symlink;
     use std::sync::Arc;
+
+    #[test]
+    fn doctor_failure_does_not_undo_a_committed_move() {
+        let temp = crate::testing::TempDir::new("move-doctor").unwrap();
+        let mount = temp.folder("volume").unwrap();
+        let state = temp.folder("state").unwrap();
+        let os = Arc::new(FakeOs::with_volume(
+            &mount,
+            "11111111-2222-3333-4444-555555555555",
+            1000,
+        ));
+        let b = Barge::open_with(state, os, Arc::new(ManualClock::new(1))).unwrap();
+        b.register_volume(VolumeRegistration::new("volume", &mount).floor_bytes(0))
+            .unwrap();
+        b.set_layout(
+            Class::Vms,
+            Placement {
+                volume: "volume".into(),
+                path: "vms".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+        fs::create_dir(mount.join("vms")).unwrap();
+        let plan = b.plan_class_move(Class::Vms, "new-vms").unwrap();
+        FAIL_DOCTOR.with(|flag| flag.set(true));
+        let report = b
+            .apply_move(
+                &plan,
+                MoveApplyOptions {
+                    confirm_stopped: true,
+                    retarget_unrecorded: false,
+                },
+            )
+            .unwrap();
+        assert!(report.doctor.is_none());
+        assert!(report.doctor_error.unwrap().contains("injected"));
+        assert!(mount.join("new-vms").exists());
+    }
 
     #[test]
     fn binding_failure_restores_data_and_links() {

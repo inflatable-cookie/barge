@@ -52,7 +52,8 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   is not enough.
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
-  the next prune or sweep removes. No journal is needed.
+  the next prune or sweep removes. The area lock is released after the rename,
+  before deletion, so holds and other area operations can continue. No journal is needed.
 - **Unknown is never safe.** A volume whose identity can't be read, a marker
   that can't be parsed, a lock that can't be tested, or a pin that can't be
   inspected all count as "keep".
@@ -62,7 +63,7 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 - **Volume.** A registered external volume: name, UUID, mount point,
   availability (`permanent` or `ephemeral`), durability (`expendable` or
   `kept`), `root_dir`, reserve and floor. Barge checks its identity (UUID at the
-  expected mount) on every use, and never uses a different volume found at the
+  expected mount root) on every use, and never uses a different volume found at the
   same mount point.
 - **Area.** A folder a consumer declares, named `<namespace>/<area>` (for
   example `oxide/pool`, `oxide/outputs`). A namespace never carries a `.`, so the

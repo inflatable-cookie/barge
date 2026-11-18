@@ -212,6 +212,18 @@ impl Area {
                 locks.push((dir.clone(), AreaLock::acquire(dir)?));
             }
         }
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|e| Error::io("cannot inspect", &path, &e))?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != crate::os::effective_uid()
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(Error::refused(format!(
+                "root folder {} is not a safely owned directory",
+                path.display()
+            )));
+        }
         match read_marker(&path) {
             MarkerRead::Valid(marker) => {
                 let differences = marker_differences(&marker, &key, id, label, folder);
@@ -548,7 +560,7 @@ impl Area {
             }
             _ => return Err(Error::not_found("root marker changed while acquiring hold")),
         };
-        let root_directory = File::open(&current.path)
+        let root_directory = crate::os::open_directory(&current.path)
             .map_err(|e| Error::io("cannot open root", &current.path, &e))?;
         self.record_activity(&directory, &root.id, self.core.clock.now_unix_ms());
         Ok(Hold::new(
@@ -598,7 +610,7 @@ impl Area {
                 "root {id} is held; refusing to evict it"
             )));
         };
-        let _area_lock = AreaLock::acquire(&directory)?;
+        let area_lock = AreaLock::acquire(&directory)?;
         if pin_state(&directory, &id)? {
             return Err(Error::refused(format!(
                 "root {id} is pinned; refusing to evict it"
@@ -608,12 +620,25 @@ impl Area {
         let trash = directory.join(TRASH_DIR);
         fs::create_dir_all(&trash)
             .map_err(|source| Error::io("cannot create the trash at", &trash, &source))?;
-        let trash_path = unique_trash_path(&trash, &root.folder);
         if !unchanged_marker(&root, &key) {
             return Err(Error::refused("root marker changed before eviction"));
         }
-        fs::rename(&root.path, &trash_path)
-            .map_err(|source| Error::io("cannot evict the root to", &trash_path, &source))?;
+        let mut counter = 0_u64;
+        let trash_path = loop {
+            let candidate = if counter == 0 {
+                trash.join(&root.folder)
+            } else {
+                trash.join(format!("{}.{counter}", root.folder))
+            };
+            counter += 1;
+            match crate::os::rename_no_replace(&root.path, &candidate) {
+                Ok(()) => break candidate,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(Error::io("cannot evict the root to", &candidate, &source))
+                }
+            }
+        };
         // The root is renamed: a waiting holder wakes to a missing root and the
         // lock file is no longer useful. Unlinking it does not release our lock;
         // dropping the descriptor does.
@@ -622,9 +647,9 @@ impl Area {
         let _ = fs::remove_file(hold::activity_path(&activity, &id));
         let _ = fs::remove_file(crate::pin::pin_path(&directory, &id));
         // The rename is done and the hold lock's file is unlinked, so it protects
-        // nothing more: dropping it here leaves only the area lock across the
-        // tree delete, which is the lock a sweep takes before it looks at trash.
+        // nothing more. The area lock is also released before the tree delete.
         drop(hold_lock);
+        drop(area_lock);
         let (deleted, kept_reason) = match crate::trash::remove_evicted_tree(&trash_path, &key, &id)
         {
             Ok(removed) if removed.removed => (true, None),
@@ -987,16 +1012,6 @@ fn lock_is_current(file: &File, path: &Path) -> Result<bool> {
     let now = crate::os::path_identity(path)
         .map_err(|source| Error::io("cannot inspect the hold lock", path, &source))?;
     Ok(now == Some(held))
-}
-
-pub(crate) fn unique_trash_path(trash: &Path, name: &str) -> PathBuf {
-    let mut candidate = trash.join(name);
-    let mut counter = 0;
-    while candidate.exists() {
-        counter += 1;
-        candidate = trash.join(format!("{name}.{counter}"));
-    }
-    candidate
 }
 
 #[cfg(test)]

@@ -697,3 +697,51 @@ fn an_unreadable_pin_is_never_read_as_unpinned() {
     assert_eq!(error.kind(), crate::error::ErrorKind::Io);
     assert!(root.path.is_dir(), "the root was not evicted");
 }
+
+#[test]
+fn hold_can_start_while_evicted_tree_is_being_deleted() {
+    let (_temp, barge) = fixture();
+    let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+    let doomed = area.create_root("old").unwrap();
+    let survivor = area.create_root("new").unwrap();
+    let other = area.clone();
+    crate::trash::DELETE_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let _hold = other
+                .try_hold(&survivor.id, Mode::Exclusive)
+                .unwrap()
+                .unwrap();
+        }))
+    });
+    area.evict(&doomed.id).unwrap();
+}
+
+#[test]
+fn hold_lock_does_not_follow_a_symlink() {
+    use std::os::unix::fs::symlink;
+    let (temp, barge) = fixture();
+    let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+    let root = area.create_root("slot").unwrap();
+    let lock = hold_lock_path(root.path.parent().unwrap(), &root.id);
+    let victim = temp.child("victim");
+    fs::write(&victim, b"safe").unwrap();
+    symlink(&victim, &lock).unwrap();
+    assert!(area.try_hold(&root.id, Mode::Exclusive).is_err());
+    assert_eq!(fs::read(victim).unwrap(), b"safe");
+}
+
+#[test]
+fn adoption_rechecks_permissions_under_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, barge) = fixture();
+    let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+    let dir = area.location().unwrap().path().unwrap().join("adopted");
+    fs::create_dir_all(&dir).unwrap();
+    let changed = dir.clone();
+    ADOPT_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::set_permissions(changed, fs::Permissions::from_mode(0o777)).unwrap()
+        }))
+    });
+    assert!(area.adopt_root("adopted", "slot", "id").is_err());
+}
