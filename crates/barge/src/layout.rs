@@ -419,6 +419,22 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn invalid_layout_and_unknown_schema_are_unknown_state() {
+        let tmp = crate::testing::TempDir::new("invalid-layout").unwrap();
+        let path = tmp.child("layout.json");
+        std::fs::write(&path, br#"{"schema":"barge.layout/1","classes":{"scratch":{"volume":"Builds","path":"../escape"}}}"#).unwrap();
+        assert_eq!(
+            read(&path).unwrap_err().kind(),
+            crate::ErrorKind::UnknownState
+        );
+        std::fs::write(&path, br#"{"schema":"barge.layout/99","classes":{}}"#).unwrap();
+        assert_eq!(
+            read(&path).unwrap_err().kind(),
+            crate::ErrorKind::UnknownState
+        );
+    }
+
+    #[test]
     fn failed_volume_write_can_be_repaired_from_account() {
         let tmp = crate::testing::TempDir::new("layout-repair").unwrap();
         let mount = tmp.folder("mount").unwrap();

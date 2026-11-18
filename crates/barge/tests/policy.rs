@@ -356,3 +356,31 @@ fn a_kept_root_reports_the_size_it_holds() {
     assert!(!kept.bytes_approximate);
     drop(hold);
 }
+
+#[test]
+fn status_reports_a_free_space_failure() {
+    #[derive(Debug)]
+    struct FailingFree;
+    impl barge::Os for FailingFree {
+        fn volume_identity(&self, _mount: &std::path::Path) -> barge::Result<Option<String>> {
+            Ok(Some(common::UUID.to_string()))
+        }
+        fn free_bytes(&self, _path: &std::path::Path) -> barge::Result<u64> {
+            Err(barge::Error::unknown_state("free space unavailable"))
+        }
+    }
+    let fixture = Fixture::new();
+    let barge = barge::Barge::open_with(
+        fixture.temp.folder("failure-state").unwrap(),
+        std::sync::Arc::new(FailingFree),
+        fixture.clock.clone(),
+    )
+    .unwrap();
+    barge
+        .register_volume(VolumeRegistration::new("Builds", &fixture.mount).floor_bytes(0))
+        .unwrap();
+    assert_eq!(
+        barge.status().unwrap_err().message(),
+        "free space unavailable"
+    );
+}
