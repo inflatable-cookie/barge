@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use crate::area::Area;
-use crate::error::{Error, ErrorKind, Result};
+use crate::error::{ErrorKind, Result};
 use crate::root::RootInfo;
 use crate::volume::Volume;
 use crate::Core;
@@ -135,7 +135,7 @@ pub(crate) fn prune(
     dry_run: bool,
     target_bytes: Option<u64>,
 ) -> Result<PruneReport> {
-    let volume = volume(core, volume_name)?;
+    let volume = core.volume(volume_name)?;
     let mount = volume.require_present()?;
     let spec = volume.spec().clone();
     let free_before = core.os.free_bytes(&mount)?;
@@ -174,8 +174,27 @@ pub(crate) fn prune(
         }
     }
 
+    soft_cap_pass(&areas, dry_run, &mut report, &mut planned)?;
+    reserve_pass(
+        core,
+        &mount,
+        &areas,
+        dry_run,
+        target_bytes,
+        &planned,
+        &mut report,
+    )?;
+    Ok(report)
+}
+
+fn soft_cap_pass(
+    areas: &[Area],
+    dry_run: bool,
+    report: &mut PruneReport,
+    planned: &mut HashSet<(String, String)>,
+) -> Result<()> {
     // Each area's soft cap counts only that area's own bytes.
-    for area in &areas {
+    for area in areas {
         let Some(cap) = area.record().soft_cap_bytes else {
             continue;
         };
@@ -202,7 +221,7 @@ pub(crate) fn prune(
             if bytes <= cap {
                 break;
             }
-            if evict(area, &info, PruneReason::SoftCap, dry_run, &mut report)?.is_none() {
+            if evict(area, &info, PruneReason::SoftCap, dry_run, report)?.is_none() {
                 continue;
             }
             planned.insert((area.key().label(), info.id.clone()));
@@ -210,25 +229,41 @@ pub(crate) fn prune(
             bytes = bytes.saturating_sub(size);
         }
         if bytes > cap {
-            keep_protected(area, &mut report, Some("the area is over its soft cap"))?;
+            keep_protected(area, report, Some("the area is over its soft cap"))?;
         }
     }
 
+    Ok(())
+}
+
+fn reserve_pass(
+    core: &Core,
+    mount: &std::path::Path,
+    areas: &[Area],
+    dry_run: bool,
+    target_bytes: u64,
+    planned: &HashSet<(String, String)>,
+    report: &mut PruneReport,
+) -> Result<()> {
     let current_free = if dry_run {
-        free_before.saturating_add(report.freed_bytes)
+        report.free_before_bytes.saturating_add(report.freed_bytes)
     } else {
-        core.os.free_bytes(&mount)?
+        core.os.free_bytes(mount)?
     };
     if current_free >= target_bytes {
-        report.free_after_bytes = if dry_run { free_before } else { current_free };
-        return Ok(report);
+        report.free_after_bytes = if dry_run {
+            report.free_before_bytes
+        } else {
+            current_free
+        };
+        return Ok(());
     }
 
     // The reserve: least-recently-used idle, unpinned roots on the volume, from
     // the areas that count toward it.
     let mut candidates: Vec<(Area, RootInfo)> = Vec::new();
     let mut protected: Vec<(Area, RootInfo)> = Vec::new();
-    for area in &areas {
+    for area in areas {
         if !area.record().counts_toward_reserve {
             continue;
         }
@@ -246,12 +281,11 @@ pub(crate) fn prune(
     candidates.sort_by(|left, right| {
         (left.1.last_used_unix_ms, &left.1.id).cmp(&(right.1.last_used_unix_ms, &right.1.id))
     });
-    let mut estimate = free_before.saturating_add(report.freed_bytes);
     for (area, info) in &candidates {
         let free = if dry_run {
-            estimate
+            report.free_before_bytes.saturating_add(report.freed_bytes)
         } else {
-            core.os.free_bytes(&mount)?
+            core.os.free_bytes(mount)?
         };
         if free >= target_bytes {
             break;
@@ -259,16 +293,16 @@ pub(crate) fn prune(
         if planned.contains(&(area.key().label(), info.id.clone())) {
             continue;
         }
-        if let Some(evicted) = evict(area, info, PruneReason::Reserve, dry_run, &mut report)? {
-            estimate = estimate.saturating_add(evicted.bytes);
-        }
+        evict(area, info, PruneReason::Reserve, dry_run, report)?;
     }
     let free_after = if dry_run {
-        free_before
+        report.free_before_bytes
     } else {
-        core.os.free_bytes(&mount)?
+        core.os.free_bytes(mount)?
     };
-    if (dry_run && estimate < target_bytes) || (!dry_run && free_after < target_bytes) {
+    if (dry_run && report.free_before_bytes.saturating_add(report.freed_bytes) < target_bytes)
+        || (!dry_run && free_after < target_bytes)
+    {
         for (area, info) in &protected {
             let size = area.recorded_or_measure_bytes(info, false);
             report.kept.push(KeptRoot {
@@ -287,7 +321,7 @@ pub(crate) fn prune(
         }
     }
     report.free_after_bytes = free_after;
-    Ok(report)
+    Ok(())
 }
 
 fn evict(
@@ -379,16 +413,6 @@ fn keep_protected(area: &Area, report: &mut PruneReport, detail: Option<&str>) -
         });
     }
     Ok(())
-}
-
-fn volume(core: &Core, name: &str) -> Result<Volume> {
-    let spec = core
-        .state
-        .read_volumes()?
-        .into_iter()
-        .find(|spec| spec.name == name)
-        .ok_or_else(|| Error::not_found(format!("volume {name} is not registered")))?;
-    Ok(Volume::new(core.clone(), spec))
 }
 
 fn areas(core: &Core, volume: &Volume) -> Result<Vec<Area>> {

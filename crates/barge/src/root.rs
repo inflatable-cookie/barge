@@ -53,11 +53,6 @@ pub struct Root {
 }
 
 impl Root {
-    /// The root's actual folder name.
-    pub fn folder_name(&self) -> String {
-        self.folder.clone()
-    }
-
     /// Whether this root's expiry has passed at `now_unix_ms`.
     pub fn is_expired(&self, now_unix_ms: u64) -> bool {
         self.expires_unix_ms
@@ -199,7 +194,7 @@ pub(crate) fn write_marker(folder: &Path, marker: &RootMarker) -> Result<()> {
 }
 
 /// The folder name of an owned root.
-pub fn folder_name(label: &str, id: &str) -> String {
+pub(crate) fn derived_folder(label: &str, id: &str) -> String {
     format!("{label}-{id}")
 }
 
@@ -256,7 +251,7 @@ pub fn marker_folder(marker: &RootMarker) -> String {
     marker
         .folder
         .clone()
-        .unwrap_or_else(|| folder_name(&marker.label, &marker.id))
+        .unwrap_or_else(|| derived_folder(&marker.label, &marker.id))
 }
 
 /// Mint a new root ID from the operating system's random source.

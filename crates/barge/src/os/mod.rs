@@ -172,3 +172,99 @@ fn free_space(path: &Path) -> Result<u64> {
     let free = u128::from(status.f_bavail).saturating_mul(u128::from(status.f_frsize));
     Ok(u64::try_from(free).unwrap_or(u64::MAX))
 }
+
+use crate::hold::Mode;
+use std::os::fd::AsRawFd;
+
+/// Take an advisory lock on a file. `wait` blocks; otherwise the call reports
+/// whether the lock was available.
+pub(crate) fn flock(file: &File, mode: Mode, wait: bool) -> Result<bool> {
+    let mut operation = match mode {
+        Mode::Exclusive => libc::LOCK_EX,
+        Mode::Shared => libc::LOCK_SH,
+    };
+    if !wait {
+        operation |= libc::LOCK_NB;
+    }
+    // SAFETY: `flock` takes one descriptor this process owns and one integer of
+    // flags; it reads and writes no memory of ours.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let source = std::io::Error::last_os_error();
+    if !wait && source.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    Err(Error::new(
+        crate::error::ErrorKind::Io,
+        format!("cannot take a file lock: {source}"),
+    ))
+}
+
+pub(crate) fn set_inheritable(file: &File, inheritable: bool) -> Result<()> {
+    let descriptor = file.as_raw_fd();
+    // SAFETY: both `fcntl` calls take the descriptor this `Hold` owns and one
+    // integer; the first reads its flags and the second writes them back.
+    #[allow(unsafe_code)]
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(Error::new(
+            crate::error::ErrorKind::Io,
+            format!(
+                "cannot read the hold descriptor flags: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    let wanted = if inheritable {
+        flags & !libc::FD_CLOEXEC
+    } else {
+        flags | libc::FD_CLOEXEC
+    };
+    // SAFETY: as above: one owned descriptor and one integer flag set.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::fcntl(descriptor, libc::F_SETFD, wanted) };
+    if result < 0 {
+        return Err(Error::new(
+            crate::error::ErrorKind::Io,
+            format!(
+                "cannot set the hold descriptor flags: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Open a persistent lock file without truncating it.
+pub(crate) fn open_lock(path: &Path, context: &str) -> Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|e| Error::io(context, path, &e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_uuid;
+    #[test]
+    fn uuid_is_canonical_and_requires_exact_shape() {
+        assert_eq!(
+            canonical_uuid("  abcdef01-2345-6789-abcd-ef0123456789  ").unwrap(),
+            "ABCDEF01-2345-6789-ABCD-EF0123456789"
+        );
+        for value in [
+            "",
+            "abcdef0123456789abcdef0123456789",
+            "abcdef01-2345-6789-abcd-ef012345678z",
+            "abcdef01_2345-6789-abcd-ef0123456789",
+        ] {
+            assert!(canonical_uuid(value).is_err(), "{value:?}");
+        }
+    }
+}

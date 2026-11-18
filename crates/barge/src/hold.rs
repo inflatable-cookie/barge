@@ -6,8 +6,6 @@
 //! consumer that closes the descriptor, or writes without holding, is outside the
 //! guarantee and the architecture says so.
 
-#![allow(unsafe_code)]
-
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -34,13 +32,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn operation(self) -> libc::c_int {
-        match self {
-            Self::Exclusive => libc::LOCK_EX,
-            Self::Shared => libc::LOCK_SH,
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Exclusive => "exclusive",
@@ -100,36 +91,7 @@ impl Hold {
             .file
             .as_ref()
             .ok_or_else(|| Error::unknown_state("hold has no descriptor"))?;
-        let descriptor = file.as_raw_fd();
-        // SAFETY: both `fcntl` calls take the descriptor this `Hold` owns and one
-        // integer; the first reads its flags and the second writes them back.
-        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-        if flags < 0 {
-            return Err(Error::new(
-                crate::error::ErrorKind::Io,
-                format!(
-                    "cannot read the hold descriptor flags: {}",
-                    std::io::Error::last_os_error()
-                ),
-            ));
-        }
-        let wanted = if inheritable {
-            flags & !libc::FD_CLOEXEC
-        } else {
-            flags | libc::FD_CLOEXEC
-        };
-        // SAFETY: as above: one owned descriptor and one integer flag set.
-        let result = unsafe { libc::fcntl(descriptor, libc::F_SETFD, wanted) };
-        if result < 0 {
-            return Err(Error::new(
-                crate::error::ErrorKind::Io,
-                format!(
-                    "cannot set the hold descriptor flags: {}",
-                    std::io::Error::last_os_error()
-                ),
-            ));
-        }
-        Ok(())
+        crate::os::set_inheritable(file, inheritable)
     }
 
     /// Consume the hold and leave its descriptor inheritable.
@@ -163,29 +125,6 @@ impl Drop for Hold {
     }
 }
 
-/// Take an advisory lock on a file. `wait` blocks; otherwise the call reports
-/// whether the lock was available.
-pub(crate) fn flock(file: &File, mode: Mode, wait: bool) -> Result<bool> {
-    let mut operation = mode.operation();
-    if !wait {
-        operation |= libc::LOCK_NB;
-    }
-    // SAFETY: `flock` takes one descriptor this process owns and one integer of
-    // flags; it reads and writes no memory of ours.
-    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let source = std::io::Error::last_os_error();
-    if !wait && source.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(false);
-    }
-    Err(Error::new(
-        crate::error::ErrorKind::Io,
-        format!("cannot take a file lock: {source}"),
-    ))
-}
-
 /// Whether another process (or another descriptor here) holds the lock file.
 ///
 /// A missing lock file is an unheld root. A lock file that cannot be opened is
@@ -201,7 +140,7 @@ pub(crate) fn is_locked(path: &Path) -> Result<bool> {
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(source) => return Err(Error::io("cannot open the hold lock", path, &source)),
     };
-    Ok(!flock(&file, Mode::Exclusive, false)?)
+    Ok(!crate::os::flock(&file, Mode::Exclusive, false)?)
 }
 
 /// What a call records about a root's size.

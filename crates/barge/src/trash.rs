@@ -6,6 +6,17 @@
 //! marker is read through the descriptor the deletion then walks: the folder
 //! whose ownership was checked is the folder that is removed.
 
+#[cfg(test)]
+use crate::area::EVICT_HOOK;
+use crate::area::{
+    lock_root, parent, unchanged_marker, unique_trash_path, Area, AreaLock, Eviction, ACTIVITY_DIR,
+    BARGE_DIR, LOCKS_DIR, TRASH_DIR,
+};
+use crate::hold::{self, Mode};
+use crate::pin::{pin_path, pin_state};
+use crate::root::{self, read_marker, tree_bytes};
+use crate::space::{SkippedRoot, SweepReport, SweptRoot};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -81,6 +92,151 @@ fn remove_owned_tree_checked(path: &Path, area: &str, id: Option<&str>) -> Resul
 thread_local! {
     static OPEN_TREE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+}
+
+impl Area {
+    /// Evict a root: refuse when it is held or pinned, otherwise rename it into
+    /// the area's trash and delete it there.
+    pub fn evict(&self, id: &str) -> Result<Eviction> {
+        self.core.ensure_writable()?;
+        let root = self.resolve(id)?;
+        #[cfg(test)]
+        EVICT_HOOK.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(hook) = callback {
+                hook();
+            }
+        });
+        let directory = parent(&root.path)?;
+        self.ensure_layout(&directory)?;
+        let lock_path = directory
+            .join(BARGE_DIR)
+            .join(LOCKS_DIR)
+            .join(format!("{id}.lock"));
+        let Some(_lock_file) = lock_root(&lock_path, Mode::Exclusive, false)? else {
+            return Err(Error::refused(format!(
+                "root {id} is held; refusing to evict it"
+            )));
+        };
+        let _area_lock = AreaLock::acquire(&directory)?;
+        if pin_state(&directory, id)? {
+            return Err(Error::refused(format!(
+                "root {id} is pinned; refusing to evict it"
+            )));
+        }
+        let size = tree_bytes(&root.path);
+        let trash = directory.join(TRASH_DIR);
+        fs::create_dir_all(&trash)
+            .map_err(|source| Error::io("cannot create the trash at", &trash, &source))?;
+        let trash_path = unique_trash_path(&trash, &root.folder);
+        if !unchanged_marker(&root, &self.key().label()) {
+            return Err(Error::refused("root marker changed before eviction"));
+        }
+        fs::rename(&root.path, &trash_path)
+            .map_err(|source| Error::io("cannot evict the root to", &trash_path, &source))?;
+        // The root is renamed: a waiting holder wakes to a missing root and the
+        // lock file is no longer useful. Unlinking it does not release our lock;
+        // dropping the descriptor does.
+        let _ = fs::remove_file(&lock_path);
+        let (deleted, kept_reason) =
+            match crate::trash::remove_owned_tree_for_id(&trash_path, &self.key().label(), id) {
+                Ok(deletion) if deletion.skipped.is_empty() => (true, None),
+                Ok(deletion) => (
+                    false,
+                    Some(format!(
+                        "{} entr{} stayed in place, starting at {}",
+                        deletion.skipped.len(),
+                        if deletion.skipped.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        },
+                        deletion.skipped[0].display()
+                    )),
+                ),
+                Err(error) => (false, Some(error.message().to_string())),
+            };
+        let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
+        let _ = fs::remove_file(hold::activity_path(&activity, id));
+        let pin = pin_path(&directory, id);
+        let _ = fs::remove_file(&pin);
+        Ok(Eviction {
+            area: self.key().label(),
+            id: id.to_string(),
+            label: root.label,
+            path: root.path,
+            trash_path,
+            bytes: size.bytes,
+            bytes_approximate: size.approximate,
+            deleted,
+            kept_reason,
+        })
+    }
+
+    /// Delete every owned trash entry of this area.
+    pub fn sweep_trash(&self) -> Result<SweepReport> {
+        self.core.ensure_writable()?;
+        let mut report = SweepReport::default();
+        let key = self.key().label();
+        for (directory, _) in self.search_dirs()? {
+            let trash = directory.join(TRASH_DIR);
+            let entries = match fs::read_dir(&trash) {
+                Ok(entries) => entries,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(Error::io("cannot list the trash at", &trash, &source)),
+            };
+            self.ensure_layout(&directory)?;
+            let _lock = AreaLock::acquire(&directory)?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
+                };
+                if metadata.file_type().is_symlink() {
+                    report.kept.push(SkippedRoot {
+                        path,
+                        reason: "a symbolic link, never followed".to_string(),
+                    });
+                    continue;
+                }
+                if metadata.is_dir() {
+                    match read_marker(&path) {
+                        MarkerRead::Valid(marker) if marker.area == key => {
+                            match crate::trash::remove_owned_tree(&path, &key) {
+                                Ok(deletion) => report.deleted.push(SweptRoot {
+                                    path,
+                                    bytes: deletion.bytes,
+                                }),
+                                Err(error) => report.kept.push(SkippedRoot {
+                                    path,
+                                    reason: error.message().to_string(),
+                                }),
+                            }
+                        }
+                        MarkerRead::Valid(marker) => report.kept.push(SkippedRoot {
+                            path,
+                            reason: format!("its marker belongs to area {}", marker.area),
+                        }),
+                        MarkerRead::Missing => report.kept.push(SkippedRoot {
+                            path,
+                            reason: format!("no {}", root::MARKER_NAME),
+                        }),
+                        MarkerRead::Invalid(reason) => {
+                            report.kept.push(SkippedRoot { path, reason })
+                        }
+                    }
+                } else {
+                    report.kept.push(SkippedRoot {
+                        path,
+                        reason: "not a folder".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(report)
+    }
 }
 
 #[cfg(test)]

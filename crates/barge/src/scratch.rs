@@ -10,7 +10,6 @@ use crate::error::{Error, Result};
 use crate::root::{Listing, Root};
 use crate::space::SweepReport;
 use crate::state::validate_name;
-use crate::volume::Volume;
 use crate::Core;
 
 /// The namespace every scratch area uses.
@@ -25,47 +24,12 @@ pub struct Scratch {
 impl Scratch {
     pub(crate) fn open(core: Core, volume_name: &str, project: &str) -> Result<Self> {
         validate_name("scratch project", project)?;
-        let spec = core
-            .state
-            .read_volumes()?
-            .into_iter()
-            .find(|spec| spec.name == volume_name)
-            .ok_or_else(|| Error::not_found(format!("volume {volume_name} is not registered")))?;
-        let volume = Volume::new(core.clone(), spec);
         let proposed = AreaSpec::new(NAMESPACE, project, volume_name)
             .absent(Absent::Fail)
             .counts_toward_reserve(true)
             .into_record();
-        proposed.validate()?;
-        let record = if core.read_only {
-            core.state.read_area(&proposed.key())?.ok_or_else(|| {
-                Error::refused(format!(
-                    "scratch area {} is not declared on a read-only account",
-                    proposed.key().label()
-                ))
-            })?
-        } else {
-            let _lock = core.state.lock()?;
-            match core.state.read_area(&proposed.key())? {
-                Some(stored) => {
-                    let differing = stored.differing_fields(&proposed);
-                    if !differing.is_empty() {
-                        return Err(Error::refused(format!(
-                            "scratch area {} is already declared with different {}",
-                            proposed.key().label(),
-                            differing.join(", ")
-                        )));
-                    }
-                    stored
-                }
-                None => {
-                    core.state.write_area(&proposed)?;
-                    proposed
-                }
-            }
-        };
         Ok(Self {
-            area: Area::new(core, record, volume),
+            area: core.declare_area(proposed)?,
         })
     }
 

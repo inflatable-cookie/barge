@@ -9,7 +9,7 @@ use crate::area::AreaStatus;
 use crate::error::{Error, Result};
 use crate::os::canonical_uuid;
 use crate::state::validate_relative_path;
-use crate::Core;
+use crate::{Barge, Core};
 
 /// The schema name of `volumes.json`.
 pub const VOLUMES_SCHEMA: &str = "barge.volumes/1";
@@ -262,3 +262,57 @@ pub struct VolumeStatus {
 
 /// Every volume, for status output.
 pub type Status = Vec<VolumeStatus>;
+
+impl Barge {
+    /// Register a volume, reading its identity at the mount when the caller did
+    /// not supply one.
+    pub fn register_volume(&self, registration: VolumeRegistration) -> Result<Volume> {
+        self.core.ensure_writable()?;
+        let mut spec = registration.into_spec()?;
+        let _lock = self.core.state.lock()?;
+        let mut stored = self.core.state.read_volumes()?;
+        let found = match self.core.os.volume_identity(&spec.mount)? {
+            Some(found) => found,
+            None => {
+                return Err(Error::refused(format!(
+                    "cannot read a volume identity at {}; mount the volume first",
+                    spec.mount.display()
+                )))
+            }
+        };
+        if !spec.uuid.is_empty() && !spec.uuid.eq_ignore_ascii_case(&found) {
+            return Err(Error::refused(format!(
+                "volume at {} is {found}, not the declared {}",
+                spec.mount.display(),
+                spec.uuid
+            )));
+        }
+        spec.uuid = found;
+        for existing in &stored {
+            if existing.name != spec.name && existing.uuid.eq_ignore_ascii_case(&spec.uuid) {
+                return Err(Error::refused(format!(
+                    "volume identity {} is already registered as {}",
+                    spec.uuid, existing.name
+                )));
+            }
+        }
+        match stored
+            .iter()
+            .position(|existing| existing.name == spec.name)
+        {
+            Some(index) => {
+                if !stored[index].uuid.eq_ignore_ascii_case(&spec.uuid) {
+                    return Err(Error::refused(format!(
+                        "volume {} is registered as {}, not {}",
+                        spec.name, stored[index].uuid, spec.uuid
+                    )));
+                }
+                stored[index] = spec.clone();
+            }
+            None => stored.push(spec.clone()),
+        }
+        stored.sort_by(|left, right| left.name.cmp(&right.name));
+        self.core.state.write_volumes(&stored)?;
+        Ok(Volume::new(self.core.clone(), spec))
+    }
+}

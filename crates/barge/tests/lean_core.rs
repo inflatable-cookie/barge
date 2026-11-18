@@ -241,7 +241,7 @@ fn a_hold_that_wakes_after_an_eviction_reports_not_found() {
     // Let the waiter resolve the root and block on the lock, then rename the
     // root the way an eviction does before the first hold releases.
     std::thread::sleep(Duration::from_millis(250));
-    fs::rename(&root.path, trash.join(root.folder_name())).unwrap();
+    fs::rename(&root.path, trash.join(&root.folder)).unwrap();
     drop(first);
 
     let result = waiter.join().expect("the waiting thread finished");
@@ -280,7 +280,7 @@ fn eviction_renames_into_trash_and_a_crash_leaves_owned_trash() {
     // A crash between the rename and the delete leaves owned trash, which the
     // next sweep removes.
     let crashed = area.create_root("crash").unwrap();
-    let trash_path = trash.join(crashed.folder_name());
+    let trash_path = trash.join(&crashed.folder);
     fs::rename(&crashed.path, &trash_path).unwrap();
     assert!(trash_path.is_dir());
     let report = area.sweep_trash().unwrap();
@@ -544,7 +544,7 @@ fn an_adopted_root_keeps_its_folder_and_uses_the_normal_lifecycle() {
 
     let root = area.adopt_root(folder, "slot", "oxide-72ea0e6b").unwrap();
     assert_eq!(root.path, path);
-    assert_eq!(root.folder_name(), folder);
+    assert_eq!(root.folder, folder);
     assert_eq!(
         area.adopt_root(folder, "slot", "oxide-72ea0e6b").unwrap(),
         root
@@ -849,4 +849,22 @@ fn state_survives_a_reopen_and_a_refuses_an_unknown_schema() {
     fs::write(&volumes, br#"{"schema":"barge.volumes/99","volumes":[]}"#).unwrap();
     let error = reopened.volumes().unwrap_err();
     assert_eq!(error.kind(), ErrorKind::UnknownState);
+}
+
+#[test]
+fn readonly_scratch_refuses_a_different_declaration() {
+    let fixture = Fixture::new();
+    fixture.register();
+    fixture
+        .barge
+        .area(AreaSpec::new("scratch", "project", "Builds").soft_cap_bytes(Some(1)))
+        .unwrap();
+    let read = Barge::open_read_only_with(
+        fixture.barge.state_dir(),
+        fixture.os.clone(),
+        fixture.clock.clone(),
+    )
+    .unwrap();
+    let error = read.scratch("Builds", "project").unwrap_err();
+    assert!(error.message().contains("soft_cap_bytes"));
 }

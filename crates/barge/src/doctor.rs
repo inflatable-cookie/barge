@@ -179,7 +179,7 @@ impl Barge {
         let unknown = if base.is_dir() {
             self.survey(volume.name(), false)?
                 .into_iter()
-                .filter(|item| item.classification == "unknown")
+                .filter(|item| item.classification == crate::layout::SurveyClassification::Unknown)
                 .map(|item| item.path)
                 .collect()
         } else {

@@ -241,14 +241,8 @@ pub(crate) struct StateLock {
 impl StateLock {
     fn acquire(root: &Path) -> Result<Self> {
         let path = root.join(LOCK_NAME);
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| Error::io("cannot open the state lock", &path, &source))?;
-        crate::hold::flock(&file, Mode::Exclusive, true)?;
+        let file = crate::os::open_lock(&path, "cannot open the state lock")?;
+        crate::os::flock(&file, Mode::Exclusive, true)?;
         Ok(Self { _file: file })
     }
 }

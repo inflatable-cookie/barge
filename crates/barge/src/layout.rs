@@ -52,23 +52,6 @@ impl Class {
             _ => Durability::Expendable,
         }
     }
-
-    pub fn lifecycle(self) -> &'static str {
-        match self {
-            Self::Scratch | Self::Evidence => "expiry",
-            Self::Vms | Self::Archives => "none",
-            _ => "lru",
-        }
-    }
-
-    pub fn owner(self) -> &'static str {
-        match self {
-            Self::Scratch | Self::Worktrees => "barge",
-            Self::Builds => "consumer_areas",
-            Self::Archives => "operator",
-            _ => "tool",
-        }
-    }
 }
 
 impl std::str::FromStr for Class {
@@ -246,13 +229,24 @@ impl Barge {
         for name in &affected {
             let volume = self.volume(name)?;
             volume.require_present()?;
-            if self.layout_disagrees(name)? {
+            let expected = account.for_volume(name);
+            let record = read(&volume.spec().mount.join(".barge/layout.json"))?;
+            if record
+                .as_ref()
+                .map_or(!expected.classes.is_empty(), |record| record != &expected)
+            {
                 return Err(Error::refused(format!("layout record on {name} disagrees with account; resolve it before changing layout")));
             }
         }
         account.classes.insert(class, placement);
         account.validate()?;
         write(&self.state_dir().join("layout.json"), &account)?;
+        #[cfg(test)]
+        WRITE_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         for name in affected {
             let mount = self.volume(&name)?.require_present()?;
             write(
@@ -261,6 +255,15 @@ impl Barge {
             )?;
         }
         Ok(account)
+    }
+
+    /// Rewrite one volume record from this account's authoritative layout.
+    pub fn repair_volume_layout(&self, name: &str) -> Result<()> {
+        self.core.ensure_writable()?;
+        let _lock = self.core.state.lock()?;
+        let account = self.layout()?;
+        let mount = self.volume(name)?.require_present()?;
+        write(&mount.join(".barge/layout.json"), &account.for_volume(name))
     }
 
     /// Resolve a class on its volume or its explicit fallback.
@@ -296,17 +299,6 @@ impl Barge {
         }
         Ok(ResourcePath { path, fallback })
     }
-}
-
-/// One item in a read-only volume survey.
-#[derive(Debug, Clone, Serialize)]
-pub struct SurveyItem {
-    pub path: PathBuf,
-    pub classification: String,
-    pub bytes: Option<u64>,
-}
-
-impl Barge {
     /// List top-level items, classifying known placement and area paths.
     pub fn survey(&self, name: &str, with_bytes: bool) -> Result<Vec<SurveyItem>> {
         let volume = self.volume(name)?;
@@ -319,11 +311,23 @@ impl Barge {
             let entry = entry.map_err(|e| Error::io("cannot list", &base, &e))?;
             let path = entry.path();
             let classification = if entry.file_name() == ".barge" {
-                "barge".to_string()
+                SurveyClassification::Barge
+            } else if [
+                ".DS_Store",
+                ".Spotlight-V100",
+                ".fseventsd",
+                ".TemporaryItems",
+                ".DocumentRevisions-V100",
+                ".Trashes",
+            ]
+            .iter()
+            .any(|name| entry.file_name() == *name)
+            {
+                SurveyClassification::System
             } else if let Some((class, _)) = layout.classes.iter().find(|(_, placement)| {
                 placement.volume == name && base.join(&placement.path).starts_with(&path)
             }) {
-                format!("class:{}", class.name())
+                SurveyClassification::Class(*class)
             } else if let Some(area) = areas.iter().find(|area| {
                 area.volume == name
                     && volume
@@ -331,9 +335,9 @@ impl Barge {
                         .join(area.effective_folder())
                         .starts_with(&path)
             }) {
-                format!("area:{}/{}", area.namespace, area.name)
+                SurveyClassification::Area(format!("{}/{}", area.namespace, area.name))
             } else {
-                "unknown".to_string()
+                SurveyClassification::Unknown
             };
             let bytes = if with_bytes {
                 Some(survey_bytes(&path)?)
@@ -351,6 +355,45 @@ impl Barge {
     }
 }
 
+/// The role of an item in a volume survey.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurveyClassification {
+    Barge,
+    System,
+    Class(Class),
+    Area(String),
+    Unknown,
+}
+
+impl std::fmt::Display for SurveyClassification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Barge => f.write_str("barge"),
+            Self::System => f.write_str("system"),
+            Self::Class(class) => write!(f, "class:{}", class.name()),
+            Self::Area(area) => write!(f, "area:{area}"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+impl Serialize for SurveyClassification {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+/// One item in a read-only volume survey.
+#[derive(Debug, Clone, Serialize)]
+pub struct SurveyItem {
+    pub path: PathBuf,
+    pub classification: SurveyClassification,
+    pub bytes: Option<u64>,
+}
+
 fn survey_bytes(path: &Path) -> Result<u64> {
     let metadata = fs::symlink_metadata(path).map_err(|e| Error::io("cannot inspect", path, &e))?;
     if !metadata.is_dir() {
@@ -364,28 +407,59 @@ fn survey_bytes(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// Render one shell assignment, quoting paths without invoking a shell.
-pub fn shell_assignment(shell: &str, name: &str, value: &Path) -> Result<String> {
-    let value = value
-        .to_str()
-        .ok_or_else(|| Error::usage("resource path is not valid UTF-8"))?;
-    match shell {
-        "bash" | "zsh" => Ok(format!("export {name}='{}'", value.replace('\'', "'\\''"))),
-        "fish" => Ok(format!(
-            "set -gx {name} '{}';",
-            value.replace('\\', "\\\\").replace('\'', "\\'")
-        )),
-        _ => Err(Error::usage("shell must be zsh, bash or fish")),
-    }
+#[cfg(test)]
+thread_local! {
+    static WRITE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
-impl Barge {
-    /// Resolve the shell's scratch assignment. The caller can warn on errors or fallback.
-    pub fn resource_env(&self, shell: &str) -> Result<(String, bool)> {
-        let path = self.resource_path(Class::Scratch, None)?;
-        Ok((
-            shell_assignment(shell, "BARGE_SCRATCH", &path.path)?,
-            path.fallback,
-        ))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FakeOs, ManualClock, VolumeRegistration};
+    use std::sync::Arc;
+
+    #[test]
+    fn failed_volume_write_can_be_repaired_from_account() {
+        let tmp = crate::testing::TempDir::new("layout-repair").unwrap();
+        let mount = tmp.folder("mount").unwrap();
+        let state = tmp.folder("state").unwrap();
+        let os = Arc::new(FakeOs::with_volume(
+            &mount,
+            "11111111-2222-3333-4444-555555555555",
+            100,
+        ));
+        let barge = Barge::open_with(state, os, Arc::new(ManualClock::new(0))).unwrap();
+        barge
+            .register_volume(VolumeRegistration::new("Builds", &mount).floor_bytes(0))
+            .unwrap();
+        let path = mount.join(".barge/layout.json");
+        let blocked = path.clone();
+        WRITE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || std::fs::create_dir_all(blocked).unwrap()))
+        });
+        assert!(barge
+            .set_layout(
+                Class::Scratch,
+                Placement {
+                    volume: "Builds".into(),
+                    path: "scratch".into(),
+                    absent: Absent::Fail
+                }
+            )
+            .is_err());
+        std::fs::remove_dir(&path).unwrap();
+        assert!(barge.layout_disagrees("Builds").unwrap());
+        barge.repair_volume_layout("Builds").unwrap();
+        assert!(!barge.layout_disagrees("Builds").unwrap());
+        barge
+            .set_layout(
+                Class::Scratch,
+                Placement {
+                    volume: "Builds".into(),
+                    path: "new".into(),
+                    absent: Absent::Fail,
+                },
+            )
+            .unwrap();
     }
 }

@@ -87,6 +87,16 @@ fn path_and_survey_are_read_only() {
     fs::create_dir(f.base().join(".barge")).unwrap();
     assert!(f.mount.join(".barge/layout.json").is_file());
     assert!(!f.base().join(".barge/layout.json").exists());
+    for name in [
+        ".DS_Store",
+        ".Spotlight-V100",
+        ".fseventsd",
+        ".TemporaryItems",
+        ".DocumentRevisions-V100",
+        ".Trashes",
+    ] {
+        fs::write(f.base().join(name), b"").unwrap();
+    }
     let before = snapshot(f.temp.path());
     let read =
         Barge::open_read_only_with(f.barge.state_dir(), f.os.clone(), f.clock.clone()).unwrap();
@@ -97,25 +107,43 @@ fn path_and_survey_are_read_only() {
         f.base().join("scratch/proj")
     );
     let items = read.survey("Builds", true).unwrap();
-    assert!(items.iter().any(|i| i.classification == "class:scratch"));
-    assert!(items.iter().any(|i| i.classification == "area:test/pool"));
-    assert!(items.iter().any(|i| i.classification == "barge"));
     assert!(items
         .iter()
-        .any(|i| i.classification == "unknown" && i.bytes == Some(5)));
+        .any(|i| i.classification == barge::layout::SurveyClassification::Class(Class::Scratch)));
+    assert!(
+        items
+            .iter()
+            .any(|i| i.classification
+                == barge::layout::SurveyClassification::Area("test/pool".into()))
+    );
+    assert!(items
+        .iter()
+        .any(|i| i.classification == barge::layout::SurveyClassification::Barge));
+    assert!(items.iter().any(
+        |i| i.classification == barge::layout::SurveyClassification::Unknown && i.bytes == Some(5)
+    ));
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.classification == barge::layout::SurveyClassification::System)
+            .count(),
+        6
+    );
+    let report = read.doctor().unwrap();
+    assert!(report
+        .volumes
+        .iter()
+        .all(|volume| volume.layout.as_ref().is_none_or(|layout| layout
+            .unknown
+            .iter()
+            .all(|path| !path.file_name().unwrap().to_string_lossy().starts_with('.')))));
     read.layout().unwrap();
     read.layout_disagrees("Builds").unwrap();
     read.survey("Builds", false).unwrap();
-    for shell in ["zsh", "bash", "fish"] {
-        let (assignment, fallback) = read.resource_env(shell).unwrap();
-        assert!(assignment.contains("BARGE_SCRATCH"));
-        assert!(!fallback);
-    }
     assert_eq!(before, snapshot(f.temp.path()));
     f.os.add_volume(f.mount.clone(), None, 0);
     let before = snapshot(f.temp.path());
     assert!(read.resource_path(Class::Scratch, None).unwrap().fallback);
-    assert!(read.resource_env("bash").unwrap().1);
     assert_eq!(before, snapshot(f.temp.path()));
     let fallback = placement("scratch", Absent::Fail);
     // Policy is changed while the volume is present.
@@ -123,30 +151,12 @@ fn path_and_survey_are_read_only() {
     f.barge.set_layout(Class::Scratch, fallback).unwrap();
     f.os.add_volume(f.mount.clone(), None, 0);
     let before = snapshot(f.temp.path());
-    assert!(read.resource_env("bash").is_err());
     assert!(read
         .resource_path(Class::Scratch, None)
         .unwrap_err()
         .message()
         .contains("attach"));
     assert_eq!(before, snapshot(f.temp.path()));
-}
-
-#[test]
-fn shell_assignments_quote_paths() {
-    let path = std::path::Path::new("/some path/it's here");
-    assert_eq!(
-        barge::layout::shell_assignment("bash", "BARGE_SCRATCH", path).unwrap(),
-        "export BARGE_SCRATCH='/some path/it'\\''s here'"
-    );
-    assert_eq!(
-        barge::layout::shell_assignment("zsh", "BARGE_SCRATCH", path).unwrap(),
-        "export BARGE_SCRATCH='/some path/it'\\''s here'"
-    );
-    assert_eq!(
-        barge::layout::shell_assignment("fish", "BARGE_SCRATCH", path).unwrap(),
-        "set -gx BARGE_SCRATCH '/some path/it\\'s here';"
-    );
 }
 
 fn snapshot(root: &Path) -> Vec<(PathBuf, SystemTime, Option<Vec<u8>>)> {
