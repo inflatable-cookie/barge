@@ -24,6 +24,7 @@ pub mod doctor;
 pub mod error;
 pub mod hold;
 pub mod layout;
+pub mod move_plan;
 pub mod os;
 pub mod pin;
 pub mod root;
@@ -51,6 +52,7 @@ pub use doctor::{
 pub use error::{Error, ErrorKind, Result};
 pub use hold::{Hold, Mode};
 pub use layout::{Class, Layout, Placement, ResourcePath, SurveyItem};
+pub use move_plan::{MoveBinding, MoveIdentity, MoveLayout, MovePlan};
 pub use os::{FakeOs, Os};
 pub use root::{Listing, Root, RootInfo, Straggler};
 pub use scratch::Scratch;
