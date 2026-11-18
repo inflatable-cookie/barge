@@ -112,7 +112,7 @@ fn the_cli_registers_reports_and_manages_roots() {
     ]);
     assert!(declared.status.success(), "{}", stderr(&declared));
     let document = parse_document(&declared);
-    assert_eq!(document["schema"], "barge.area/1");
+    assert_eq!(document["schema"], "barge.area-declared/1");
     assert_eq!(document["data"]["area"]["absent"]["kind"], "fallback");
 
     let areas = fixture.json(&["area", "list", "--volume", "Builds"]);
@@ -675,7 +675,7 @@ fn bindings_record_drift_and_doctor_report_it() {
     let list = fixture.json(&["bind", "list"]);
     assert!(list.status.success(), "{}", stderr(&list));
     let document = parse_document(&list);
-    assert_eq!(document["schema"], "barge.bindings/1");
+    assert_eq!(document["schema"], "barge.binding-list/1");
     assert_eq!(
         document["data"]["bindings"][0]["consumer"],
         "cargo-registry"
