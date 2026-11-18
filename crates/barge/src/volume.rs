@@ -231,15 +231,10 @@ impl Volume {
     pub fn require_present(&self) -> Result<PathBuf> {
         match self.state()? {
             VolumeState::Present => Ok(self.spec.mount.clone()),
-            VolumeState::Absent => Err(Error::refused(format!(
-                "volume {} is absent; attach it at {}",
-                self.spec.name,
-                self.spec.mount.display()
-            ))),
-            VolumeState::Mismatch { registered, found } => Err(Error::refused(format!(
-                "volume at {} is {found}, not the registered {registered}; refusing to use it",
-                self.spec.mount.display()
-            ))),
+            VolumeState::Absent => Err(absent_refusal(&self.spec)),
+            VolumeState::Mismatch { registered, found } => {
+                Err(identity_refusal(&self.spec, &registered, &found))
+            }
         }
     }
 
@@ -248,6 +243,23 @@ impl Volume {
         let mount = self.require_present()?;
         self.core.os.free_bytes(&mount)
     }
+}
+
+/// The refusal for a volume that is attached somewhere else, or not at all.
+pub(crate) fn absent_refusal(spec: &VolumeSpec) -> Error {
+    Error::refused(format!(
+        "volume {} is absent; attach it at {}",
+        spec.name,
+        spec.mount.display()
+    ))
+}
+
+/// The refusal for a volume whose identity is not the registered one.
+pub(crate) fn identity_refusal(spec: &VolumeSpec, registered: &str, found: &str) -> Error {
+    Error::refused(format!(
+        "volume at {} is {found}, not the registered {registered}; refusing to use it",
+        spec.mount.display()
+    ))
 }
 
 /// One volume in the status document.

@@ -387,16 +387,15 @@ impl Barge {
             }
             for root in area.list_without_bytes()?.roots {
                 if root.path.starts_with(&plan.source) || plan.source.starts_with(&root.path) {
-                    let lock_path = root
+                    let directory = root
                         .path
                         .parent()
-                        .ok_or_else(|| Error::unknown_state("root has no area"))?
-                        .join(".barge/locks")
-                        .join(format!("{}.lock", root.id));
-                    let file = crate::area::lock_root(&lock_path, crate::Mode::Exclusive, false)?
+                        .ok_or_else(|| Error::unknown_state("root has no area"))?;
+                    let lock_path = crate::area::hold_lock_path(directory, &root.id);
+                    let file = crate::area::lock_root_try(&lock_path, crate::Mode::Exclusive)?
                         .ok_or_else(|| {
-                        Error::refused(format!("root {} is held", root.path.display()))
-                    })?;
+                            Error::refused(format!("root {} is held", root.path.display()))
+                        })?;
                     root_locks.push(file);
                 }
             }
@@ -478,10 +477,13 @@ impl Barge {
                 layout.classes.insert(change.class, change.after.clone());
                 let mount = self.volume(&plan.volume)?.require_present()?;
                 crate::layout::write(
-                    &mount.join(".barge/layout.json"),
+                    &mount.join(crate::layout::VOLUME_LAYOUT_FILE),
                     &layout.for_volume(&plan.volume),
                 )?;
-                crate::layout::write(&self.state_dir().join("layout.json"), &layout)?;
+                crate::layout::write(
+                    &self.state_dir().join(crate::layout::ACCOUNT_LAYOUT_FILE),
+                    &layout,
+                )?;
             }
             Ok(())
         })();
@@ -531,15 +533,16 @@ impl Barge {
             if plan.layout.is_some() {
                 if let Ok(volume) = self.volume(&plan.volume) {
                     if let Err(e) = crate::layout::write(
-                        &volume.spec().mount.join(".barge/layout.json"),
+                        &volume.spec().mount.join(crate::layout::VOLUME_LAYOUT_FILE),
                         &before_layout.for_volume(&plan.volume),
                     ) {
                         failures.push(format!("volume layout could not be restored: {e}"));
                     }
                 }
-                if let Err(e) =
-                    crate::layout::write(&self.state_dir().join("layout.json"), &before_layout)
-                {
+                if let Err(e) = crate::layout::write(
+                    &self.state_dir().join(crate::layout::ACCOUNT_LAYOUT_FILE),
+                    &before_layout,
+                ) {
                     failures.push(format!("account layout could not be restored: {e}"));
                 }
             }

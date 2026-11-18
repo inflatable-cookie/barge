@@ -206,12 +206,6 @@ pub(crate) fn measure_tree(path: &Path) -> TreeSize {
     measure_opened(path, &same_device)
 }
 
-/// The testable core of [`measure_tree`].
-#[cfg(test)]
-pub(crate) fn measure_tree_with(path: &Path, device: DeviceFn<'_>) -> TreeSize {
-    measure_opened(path, device)
-}
-
 fn measure_opened(path: &Path, device: DeviceFn<'_>) -> TreeSize {
     let mut measured = TreeSize::default();
     let directory = match open_directory(path) {
@@ -609,5 +603,15 @@ mod tests {
         assert!(!removed.skipped.is_empty(), "the deep tree stays in place");
         assert!(!removed.removed);
         assert!(deepest.is_dir());
+
+        // Measuring stops at the same cap, so a size never counts a tree the
+        // deletion would refuse to reach.
+        let measured = measure_tree(&root);
+        assert!(measured.approximate, "an uncounted tree is never exact");
+        assert!(
+            measured.bytes < 32,
+            "the buried file is past the cap: {}",
+            measured.bytes
+        );
     }
 }

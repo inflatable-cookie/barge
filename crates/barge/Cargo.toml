@@ -6,12 +6,23 @@ rust-version.workspace = true
 publish.workspace = true
 description = "Barge's storage library: volumes, areas, owned roots, holds, pins, pruning and scratch"
 
+[features]
+# `barge::testing`: the temporary directory test fixtures use. Off in the library
+# a consumer links, so test helpers never ship; dev-dependencies enable it for
+# test builds.
+testing = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+# The crate's own integration tests use `barge::testing`, so the dependency on
+# itself turns that feature on for test builds only; a normal build never sees it.
+[dev-dependencies]
+barge = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true
