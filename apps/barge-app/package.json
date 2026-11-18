@@ -11,8 +11,6 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@inflatable-cookie/longhorn": "0.5.0",
-    "@inflatable-cookie/longhorn-tauri": "0.5.0",
     "@inflatable-cookie/poodle-core": "0.4.15",
     "@inflatable-cookie/poodle-svelte": "0.4.15",
     "@tauri-apps/api": "2.12.5",

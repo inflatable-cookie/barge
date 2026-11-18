@@ -21,9 +21,14 @@ alias = "barge"
 # this task composes it so one name selects it.
 "rust:test" = [{ task = "test rust" }]
 
-"app:check" = "cd apps/barge-app && npm run check"
-"app:test" = "cd apps/barge-app && npm run test"
-"app:dev" = "cd apps/barge-app && oxide exec -- npm run tauri -- dev"
+"app:check" = "cd apps/barge-app && bun run check"
+"app:test" = "cd apps/barge-app && bun run test"
+# One command from the repo root: install the renderer's dependencies from the
+# committed lockfile, then start the app through Oxide (AGENTS.md, "Validate").
+"app:dev" = [
+  "cd apps/barge-app && bun install --frozen-lockfile",
+  "cd apps/barge-app && oxide exec -- bun run tauri dev",
+]
 
 [test.suites.rust]
 # The whole workspace's suites: the library, the CLI, the machine client, the

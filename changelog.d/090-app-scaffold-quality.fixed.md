@@ -1,0 +1,1 @@
+Make the app scaffold reachable and honest: the window opens on launch and on relaunch, one preferences store serves the commands and Longhorn's settings registry, a failed save reverts, a failed read marks storage stale, launch at login follows the OS, and the tray popover is placed in logical coordinates with a proper template icon.

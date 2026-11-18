@@ -45,9 +45,12 @@ Rust runs through `oxide` (see the block below).
 - `effigy rust:format` — `oxide fmt --all -- --check`; `rust:format:apply` applies it.
 - `effigy docs:check` — Northstar's link check, the changelog check, and
   `git diff --check HEAD`. Check its exit code.
-- `effigy app:check` — typecheck the Svelte renderer.
-- `effigy app:test` — renderer tests.
-- `effigy app:dev` — run the app locally.
+- `effigy app:check` — typecheck the Svelte renderer with bun.
+- `effigy app:test` — renderer tests with bun.
+- `effigy app:dev` — the one command that runs the app locally: it installs the
+  renderer's dependencies from the committed `bun.lock`
+  (`bun install --frozen-lockfile`) and starts Tauri through `oxide exec`. The
+  renderer uses bun, not npm; `apps/barge-app/bun.lock` is committed.
 
 Those are the repository's only selectors. Add one only for a check this
 section names, and run it through Effigy rather than raw `cargo`.
