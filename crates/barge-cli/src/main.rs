@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use barge::{
     Absent, ApplyOptions, AreaSpec, Availability, Barge, Binding, BindingState, BlockState, Class,
-    DoctorReport, Durability, Error, ErrorKind, InitAction, InitCheck, InitReport, Placement,
-    Result, RootInfo, VolumeRegistration, VolumeState, VolumeStatus,
+    DoctorReport, Durability, Error, ErrorKind, InitAction, InitCheck, InitReport,
+    MoveApplyOptions, Placement, Result, RootInfo, VolumeRegistration, VolumeState, VolumeStatus,
 };
 use barge_machine::{
     request_power, AssumeYes, Confirmation, DaemonClient, DatagramSender, Machine, PowerActionKind,
@@ -148,7 +148,7 @@ usage: barge [--json] <command>
   bind undo <consumer>                    restore what was there before
   move <class> <new-path> --plan           review a class move
   move --item PATH --into CLASS[/SUB] --plan
-  move --apply --plan FILE|- [--confirm-stopped]
+  move --apply --plan FILE|- [--confirm-stopped] [--retarget-unrecorded]
   doctor                                  volumes, layout and binding drift
   init [--project P] [--path DIR] [--check]
                                           write the AGENTS.md scratch block;

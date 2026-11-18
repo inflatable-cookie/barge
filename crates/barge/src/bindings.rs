@@ -11,6 +11,11 @@
 //! explicit replace; it is renamed aside and undo renames it back. Deleting a
 //! link removes the link itself, never what it points at.
 //!
+//! A link may point at a folder or at a regular file, which is how a tool's disk
+//! image is reached. Both kinds of destination are recorded with the device and
+//! inode Barge linked, so doctor reports a destination that was replaced, not
+//! just one the link no longer reaches.
+//!
 //! The `workflow` kind records the managed block `barge init` writes into a
 //! repository's `AGENTS.md`, so `barge doctor` can report the block as current
 //! or stale. Its consumer is the repository path. `init` merges into the file
@@ -81,6 +86,16 @@ pub enum EntryKind {
     File,
 }
 
+/// The filesystem identity of a link's destination: the device and inode Barge
+/// pointed the link at. A record kept before identities were captured has none,
+/// and is then compared by path alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
 /// What was at the target before Barge applied the link. Undo restores it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -123,6 +138,11 @@ pub struct Applied {
     /// The resolved class value the target now points at.
     pub value: PathBuf,
     pub at_unix_ms: u64,
+    /// The device and inode the destination had when Barge applied it. Absent in
+    /// a record written before identities were captured, and for a workflow
+    /// block, which has no destination of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<EntryIdentity>,
 }
 
 /// One recorded binding.
@@ -258,6 +278,9 @@ pub struct LinkPlan {
     pub link: PathBuf,
     pub before: Observed,
     pub after: Observed,
+    /// The device and inode of the destination the plan resolved, so apply
+    /// refuses a destination that was replaced since it was reviewed.
+    pub destination_identity: EntryIdentity,
     /// The target is a real directory or file: applying needs the explicit
     /// replace and preserves it beside the link.
     pub replace: bool,
@@ -305,6 +328,7 @@ impl Bindings {
     pub fn plan(&self, binding: &Binding) -> Result<LinkPlan> {
         binding.validate()?;
         let destination = self.destination(binding.class, binding.value()?)?;
+        let destination_identity = entry_identity(&destination)?;
         require_parent(&binding.link)?;
         self.check_free(&binding.consumer, &binding.link)?;
         let before = observe(&binding.link)?;
@@ -313,6 +337,7 @@ impl Bindings {
             class: binding.class,
             link: binding.link.clone(),
             after: Observed::Link { destination },
+            destination_identity,
             replace: matches!(before, Observed::Directory { .. } | Observed::File { .. }),
             before,
         })
@@ -345,6 +370,13 @@ impl Bindings {
         }
         let destination = self.destination(binding.class, binding.value()?)?;
         check_plan(binding, plan, &destination)?;
+        let identity = entry_identity(&destination)?;
+        if identity != plan.destination_identity {
+            return Err(Error::refused(format!(
+                "destination {} was replaced since it was planned",
+                destination.display()
+            )));
+        }
         let prior = prior_for(&binding.link, &observed)?;
         if let Prior::Preserved { path, .. } = &prior {
             if !options.replace {
@@ -386,6 +418,7 @@ impl Bindings {
             applied: Applied {
                 value: destination,
                 at_unix_ms: self.core.clock.now_unix_ms(),
+                identity: Some(identity),
             },
             prior: prior.clone(),
         };
@@ -449,8 +482,9 @@ impl Bindings {
                 path: binding.link.clone(),
             },
             applied: Applied {
-                value: resolved,
+                value: resolved.clone(),
                 at_unix_ms: self.core.clock.now_unix_ms(),
+                identity: Some(entry_identity(&resolved)?),
             },
             prior: Prior::Link { destination },
         };
@@ -564,7 +598,9 @@ impl Bindings {
         Ok(volume.base().join(&placement.path))
     }
 
-    /// The resolved value, refused unless it is a folder inside the class folder.
+    /// The resolved class value, refused unless it is a folder or a regular file
+    /// inside the class folder. A symlink that leaves the class folder is never
+    /// reached: the value is resolved first and checked as it really is.
     fn destination(&self, class: Class, value: &Path) -> Result<PathBuf> {
         let folder = canonical_dir(&self.class_folder(class)?)?;
         let destination = match fs::canonicalize(value) {
@@ -577,9 +613,9 @@ impl Bindings {
             }
             Err(source) => return Err(Error::io("cannot resolve", value, &source)),
         };
-        if !is_directory(&destination) {
+        if !is_folder_or_file(&destination) {
             return Err(Error::refused(format!(
-                "link destination {} is not a folder",
+                "link destination {} is not a folder or a regular file",
                 value.display()
             )));
         }
@@ -748,7 +784,7 @@ fn reapply_applied(link: &Path, record: &BindingRecord) -> Result<()> {
 
 /// Whether two link paths name the same target, resolving the folder above them
 /// so `sub/../x` and a symlinked folder still count as one target.
-fn same_target(left: &Path, right: &Path) -> bool {
+pub(crate) fn same_target(left: &Path, right: &Path) -> bool {
     match (target_identity(left), target_identity(right)) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
@@ -817,6 +853,27 @@ fn is_directory(path: &Path) -> bool {
     fs::metadata(path)
         .map(|metadata| metadata.is_dir())
         .unwrap_or(false)
+}
+
+fn is_folder_or_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| {
+            let kind = metadata.file_type();
+            kind.is_dir() || kind.is_file()
+        })
+        .unwrap_or(false)
+}
+
+/// The device and inode of an existing entry.
+pub(crate) fn entry_identity(path: &Path) -> Result<EntryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata =
+        fs::metadata(path).map_err(|source| Error::io("cannot inspect", path, &source))?;
+    Ok(EntryIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
 }
 
 fn canonical_dir(path: &Path) -> Result<PathBuf> {

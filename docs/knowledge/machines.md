@@ -35,6 +35,16 @@ for visual design:
   address.
 - Launching Moonlight against the PC is a convenience action in the UI.
 
+## VM disks
+
+A virtual machine's disk is kept data, the `vms` class, and the tool reaches it
+through a link the tool owns, such as `~/.colima/_lima/<profile>/disk`
+([resources](resources.md#known-link-locations)). Retarget that link before the
+VM starts: Lima recreates a missing disk, so a VM started with a dangling link
+boots a blank machine instead of failing. `barge move --plan` lists such a link
+when it points inside the moved folder, and refuses to apply until the move is
+asked to retarget it ([moving a class](resources.md#moving-a-class)).
+
 ## Registry state
 
 The registry is `machines.json` in the account state directory, the same

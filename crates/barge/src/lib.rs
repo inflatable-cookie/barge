@@ -19,6 +19,7 @@ pub mod clock;
 pub mod doctor;
 pub mod error;
 pub mod hold;
+pub mod known_links;
 pub mod layout;
 pub mod move_plan;
 pub mod os;
@@ -38,8 +39,8 @@ use state::StateDir;
 
 pub use area::{Absent, Area, AreaRecord, AreaSpec, AreaStatus, Location};
 pub use bindings::{
-    Applied, ApplyOptions, Binding, BindingKind, BindingRecord, BindingTarget, Bindings, EntryKind,
-    LinkPlan, Observed, Prior,
+    Applied, ApplyOptions, Binding, BindingKind, BindingRecord, BindingTarget, Bindings,
+    EntryIdentity, EntryKind, LinkPlan, Observed, Prior,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use doctor::{
@@ -47,8 +48,12 @@ pub use doctor::{
 };
 pub use error::{Error, ErrorKind, Result};
 pub use hold::{Hold, Mode};
+pub use known_links::KnownLink;
 pub use layout::{Class, Layout, Placement, ResourcePath, SurveyItem};
-pub use move_plan::{MoveArea, MoveBinding, MoveIdentity, MoveLayout, MovePlan, MoveReport};
+pub use move_plan::{
+    MoveApplyOptions, MoveArea, MoveBinding, MoveIdentity, MoveLayout, MovePlan, MoveReport,
+    UnrecordedLink,
+};
 pub use os::{FakeOs, Os};
 pub use root::{Listing, Root, RootInfo, Straggler};
 pub use scratch::Scratch;
@@ -76,9 +81,22 @@ pub(crate) struct Core {
     pub(crate) os: Arc<dyn Os>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) read_only: bool,
+    /// The home folder known link locations are found under, when a caller named
+    /// one instead of `HOME`.
+    pub(crate) home: Option<PathBuf>,
 }
 
 impl Core {
+    /// The home folder to look for known link locations under: the one a caller
+    /// named, else `HOME`. Without either, no known-link scan runs.
+    pub(crate) fn home(&self) -> Option<PathBuf> {
+        self.home.clone().or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+        })
+    }
+
     pub(crate) fn ensure_writable(&self) -> Result<()> {
         if self.read_only {
             Err(Error::refused("Barge account was opened read-only"))
@@ -161,6 +179,7 @@ impl Barge {
                 os,
                 clock,
                 read_only: false,
+                home: None,
             },
         })
     }
@@ -184,8 +203,17 @@ impl Barge {
                 os,
                 clock,
                 read_only: true,
+                home: None,
             },
         })
+    }
+
+    /// Look for known link locations under `home` instead of `HOME`. Only a
+    /// caller that is not scanning a real home folder needs this, which is what
+    /// Barge's own tests do; a real run reads `HOME`.
+    pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.core.home = Some(home.into());
+        self
     }
 
     /// The account state directory in use.

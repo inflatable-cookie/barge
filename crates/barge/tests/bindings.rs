@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use barge::{
-    Absent, ApplyOptions, Barge, Binding, BindingState, Class, Observed, Placement, Prior,
+    Absent, ApplyOptions, Barge, Binding, BindingState, Class, EntryIdentity, Observed, Placement,
+    Prior,
 };
 use common::{Fixture, TIB, UUID};
 
@@ -38,6 +39,42 @@ fn class_folder(fixture: &Fixture, relative: &str) -> PathBuf {
     let path = fixture.base().join("caches").join(relative);
     fs::create_dir_all(&path).unwrap();
     path
+}
+
+/// A `vms` class folder, where a tool's disk images live.
+fn vms_layout(fixture: &Fixture) -> PathBuf {
+    fixture
+        .barge
+        .set_layout(
+            Class::Vms,
+            Placement {
+                volume: "Builds".into(),
+                path: "vms".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+    let folder = fixture.base().join("vms");
+    fs::create_dir_all(&folder).unwrap();
+    folder
+}
+
+/// The device and inode of an entry, as Barge records them.
+fn identity(path: &Path) -> EntryIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).unwrap();
+    EntryIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    }
+}
+
+/// Replace a file with a fresh one at the same path, so its inode changes.
+fn replace_file(path: &Path, contents: &[u8]) {
+    let fresh = path.with_file_name("fresh-disk");
+    fs::write(&fresh, contents).unwrap();
+    fs::rename(&fresh, path).unwrap();
 }
 
 fn home(fixture: &Fixture) -> PathBuf {
@@ -647,4 +684,141 @@ fn snapshot(root: &Path) -> Vec<(PathBuf, SystemTime, Option<Vec<u8>>)> {
     visit(root, &mut result);
     result.sort_by(|a, b| a.0.cmp(&b.0));
     result
+}
+
+#[test]
+fn a_file_destination_plans_applies_adopts_undoes_and_reports_ok() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let vms = vms_layout(&fixture);
+    let disk = vms.join("colima-effigy/disk");
+    fs::create_dir(disk.parent().unwrap()).unwrap();
+    fs::write(&disk, b"disk-image").unwrap();
+    let link = home(&fixture).join("disk");
+    let bindings = fixture.barge.bindings();
+    let binding = Binding::link("colima-disk", Class::Vms, &link).to(&disk);
+
+    let plan = bindings.plan(&binding).unwrap();
+    assert_eq!(plan.before, Observed::Absent);
+    assert_eq!(
+        plan.after,
+        Observed::Link {
+            destination: canonical(&disk)
+        },
+        "a regular file is a destination, resolved as the link will hold it"
+    );
+    assert_eq!(plan.destination_identity, identity(&disk));
+    assert!(!plan.replace);
+
+    let record = bindings
+        .apply(&binding, &plan, ApplyOptions::default())
+        .unwrap();
+    assert_eq!(canonical(&link), canonical(&disk));
+    assert_eq!(record.applied.value, canonical(&disk));
+    assert_eq!(record.applied.identity, Some(identity(&disk)));
+    assert_eq!(fs::read(&link).unwrap(), b"disk-image");
+    assert!(fixture.barge.doctor().unwrap().ok);
+
+    bindings.undo("colima-disk").unwrap();
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert_eq!(
+        fs::read(&disk).unwrap(),
+        b"disk-image",
+        "undo never follows the link"
+    );
+
+    // Adopt records a file link that is already there, without changing it.
+    symlink(&disk, &link).unwrap();
+    let adopted = bindings
+        .adopt(&Binding::link("colima-disk", Class::Vms, &link))
+        .unwrap();
+    assert_eq!(adopted.applied.value, canonical(&disk));
+    assert_eq!(adopted.applied.identity, Some(identity(&disk)));
+    assert_eq!(
+        adopted.prior,
+        Prior::Link {
+            destination: disk.clone()
+        }
+    );
+    assert!(fixture.barge.doctor().unwrap().ok);
+    bindings.undo("colima-disk").unwrap();
+    assert_eq!(fs::read_link(&link).unwrap(), disk);
+
+    // A file destination may not be reached through a link that leaves the class
+    // folder, and the plan says so.
+    let outside = fixture.temp.child("outside-disk");
+    fs::write(&outside, b"elsewhere").unwrap();
+    let sneak = vms.join("colima-effigy/sneak");
+    symlink(&outside, &sneak).unwrap();
+    let refused = bindings
+        .plan(&Binding::link("sneak", Class::Vms, &link).to(&sneak))
+        .unwrap_err();
+    assert!(
+        refused.message().contains("outside the vms class folder"),
+        "{}",
+        refused.message()
+    );
+}
+
+#[test]
+fn apply_refuses_a_file_destination_replaced_since_the_plan() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let vms = vms_layout(&fixture);
+    let disk = vms.join("colima/disk");
+    fs::create_dir(disk.parent().unwrap()).unwrap();
+    fs::write(&disk, b"disk-image").unwrap();
+    let link = home(&fixture).join("disk");
+    let bindings = fixture.barge.bindings();
+    let binding = Binding::link("colima-disk", Class::Vms, &link).to(&disk);
+
+    let plan = bindings.plan(&binding).unwrap();
+    replace_file(&disk, b"another disk");
+    let refused = bindings
+        .apply(&binding, &plan, ApplyOptions::default())
+        .unwrap_err();
+    assert!(
+        refused.message().contains("replaced since it was planned"),
+        "{}",
+        refused.message()
+    );
+    assert!(fs::symlink_metadata(&link).is_err(), "nothing was linked");
+    assert!(bindings.list().unwrap().is_empty());
+}
+
+#[test]
+fn doctor_reports_a_replaced_file_destination_as_drift() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let vms = vms_layout(&fixture);
+    let disk = vms.join("colima/disk");
+    fs::create_dir(disk.parent().unwrap()).unwrap();
+    fs::write(&disk, b"disk-image").unwrap();
+    let link = home(&fixture).join("disk");
+    let bindings = fixture.barge.bindings();
+    let binding = Binding::link("colima-disk", Class::Vms, &link).to(&disk);
+    let plan = bindings.plan(&binding).unwrap();
+    bindings
+        .apply(&binding, &plan, ApplyOptions::default())
+        .unwrap();
+    assert!(fixture.barge.doctor().unwrap().ok);
+
+    // The tool replaces its disk at the same path: the link still reaches a file,
+    // but not the one Barge linked.
+    replace_file(&disk, b"a fresh disk");
+    let report = fixture.barge.doctor().unwrap();
+    assert!(!report.ok);
+    assert_eq!(report.problems(), 1);
+    match &report.bindings[0].state {
+        BindingState::Drifted {
+            observed,
+            expected,
+            reason,
+        } => {
+            assert_eq!(observed.as_deref(), Some(canonical(&disk).as_path()));
+            assert_eq!(expected, &canonical(&disk));
+            assert!(reason.contains("replaced"), "{reason}");
+        }
+        other => panic!("expected drifted, got {other:?}"),
+    }
 }

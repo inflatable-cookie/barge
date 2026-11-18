@@ -253,7 +253,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 - `init [--project p] [--path dir] [--check]`, which writes or reports the
   managed `AGENTS.md` workflow block from the layout
   ([resources](resources.md#reaching-tools-and-agents-without-coupling));
-- `move --plan | --apply`;
+- `move --plan | --apply [--retarget-unrecorded]`;
 - `doctor`;
 - `machine add | list | remove | wake | status | sleep | restart | shutdown | cancel`
   ([machines](machines.md)).
