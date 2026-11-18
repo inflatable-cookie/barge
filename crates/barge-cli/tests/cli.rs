@@ -2,6 +2,11 @@
 //! the verbs the brief lists. Every fixture is a temporary directory; the
 //! registered mount is a folder inside it, so nothing touches a real drive.
 
+// An integration test target is its own crate, and its fixture helpers are not
+// inside a `#[test]` function, where `clippy.toml` grants the exception. Tests
+// may unwrap, expect and panic; the shipped crates may not.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -12,6 +17,10 @@ use std::time::Duration;
 
 use barge::testing::TempDir;
 use serde_json::Value;
+
+/// The identity the test-only seam hook reports for every fixture mount
+/// (`BARGE_TEST_VOLUME_UUID`), so no test depends on the host's own volume.
+const TEST_UUID: &str = "11111111-2222-3333-4444-555555555555";
 
 struct Fixture {
     temp: TempDir,
@@ -27,10 +36,19 @@ impl Fixture {
         Self { temp, state, mount }
     }
 
-    fn run(&self, arguments: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_barge"))
+    /// The environment every run gets: the fixture's own state directory and the
+    /// fixed volume identity.
+    fn barge(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_barge"));
+        command
             .args(arguments)
             .env("BARGE_STATE_DIR", &self.state)
+            .env("BARGE_TEST_VOLUME_UUID", TEST_UUID);
+        command
+    }
+
+    fn run(&self, arguments: &[&str]) -> Output {
+        self.barge(arguments)
             .output()
             .expect("run the barge binary")
     }
@@ -149,8 +167,7 @@ fn the_cli_registers_reports_and_manages_roots() {
     assert_eq!(document["schema"], "barge.volume/1");
     assert_eq!(document["data"]["state"]["state"], "present");
     assert_eq!(
-        document["data"]["volume"]["uuid"].as_str().unwrap().len(),
-        36,
+        document["data"]["volume"]["uuid"], TEST_UUID,
         "the volume identity is read at the mount"
     );
 
@@ -278,9 +295,7 @@ fn the_cli_maps_refusals_and_usage_to_their_exit_codes() {
         "00000000-0000-0000-0000-000000000000",
     ]);
     assert_eq!(duplicate.status.code(), Some(1), "{}", stderr(&duplicate));
-    let volume = parse_document(&fixture.json(&["volume", "status", "Builds"]));
-    let uuid = volume["data"]["volume"]["uuid"].as_str().unwrap();
-    assert_eq!(stderr(&duplicate), format!("barge: volume at {} is {uuid}, not the declared 00000000-0000-0000-0000-000000000000\n", fixture.mount()));
+    assert_eq!(stderr(&duplicate), format!("barge: volume at {} is {TEST_UUID}, not the declared 00000000-0000-0000-0000-000000000000\n", fixture.mount()));
 
     let missing = fixture.json(&["volume", "status", "Missing"]);
     assert_eq!(missing.status.code(), Some(1));
@@ -446,9 +461,8 @@ fn register_machine(fixture: &Fixture, daemon_port: u16) {
 }
 
 fn run_with_stdin(fixture: &Fixture, arguments: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_barge"))
-        .args(arguments)
-        .env("BARGE_STATE_DIR", &fixture.state)
+    let mut child = fixture
+        .barge(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -882,6 +896,7 @@ fn usage_and_passive_commands_do_not_create_state() {
         Command::new(env!("CARGO_BIN_EXE_barge"))
             .args(args)
             .env("BARGE_STATE_DIR", &missing)
+            .env("BARGE_TEST_VOLUME_UUID", TEST_UUID)
             .output()
             .unwrap()
     };

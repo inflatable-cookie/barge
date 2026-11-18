@@ -8,11 +8,6 @@
 //! shell command, and the request body never names a method: [`PowerActionKind`]
 //! is the whole set of things the daemon can be asked to do.
 
-#![cfg_attr(
-    not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
-
 use std::fmt;
 
 pub mod config;

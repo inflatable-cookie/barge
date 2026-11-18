@@ -110,6 +110,9 @@ pub fn platform() -> Arc<dyn Os> {
 
 impl Os for PlatformOs {
     fn volume_identity(&self, mount: &Path) -> Result<Option<String>> {
+        if let Some(uuid) = test_identity(mount) {
+            return Ok(Some(uuid));
+        }
         #[cfg(target_os = "macos")]
         {
             macos::volume_uuid(mount)
@@ -124,6 +127,35 @@ impl Os for PlatformOs {
     fn free_bytes(&self, path: &Path) -> Result<u64> {
         free_space(path)
     }
+}
+
+/// The environment variable that replaces the real volume identity.
+///
+/// This is Barge's only test affordance in the shipped binary: the CLI contract
+/// tests register a fixture folder, so they set this to a fixed UUID instead of
+/// depending on the host's own volume. It exists because a platform whose real
+/// identity Barge cannot read yet (Linux) would otherwise have no CLI contract
+/// coverage at all. Nothing in Barge sets it.
+const TEST_IDENTITY_VAR: &str = "BARGE_TEST_VOLUME_UUID";
+
+/// The fake identity, when the test hook is set and the path is a temporary one.
+///
+/// Only a path inside the process's own temporary directory is affected, so the
+/// hook can never name a registered volume on a real drive. A value that is not
+/// a canonical UUID is ignored rather than refused: this hook only stands in for
+/// a fact the platform could not supply, and a real run never has it.
+fn test_identity(mount: &Path) -> Option<String> {
+    let value = std::env::var_os(TEST_IDENTITY_VAR)?;
+    let value = value.to_str()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let temporary = std::fs::canonicalize(std::env::temp_dir()).ok()?;
+    let candidate = std::fs::canonicalize(mount).ok()?;
+    if !candidate.starts_with(&temporary) {
+        return None;
+    }
+    canonical_uuid(value).ok()
 }
 
 /// Normalise a volume UUID to the canonical uppercase 8-4-4-4-12 form.
@@ -247,6 +279,39 @@ pub(crate) fn open_lock(path: &Path, context: &str) -> Result<File> {
         .truncate(false)
         .open(path)
         .map_err(|e| Error::io(context, path, &e))
+}
+
+/// Rename only if the destination is absent, without a check-then-rename race.
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let from =
+        CString::new(from.as_os_str().as_bytes()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let to =
+        CString::new(to.as_os_str().as_bytes()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    // SAFETY: both paths are valid NUL-terminated strings and the calls do not retain them.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(test)]

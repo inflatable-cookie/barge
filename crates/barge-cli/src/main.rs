@@ -1,8 +1,3 @@
-#![cfg_attr(
-    not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
-
 //! Barge's CLI: argument parsing, the JSON envelope, exit codes and the human
 //! summary. Every mechanic lives in the `barge` library.
 //!
@@ -35,6 +30,8 @@ mod survey;
 use survey::*;
 mod bind;
 use bind::*;
+mod move_resource;
+use move_resource::*;
 mod doctor;
 use doctor::*;
 mod init;
@@ -108,6 +105,7 @@ fn dispatch(command: &str, rest: &[String], json: bool) -> Result<()> {
         "area" => area(rest, json),
         "root" => root(rest, json),
         "bind" => bind(rest, json),
+        "move" => move_resource(rest, json),
         "prune" => prune(rest, json),
         "scratch" => scratch(rest, json),
         "machine" => machine(rest, json),
@@ -148,6 +146,9 @@ usage: barge [--json] <command>
   bind apply --plan FILE|- [--replace]    apply exactly that reviewed plan
   bind adopt --consumer C --class K --link PATH
   bind undo <consumer>                    restore what was there before
+  move <class> <new-path> --plan           review a class move
+  move --item PATH --into CLASS[/SUB] --plan
+  move --apply --plan FILE|- [--confirm-stopped]
   doctor                                  volumes, layout and binding drift
   init [--project P] [--path DIR] [--check]
                                           write the AGENTS.md scratch block;
@@ -228,6 +229,7 @@ mod tests {
     }
 
     use super::*;
+    use barge::testing::TempDir;
     use std::io;
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -244,14 +246,9 @@ mod tests {
 
     #[test]
     fn machine_cli_add_list_and_wake_use_the_fake_sender() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("barge-cli-machine-{}-{unique}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
-        let registry = Registry::open(&path).unwrap();
+        // The fixture removes itself, even if an assertion below panics.
+        let temp = TempDir::new("cli-machine").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
         let sender = FakeSender::default();
         let add = [
             "add",
@@ -292,8 +289,6 @@ mod tests {
         assert_eq!(sent[0].0.len(), 102);
         assert_eq!(sent[0].1, "192.168.1.255:9".parse().unwrap());
         assert_eq!(registry.list().unwrap().len(), 1);
-        drop(sent);
-        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

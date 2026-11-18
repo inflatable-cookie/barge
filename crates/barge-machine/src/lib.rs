@@ -8,10 +8,6 @@
 //! file, so a registry write and a storage write never interleave, and the two
 //! copies have to be changed together.
 #![deny(missing_docs)]
-#![cfg_attr(
-    not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
 
 use std::fs::{self, File};
 use std::io::{self, Write};

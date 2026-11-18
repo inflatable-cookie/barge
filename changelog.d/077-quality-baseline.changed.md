@@ -1,0 +1,1 @@
+Make the tests deterministic and portable, share dependency requirements across the workspace, move the panic lints to the workspace with a test exception, and drop the retired `evidence` class; the docs now match the built CLI, layout and API.

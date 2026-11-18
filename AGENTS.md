@@ -4,7 +4,7 @@ Barge moves heavy, rebuildable developer data off the internal drive onto a dedi
 
 ## Ownership and work
 
-Repository: `inflatable-cookie/barge`. Since 2026-11-17 Barge has its own planner (a Claude Code thread) and is no longer planned by the Oxide Supervisor; Oxide's planner keeps Oxide (Tom). Briefs, tasks and reviews run through Nucleus; do not create repository planning or status mirrors. Product changes go through a brief, a PR and one independent review. Scope or direction changes go to Tom.
+Repository: `inflatable-cookie/barge`. Who plans, owns and may change Barge is recorded in [vision](docs/knowledge/vision.md#authority); this file does not restate it. Briefs, tasks and reviews run through Nucleus; do not create repository planning or status mirrors. Product changes go through a brief, a PR and one independent review. Scope or direction changes go to Tom.
 
 ## Guardrails
 

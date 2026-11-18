@@ -1,7 +1,9 @@
 # Resources and bindings
 
-Status: design approved by Tom, 2026-11-18. Steps 1-3 are built; later steps remain planned. The lean storage core in [architecture](architecture.md) is the mechanism
-this design builds on and does not change.
+Status: design approved by Tom, 2026-11-18. Steps 1, 2, 3 and 5 are built;
+step 4 remains planned. The lean storage core in
+[architecture](architecture.md) is the mechanism this design builds on and does
+not change.
 
 ## The problem
 
@@ -43,9 +45,13 @@ The starting set:
 | `worktrees` | expendable, LRU | Barge | warm git worktree pools, Paseo and Nucleus workspaces |
 | `builds` | expendable, LRU | the consumer, via areas | Oxide's pool and outputs |
 | `caches` | expendable, LRU | the tool | Cargo registry and git, npm, bun, pip |
-| `evidence` | expendable, with expiry | the tool | Effigy, Praxis and Nucleus run evidence |
 | `vms` | kept | the tool | Colima and Parallels disks |
 | `archives` | kept | the operator | archives and old projects |
+
+**Run evidence is scratch** (Tom, 2026-11-18). A tool's run evidence is placed
+under the `scratch` class, `scratch/<tool>/…`, with that tool's own expiry;
+there is no separate class for it. A stored layout that still names `evidence`
+is refused, naming the retired class, rather than misread.
 
 **Durability belongs to the class, not the volume** (Tom, 2026-11-18). Each
 class is placed on one registered volume, and different classes can live on
@@ -80,7 +86,6 @@ It has two copies, with one authority:
     "worktrees": { "volume": "Stash", "path": "worktrees" },
     "builds":    { "volume": "Stash", "path": "builds" },
     "caches":    { "volume": "Stash", "path": "caches" },
-    "evidence":  { "volume": "Stash", "path": "evidence" },
     "vms":       { "volume": "Stash", "path": "vms" },
     "archives":  { "volume": "Stash", "path": "archives" }
   }
@@ -262,20 +267,22 @@ Changing where a class lives is the operation the Stash tidy needs, so it is
 one command with a plan:
 
 ```
-barge move <class|area> <new-path> --plan    # writes nothing
-barge move <class|area> <new-path> --apply   # after operator approval
+barge move <class> <new-path> --plan > plan.json
+barge move --item <path> --into <class>/<sub> --plan > plan.json
+barge move --apply --plan plan.json --confirm-stopped
 ```
 
-The plan lists:
+The reviewed JSON plan records volume and filesystem identities and lists:
 - the data to move. A move within one APFS volume is a rename: instant,
   atomic, and with no copy.
 - every binding that points at the old path, with its exact change;
 - the workflow blocks to regenerate;
-- the consumers that must be stopped first.
+- the consumers that must be stopped first;
+- area declarations carried by a moved folder, whose consumers must update their declarations.
 
 Barge doesn't scan processes, so for tool-owned data the operator confirms the
 tool is stopped. For Barge-owned roots, holds already prove it. Apply renames,
-then updates each binding, then runs doctor. A failure leaves both the old
+then updates each binding and any moved area declaration and layout, then runs doctor. An item inside an area cannot be moved out on its own because that would orphan its root. A failure leaves both the old
 binding and the old data in place, or rolls the rename back. The apply step
 always needs Tom's explicit approval for live data (AGENTS.md guardrail).
 
@@ -289,24 +296,26 @@ plan.
 ## Library and CLI additions
 
 ```rust
-let layout = barge.layout("Stash")?;                // read, or the default proposal
-layout.path(Class::Scratch)?;                       // resolved, with the absent policy applied
-barge.bindings()?.doctor()?;                        // Report
+let layout = barge.layout()?;                       // the account's placements
+let path = barge.resource_path(Class::Scratch, Some("oxide"))?;  // absent policy applied
 let block = barge.workflow("project")?;             // the managed AGENTS.md block
-let report = barge.init(repo, None)?;               // insert or replace it, and record it
+let init = barge.init(repo, None)?;                 // insert or replace it, and record it
 let check = barge.init_check(repo, None)?;          // current, stale or missing
-barge.bind(Binding::setting("paseo", Class::Worktrees))?.plan()?;   // Change; apply is explicit
+let report = barge.doctor()?;                       // read-only drift report
+let bindings = barge.bindings();
+let plan = bindings.plan(&binding)?;                // the exact before and after
+bindings.apply(&binding, &plan, ApplyOptions::default())?;   // takes that plan back
 ```
 
-CLI:
+CLI, as built:
 - `barge layout show|set`
 - `barge path <class> [--project p]`
-- `barge env [--shell zsh]`
-- `barge bind list|plan|apply|undo`
-- `barge doctor`
-- `barge init [--check]`
-- `barge survey`
+- `barge env [--shell zsh|bash|fish]`
+- `barge bind list|plan|apply|adopt|undo`
+- `barge init [--project p] [--path dir] [--check]`
 - `barge move --plan|--apply`
+- `barge doctor`
+- `barge survey <volume>`
 
 ## What stays out
 
@@ -328,7 +337,7 @@ Each step is its own brief, reviewed as usual.
 3. **Built:** `init` with workflow blocks. Adopting this repository, then
    Effigy's, is the operator's step after merge.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
-5. `move --plan|--apply`; the Stash layout lane then uses it item by item.
+5. **Built:** `move --plan|--apply`; the Stash layout lane then uses it item by item.
 
 ## Questions
 
