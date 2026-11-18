@@ -79,6 +79,17 @@ impl StateDir {
         Ok(state)
     }
 
+    /// Open an account path for reads without creating it or any child.
+    pub fn open_read_only(root: PathBuf) -> Result<Self> {
+        if !root.is_absolute() {
+            return Err(Error::usage(format!(
+                "state directory {} is not absolute",
+                root.display()
+            )));
+        }
+        Ok(Self { root })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

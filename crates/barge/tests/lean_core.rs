@@ -6,6 +6,7 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -13,6 +14,160 @@ use barge::{
     Absent, AreaSpec, Barge, ErrorKind, Mode, PruneReason, VolumeRegistration, VolumeState,
 };
 use common::{fill, Fixture, OTHER_UUID, TIB, UUID};
+
+fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn visit(root: &Path, path: &Path, result: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            let relative = entry
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if entry.is_dir() {
+                result.push((relative, Vec::new()));
+                visit(root, &entry, result);
+            } else {
+                result.push((relative, fs::read(entry).unwrap()));
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    if root.exists() {
+        visit(root, root, &mut result);
+    }
+    result
+}
+
+#[test]
+fn read_only_open_is_passive_for_absent_partial_and_populated_accounts() {
+    let fixture = Fixture::new();
+    let absent = fixture.temp.path().join("absent-account");
+    let before = tree_snapshot(&absent);
+    let reader =
+        Barge::open_read_only_with(&absent, fixture.os.clone(), fixture.clock.clone()).unwrap();
+    assert!(reader.volumes().unwrap().is_empty());
+    assert!(reader.areas().unwrap().is_empty());
+    assert_eq!(tree_snapshot(&absent), before);
+
+    let partial = fixture.temp.path().join("partial-account");
+    fs::create_dir(&partial).unwrap();
+    fs::write(
+        partial.join("volumes.json"),
+        br#"{"schema":"barge.volumes/1","volumes":[]}"#,
+    )
+    .unwrap();
+    let before = tree_snapshot(&partial);
+    let reader =
+        Barge::open_read_only_with(&partial, fixture.os.clone(), fixture.clock.clone()).unwrap();
+    assert!(reader.volumes().unwrap().is_empty());
+    assert!(reader.areas().unwrap().is_empty());
+    assert_eq!(tree_snapshot(&partial), before);
+
+    fixture.register();
+    let area = fixture.area("pool");
+    let root = area.create_root("slot").unwrap();
+    let scratch = fixture.barge.scratch("Builds", "scratch-test").unwrap();
+    let scratch_root = scratch.create("scratch", Duration::from_secs(60)).unwrap();
+    let state_path = fixture.barge.state_dir().to_path_buf();
+    let before = tree_snapshot(&state_path);
+    let volume_before = tree_snapshot(&fixture.mount);
+    let reader =
+        Barge::open_read_only_with(&state_path, fixture.os.clone(), fixture.clock.clone()).unwrap();
+    assert_eq!(reader.volumes().unwrap().len(), 1);
+    assert_eq!(
+        reader.volume("Builds").unwrap().state().unwrap(),
+        VolumeState::Present
+    );
+    assert_eq!(reader.areas().unwrap().len(), 2);
+    let inspected = reader
+        .area(AreaSpec::new("test", "pool", "Builds"))
+        .unwrap();
+    assert!(matches!(
+        inspected.location().unwrap(),
+        barge::Location::Volume(_)
+    ));
+    assert_eq!(inspected.list().unwrap().roots.len(), 1);
+    assert_eq!(inspected.resolve(&root.id).unwrap().path, root.path);
+    assert_eq!(reader.space("Builds").unwrap().free_bytes, TIB);
+    assert!(reader.prune("Builds", true).unwrap().dry_run);
+    assert_eq!(
+        reader
+            .scratch("Builds", "scratch-test")
+            .unwrap()
+            .roots()
+            .unwrap()
+            .roots
+            .len(),
+        1
+    );
+    assert_eq!(tree_snapshot(&state_path), before);
+    assert_eq!(tree_snapshot(&fixture.mount), volume_before);
+    assert!(scratch_root.path.is_dir());
+}
+
+#[test]
+fn every_read_only_mutation_refuses_without_changing_files() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let area = fixture.area("pool");
+    let root = area.create_root("slot").unwrap();
+    let scratch = fixture.barge.scratch("Builds", "scratch-test").unwrap();
+    let scratch_root = scratch.create("scratch", Duration::from_secs(60)).unwrap();
+    let folder = root
+        .path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let state_path = fixture.barge.state_dir().to_path_buf();
+    let reader =
+        Barge::open_read_only_with(&state_path, fixture.os.clone(), fixture.clock.clone()).unwrap();
+    let area = reader
+        .area(AreaSpec::new("test", "pool", "Builds"))
+        .unwrap();
+    let scratch = reader.scratch("Builds", "scratch-test").unwrap();
+    let snapshot = tree_snapshot(fixture.temp.path());
+    let assert_refused = |result: barge::Result<()>| {
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::Refused);
+        assert_eq!(tree_snapshot(fixture.temp.path()), snapshot);
+    };
+
+    assert_refused(
+        reader
+            .register_volume(VolumeRegistration::new("Builds", fixture.mount.clone()))
+            .map(|_| ()),
+    );
+    assert_refused(
+        reader
+            .area(AreaSpec::new("test", "new", "Builds"))
+            .map(|_| ()),
+    );
+    assert_refused(area.create_root("new").map(|_| ()));
+    assert_refused(
+        area.adopt_root(&folder, "adopted", "adopted-id")
+            .map(|_| ()),
+    );
+    assert_refused(area.hold(&root.id, Mode::Exclusive).map(|_| ()));
+    assert_refused(area.try_hold(&root.id, Mode::Shared).map(|_| ()));
+    assert_refused(area.pin(&root.id, "preview"));
+    assert_refused(area.unpin(&root.id));
+    assert_refused(area.evict(&root.id).map(|_| ()));
+    assert_refused(reader.prune("Builds", false).map(|_| ()));
+    assert_refused(reader.admit("Builds").map(|_| ()));
+    assert_refused(area.sweep_trash().map(|_| ()));
+    assert_refused(area.sweep_expired().map(|_| ()));
+    assert_refused(reader.sweep_trash("Builds").map(|_| ()));
+    assert_refused(reader.sweep_scratch("Builds", None).map(|_| ()));
+    assert_refused(scratch.create("new", Duration::from_secs(60)).map(|_| ()));
+    assert_refused(scratch.sweep().map(|_| ()));
+    assert!(scratch_root.path.is_dir());
+}
 
 #[test]
 fn a_hold_blocks_eviction_and_prune_and_a_release_allows_them() {

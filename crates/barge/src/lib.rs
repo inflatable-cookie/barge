@@ -56,6 +56,17 @@ pub(crate) struct Core {
     pub(crate) state: StateDir,
     pub(crate) os: Arc<dyn Os>,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) read_only: bool,
+}
+
+impl Core {
+    pub(crate) fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            Err(Error::refused("Barge account was opened read-only"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Barge's entry point: the account state directory plus the platform seams.
@@ -82,7 +93,35 @@ impl Barge {
     ) -> Result<Self> {
         let state = StateDir::open(state_dir.into())?;
         Ok(Self {
-            core: Core { state, os, clock },
+            core: Core {
+                state,
+                os,
+                clock,
+                read_only: false,
+            },
+        })
+    }
+
+    /// Open the default account without creating or changing files.
+    pub fn open_read_only() -> Result<Self> {
+        let root = StateDir::discover()?;
+        Self::open_read_only_with(root, os::platform(), Arc::new(clock::SystemClock::new()))
+    }
+
+    /// Open a named account without creating or changing files.
+    pub fn open_read_only_with(
+        state_dir: impl Into<PathBuf>,
+        os: Arc<dyn Os>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        let state = StateDir::open_read_only(state_dir.into())?;
+        Ok(Self {
+            core: Core {
+                state,
+                os,
+                clock,
+                read_only: true,
+            },
         })
     }
 
@@ -94,6 +133,7 @@ impl Barge {
     /// Register a volume, reading its identity at the mount when the caller did
     /// not supply one.
     pub fn register_volume(&self, registration: VolumeRegistration) -> Result<Volume> {
+        self.core.ensure_writable()?;
         let mut spec = registration.into_spec()?;
         let _lock = self.core.state.lock()?;
         let mut stored = self.core.state.read_volumes()?;
@@ -170,6 +210,24 @@ impl Barge {
         let proposed = spec.into_record();
         proposed.validate()?;
         let volume_name = proposed.volume.clone();
+        if self.core.read_only {
+            self.volume(&volume_name)?;
+            let stored = self.core.state.read_area(&proposed.key())?.ok_or_else(|| {
+                Error::refused(format!(
+                    "area {} is not declared on a read-only account",
+                    proposed.key().label()
+                ))
+            })?;
+            let differing = stored.differing_fields(&proposed);
+            if !differing.is_empty() {
+                return Err(Error::refused(format!(
+                    "area {} is already declared with different {}",
+                    proposed.key().label(),
+                    differing.join(", ")
+                )));
+            }
+            return self.area_from_record(stored);
+        }
         let _lock = self.core.state.lock()?;
         self.volume(&volume_name)?;
         let stored = self.core.state.read_area(&proposed.key())?;
@@ -222,12 +280,16 @@ impl Barge {
     /// Prune a volume: each area's soft cap first, then least-recently-used idle
     /// unpinned roots until free space is back above the volume's reserve.
     pub fn prune(&self, volume_name: &str, dry_run: bool) -> Result<PruneReport> {
+        if !dry_run {
+            self.core.ensure_writable()?;
+        }
         space::prune(&self.core, volume_name, dry_run, None)
     }
 
     /// Admit work on a volume: prune, then refuse only below the floor once
     /// nothing idle is left.
     pub fn admit(&self, volume_name: &str) -> Result<PruneReport> {
+        self.core.ensure_writable()?;
         let floor = self.volume(volume_name)?.spec().floor_bytes;
         let report = space::prune(&self.core, volume_name, false, Some(floor))?;
         let space = self.space(volume_name)?;
@@ -242,6 +304,7 @@ impl Barge {
 
     /// Delete every owned trash entry of every area on a volume.
     pub fn sweep_trash(&self, volume_name: &str) -> Result<SweepReport> {
+        self.core.ensure_writable()?;
         let mut report = SweepReport::default();
         for area in self.areas()? {
             if area.record().volume != volume_name {
@@ -262,6 +325,7 @@ impl Barge {
     /// Sweep expired idle scratch roots for one project, or every project on the
     /// volume when `project` is `None`.
     pub fn sweep_scratch(&self, volume_name: &str, project: Option<&str>) -> Result<SweepReport> {
+        self.core.ensure_writable()?;
         let mut report = SweepReport::default();
         for area in self.areas()? {
             let record = area.record();
