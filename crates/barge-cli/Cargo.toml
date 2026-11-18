@@ -16,5 +16,10 @@ barge-machine = { path = "../barge-machine" }
 # The JSON envelope: the CLI encodes one document per command.
 serde_json.workspace = true
 
+# Tests use the storage library's `testing::TempDir`; the feature stays off in the
+# library the binary links.
+[dev-dependencies]
+barge = { path = "../barge", features = ["testing"] }
+
 [lints]
 workspace = true

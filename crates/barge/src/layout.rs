@@ -6,9 +6,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Absent, Barge, Core, Durability, Error, Result, VolumeState};
+use crate::{Absent, Barge, Core, Error, Result, VolumeState};
 
 const SCHEMA: &str = "barge.layout/1";
+
+/// The account's authoritative layout record, inside its state directory.
+pub(crate) const ACCOUNT_LAYOUT_FILE: &str = "layout.json";
+/// A volume's copy of the layout record, relative to its mount.
+pub(crate) const VOLUME_LAYOUT_FILE: &str = ".barge/layout.json";
 
 /// The resource classes Barge can place.
 ///
@@ -43,13 +48,6 @@ impl Class {
             Self::Caches => "caches",
             Self::Vms => "vms",
             Self::Archives => "archives",
-        }
-    }
-
-    pub fn durability(self) -> Durability {
-        match self {
-            Self::Vms | Self::Archives => Durability::Kept,
-            _ => Durability::Expendable,
         }
     }
 }
@@ -170,7 +168,7 @@ pub struct ResourcePath {
 impl Core {
     /// Read the account layout, without creating state.
     pub(crate) fn account_layout(&self) -> Result<Layout> {
-        Ok(read(&self.state.root().join("layout.json"))?.unwrap_or_default())
+        Ok(read(&self.state.root().join(ACCOUNT_LAYOUT_FILE))?.unwrap_or_default())
     }
 }
 
@@ -183,7 +181,7 @@ impl Barge {
     /// Read a volume's record, after checking the registered volume identity.
     pub fn volume_layout(&self, volume: &str) -> Result<Option<Layout>> {
         let mount = self.volume(volume)?.require_present()?;
-        read(&mount.join(".barge/layout.json"))
+        read(&mount.join(VOLUME_LAYOUT_FILE))
     }
 
     /// Report whether an existing volume record differs from the account copy.
@@ -240,7 +238,7 @@ impl Barge {
             }
             account.classes.insert(class, placement);
         }
-        write(&self.state_dir().join("layout.json"), &account)?;
+        write(&self.state_dir().join(ACCOUNT_LAYOUT_FILE), &account)?;
         Ok(account)
     }
 
@@ -259,7 +257,7 @@ impl Barge {
             let volume = self.volume(name)?;
             volume.require_present()?;
             let expected = account.for_volume(name);
-            let record = read(&volume.spec().mount.join(".barge/layout.json"))?;
+            let record = read(&volume.spec().mount.join(VOLUME_LAYOUT_FILE))?;
             if record
                 .as_ref()
                 .map_or(!expected.classes.is_empty(), |record| record != &expected)
@@ -269,19 +267,17 @@ impl Barge {
         }
         account.classes.insert(class, placement);
         account.validate()?;
-        write(&self.state_dir().join("layout.json"), &account)?;
+        write(&self.state_dir().join(ACCOUNT_LAYOUT_FILE), &account)?;
         #[cfg(test)]
         WRITE_HOOK.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() {
+            let callback = hook.borrow_mut().take();
+            if let Some(hook) = callback {
                 hook();
             }
         });
         for name in affected {
             let mount = self.volume(&name)?.require_present()?;
-            write(
-                &mount.join(".barge/layout.json"),
-                &account.for_volume(&name),
-            )?;
+            write(&mount.join(VOLUME_LAYOUT_FILE), &account.for_volume(&name))?;
         }
         Ok(account)
     }
@@ -292,7 +288,7 @@ impl Barge {
         let _lock = self.core.state.lock()?;
         let account = self.layout()?;
         let mount = self.volume(name)?.require_present()?;
-        write(&mount.join(".barge/layout.json"), &account.for_volume(name))
+        write(&mount.join(VOLUME_LAYOUT_FILE), &account.for_volume(name))
     }
 
     /// Resolve a class on its volume or its explicit fallback.
@@ -318,9 +314,14 @@ impl Barge {
                 }
                 Absent::Fallback { path } => (path.clone(), true),
             },
-            VolumeState::Mismatch { .. } => {
-                volume.require_present()?;
-                return Err(Error::refused("volume identity mismatch"));
+            // A volume found at the mount that is not the registered one is
+            // refused here, naming both UUIDs; there is no fallback for it.
+            VolumeState::Mismatch { registered, found } => {
+                return Err(crate::volume::identity_refusal(
+                    volume.spec(),
+                    &registered,
+                    &found,
+                ))
             }
         };
         if let Some(project) = project {
@@ -434,6 +435,50 @@ mod tests {
     use super::*;
     use crate::{FakeOs, ManualClock, VolumeRegistration};
     use std::sync::Arc;
+
+    /// A registered volume named `Builds` at a mount inside a temporary folder.
+    fn fixture(label: &str) -> (crate::testing::TempDir, Arc<FakeOs>, Barge, PathBuf) {
+        let tmp = crate::testing::TempDir::new(label).unwrap();
+        let mount = tmp.folder("mount").unwrap();
+        let state = tmp.folder("state").unwrap();
+        let os = Arc::new(FakeOs::with_volume(
+            &mount,
+            "11111111-2222-3333-4444-555555555555",
+            100,
+        ));
+        let barge = Barge::open_with(state, os.clone(), Arc::new(ManualClock::new(0))).unwrap();
+        barge
+            .register_volume(VolumeRegistration::new("Builds", &mount).floor_bytes(0))
+            .unwrap();
+        (tmp, os, barge, mount)
+    }
+
+    #[test]
+    fn survey_refuses_a_volume_it_cannot_use() {
+        let (_tmp, os, barge, mount) = fixture("survey-absent");
+        os.set_uuid(&mount, None);
+        let error = barge.survey("Builds", false).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Refused);
+        assert!(error.message().contains("absent"), "{error}");
+
+        os.set_uuid(&mount, Some("99999999-8888-7777-6666-555555555555"));
+        let error = barge.survey("Builds", false).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Refused);
+        assert!(error.message().contains("11111111"), "{error}");
+    }
+
+    #[test]
+    fn survey_reports_a_failure_to_list_the_volume_base() {
+        let (_tmp, _os, barge, mount) = fixture("survey-unlistable");
+        std::fs::create_dir(mount.join("item")).unwrap();
+        std::fs::remove_dir_all(&mount).unwrap();
+        let error = barge.survey("Builds", false).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert!(
+            error.message().contains("cannot list"),
+            "the failure names what it could not read: {error}"
+        );
+    }
 
     #[test]
     fn invalid_layout_and_unknown_schema_are_unknown_state() {

@@ -27,7 +27,6 @@ pub mod root;
 pub mod scratch;
 pub mod space;
 pub mod state;
-pub mod testing;
 mod trash;
 pub mod volume;
 pub mod workflow;
@@ -61,6 +60,14 @@ pub use volume::{
     Availability, Durability, Volume, VolumeRegistration, VolumeSpec, VolumeState, VolumeStatus,
 };
 pub use workflow::{BlockState, InitAction, InitCheck, InitReport, WorkflowBlock};
+
+/// Small helpers for tests: a private temporary directory that removes itself.
+///
+/// The module is a feature and not part of the library Oxide links: a build that
+/// does not ask for `testing` carries no test helpers at all. Barge's own tests
+/// enable it through its dev-dependency.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 /// The shared interior of [`Barge`], [`area::Area`] and [`scratch::Scratch`].
 #[derive(Debug, Clone)]

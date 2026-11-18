@@ -60,7 +60,8 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   expected mount) on every use, and never uses a different volume found at the
   same mount point.
 - **Area.** A folder a consumer declares, named `<namespace>/<area>` (for
-  example `oxide/pool`, `oxide/outputs`). Its path defaults to
+  example `oxide/pool`, `oxide/outputs`). A namespace never carries a `.`, so the
+  account file `<namespace>.<area>.json` names exactly one area. Its path defaults to
   `<root_dir>/<namespace>/<area>/` and can be overridden per volume. The
   declaration carries the area's absent-volume policy, an optional soft cap,
   and whether it counts toward the volume reserve. The stored declaration is
@@ -111,7 +112,9 @@ overridden to their existing folder names, so adoption moves nothing.
 
 Storage declarations, areas, pins, roots, holds, trash, space policy and scratch
 live in separate library modules. Account state and platform operations live in
-`state` and `os`; command-line rendering stays in the CLI. A volume layout
+`state` and `os`; command-line rendering stays in the CLI. Test fixtures (a
+temporary directory that removes itself) sit behind the `testing` feature, so
+the library a consumer links carries no test helpers. A volume layout
 record can be repaired from the authoritative account copy with
 `repair_volume_layout` after an interrupted write. Survey marks macOS system
 entries separately, so doctor does not treat them as unknown.
@@ -197,7 +200,9 @@ compatibility, freshness or what a root contains.
 - An area's **soft cap** counts only that area's own bytes; above it, the
   area's own LRU idle roots are evicted. Root sizes are recorded when holds are
   released; roots without a recorded size are measured once on the next
-  soft-cap check. The total is approximate between releases. A size a walk could
+  soft-cap check. `status` reports that recorded total too, measuring only a root
+  no release has recorded, so reading status never walks every root. The total is
+  approximate between releases. A size a walk could
   not take exactly, because an entry was unreadable, a folder could not be
   enumerated or the tree is deeper than deletion reaches, is reported as
   approximate rather than as exact. Only a complete measurement is recorded, and
@@ -263,8 +268,10 @@ the block is stale or missing.
 ## Platforms
 
 macOS on APFS first. The OS layer is deliberately small: volume identity (UUID
-at a mount) and free space. Locks, renames and markers are portable, so Linux
-support is a new identity and space implementation, not a redesign.
+at a mount), free space, and the descriptor-relative open, lock and rename
+helpers every other module calls instead of naming a syscall itself. Markers are
+portable, so Linux support is a new identity and space implementation, not a
+redesign.
 
 ## Testing
 
@@ -295,6 +302,13 @@ identity. Required cases:
 There are no native proof ladders or capture harnesses. Before Oxide adopts a
 new Barge revision, run `barge volume status` and a `prune --dry-run` against
 the real Stash drive by hand.
+
+Two test affordances exist and no others. `barge::testing` is behind the
+`testing` feature, which only dev-dependencies enable, so it is not in the
+library a consumer links. `BARGE_TEST_VOLUME_UUID` is the one hook in the shipped
+library: it replaces the real volume identity, and only for a path inside the
+process's own temporary directory, so the CLI contract tests can register a
+fixture folder on a platform whose identity Barge cannot read yet.
 
 ## Boundary with Oxide
 
