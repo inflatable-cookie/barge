@@ -499,3 +499,20 @@ fn oversized_body_is_rejected() {
     let (status, _) = harness.raw(request);
     assert_eq!(status, 413);
 }
+
+#[test]
+fn stalled_body_times_out_and_the_next_client_is_served() {
+    let harness = Harness::new();
+    // A completed request confirms the serving thread is running before the
+    // stalled connection and its successor are queued in that order.
+    assert_eq!(harness.state().power, PowerState::Awake);
+    let mut slow = TcpStream::connect(harness.address).unwrap();
+    slow.write_all(b"POST /v1/power HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+        .unwrap();
+    let start = std::time::Instant::now();
+    assert_eq!(harness.state().power, PowerState::Awake);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    let mut response = String::new();
+    slow.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+}

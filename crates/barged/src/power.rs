@@ -299,16 +299,22 @@ mod tests {
         controller.request(PowerActionKind::Shutdown, 0).unwrap();
         let guard = controller.lock();
         let (started, received) = std::sync::mpsc::channel();
+        let (finished, completion) = std::sync::mpsc::channel();
         let stop = controller.clone();
         let thread = std::thread::spawn(move || {
             started.send(()).unwrap();
             stop.stop();
+            finished.send(()).unwrap();
         });
         received.recv().unwrap();
-        assert!(!controller.shared.stopped.load(Ordering::SeqCst));
+        let while_locked = completion.recv_timeout(Duration::from_millis(200));
         drop(guard);
         thread.join().unwrap();
-        assert!(controller.shared.stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            while_locked,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        completion.recv_timeout(Duration::from_secs(1)).unwrap();
         controller.wait_for_change();
         assert_eq!(controller.fire_due(), None);
         assert!(backend.called().is_empty());

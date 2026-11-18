@@ -508,24 +508,21 @@ mod tests {
         slow.write_all(b"POST /v1/power HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
             .unwrap();
         ready.recv().unwrap();
+        let (stop_drip, stopped) = std::sync::mpsc::channel();
         let drip = std::thread::spawn(move || {
-            for _ in 0..8 {
-                std::thread::sleep(Duration::from_millis(500));
-                if slow.write_all(b" ").is_err() {
-                    break;
-                }
+            while stopped.recv_timeout(Duration::from_millis(500)).is_err() {
+                // Keep the connection open even if the server has timed it out.
+                let _ = slow.write_all(b" ");
             }
         });
         let start = Instant::now();
-        assert!(
-            barge_machine::DaemonClient::at(format!("http://{address}"))
-                .cancel()
-                .unwrap()
-                .cancelled
-        );
-        assert!(start.elapsed() < Duration::from_secs(5));
+        let result = barge_machine::DaemonClient::at(format!("http://{address}")).cancel();
+        let elapsed = start.elapsed();
+        stop_drip.send(()).unwrap();
         drip.join().unwrap();
         server.join().unwrap();
+        assert!(result.unwrap().cancelled);
+        assert!(elapsed < Duration::from_secs(5));
     }
 
     #[test]
