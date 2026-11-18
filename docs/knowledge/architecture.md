@@ -264,8 +264,10 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
   ([machines](machines.md)).
 
 `--json` prints one document with a top-level `schema` field
-(`barge.<kind>/<n>`); consumers check it and refuse unknown versions. `env`
-refuses `--json` because its output is shell code. Exit codes: 0 success, 1
+(`barge.<kind>/<n>`); consumers check it and refuse unknown versions. Every
+document's fields and their shapes are the
+[consumption contract](contracts/consumption.md). `env` refuses `--json`
+because its output is shell code. Exit codes: 0 success, 1
 refused or not found (nothing changed), 2 usage error, 3 internal error.
 `doctor` exits 1 when its read-only report is not ok; `init --check` exits 1 when
 the block is stale or missing.
