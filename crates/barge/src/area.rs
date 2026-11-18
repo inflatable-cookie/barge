@@ -477,6 +477,7 @@ impl Area {
         root::validate_label(label)?;
         let directory = self.available_dir()?;
         self.ensure_layout(&directory)?;
+        let _area_lock = AreaLock::acquire(&directory)?;
         let now = self.core.clock.now_unix_ms();
         let mut attempts = 0;
         loop {
@@ -753,6 +754,13 @@ impl Area {
     /// the area's trash and delete it there.
     pub fn evict(&self, id: &str) -> Result<Eviction> {
         let root = self.resolve(id)?;
+        #[cfg(test)]
+        EVICT_HOOK.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(hook) = callback {
+                hook();
+            }
+        });
         let directory = parent(&root.path)?;
         self.ensure_layout(&directory)?;
         let lock_path = directory
@@ -782,16 +790,25 @@ impl Area {
         fs::create_dir_all(&trash)
             .map_err(|source| Error::io("cannot create the trash at", &trash, &source))?;
         let trash_path = unique_trash_path(&trash, &root.folder_name());
+        match read_marker(&root.path) {
+            MarkerRead::Valid(marker)
+                if marker.area == self.key().label()
+                    && marker.id == root.id
+                    && marker.label == root.label
+                    && root::marker_folder(&marker) == root.folder => {}
+            _ => return Err(Error::refused("root marker changed before eviction")),
+        }
         fs::rename(&root.path, &trash_path)
             .map_err(|source| Error::io("cannot evict the root to", &trash_path, &source))?;
         // The root is renamed: a waiting holder wakes to a missing root and the
         // lock file is no longer useful. Unlinking it does not release our lock;
         // dropping the descriptor does.
         let _ = fs::remove_file(&lock_path);
-        let deleted = match crate::trash::remove_owned_tree(&trash_path, &self.key().label()) {
-            Ok(deletion) => deletion.skipped.is_empty(),
-            Err(_) => false,
-        };
+        let deleted =
+            match crate::trash::remove_owned_tree_for_id(&trash_path, &self.key().label(), id) {
+                Ok(deletion) => deletion.skipped.is_empty(),
+                Err(_) => false,
+            };
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         let _ = fs::remove_file(hold::activity_path(&activity, id));
         let pin = pin_path(&directory, id);
@@ -1070,4 +1087,125 @@ fn unique_trash_path(trash: &Path, name: &str) -> PathBuf {
         candidate = trash.join(format!("{name}.{counter}"));
     }
     candidate
+}
+
+#[cfg(test)]
+thread_local! {
+    static EVICT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+mod eviction_identity_tests {
+    use super::*;
+    use crate::{Barge, ManualClock, VolumeRegistration};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn fixture() -> (crate::testing::TempDir, Barge) {
+        let temp = crate::testing::TempDir::new("identity").unwrap();
+        let mount = temp.folder("mount").unwrap();
+        let state = temp.folder("state").unwrap();
+        let os = Arc::new(crate::os::FakeOs::new());
+        os.add_volume(
+            mount.clone(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            0,
+        );
+        let barge = Barge::open_with(state, os, Arc::new(ManualClock::new(1000))).unwrap();
+        barge
+            .register_volume(
+                VolumeRegistration::new("disk", mount)
+                    .reserve_bytes(1)
+                    .floor_bytes(0),
+            )
+            .unwrap();
+        (temp, barge)
+    }
+
+    fn replace_on_resolve(area: &Area, root: &Root) -> Rc<RefCell<Option<crate::hold::Hold>>> {
+        let held = Rc::new(RefCell::new(None));
+        let saved = held.clone();
+        let area = area.clone();
+        let root = root.clone();
+        EVICT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                area.evict(&root.id).unwrap();
+                fs::create_dir(&root.path).unwrap();
+                fs::write(root.path.join("contents"), b"keep").unwrap();
+                area.adopt_root(&root.folder, "replacement", "replacement-id")
+                    .unwrap();
+                area.pin("replacement-id", "keep").unwrap();
+                *saved.borrow_mut() = Some(area.hold("replacement-id", Mode::Shared).unwrap());
+            }))
+        });
+        held
+    }
+
+    fn assert_replacement(area: &Area, root: &Root, held: &Rc<RefCell<Option<crate::hold::Hold>>>) {
+        assert_eq!(fs::read(root.path.join("contents")).unwrap(), b"keep");
+        let listing = area.list().unwrap();
+        let replacement = listing.get("replacement-id").unwrap();
+        assert!(replacement.held && replacement.pinned);
+        assert!(held.borrow().is_some());
+    }
+
+    #[test]
+    fn stale_eviction_keeps_replacement_with_hold_and_pin() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        let held = replace_on_resolve(&area, &root);
+        assert!(area.evict(&root.id).is_err());
+        assert_replacement(&area, &root, &held);
+    }
+
+    #[test]
+    fn changed_missing_and_symlinked_markers_refuse_eviction() {
+        for change in 0..3 {
+            let (_temp, barge) = fixture();
+            let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+            let root = area.create_root("slot").unwrap();
+            let path = root.path.clone();
+            EVICT_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let marker = path.join(root::MARKER_NAME);
+                    if change == 0 {
+                        let mut value = match read_marker(&path) {
+                            MarkerRead::Valid(value) => value,
+                            _ => panic!("marker"),
+                        };
+                        value.label = "changed".to_string();
+                        root::write_marker(&path, &value).unwrap();
+                    } else if change == 1 {
+                        fs::remove_file(marker).unwrap();
+                    } else {
+                        let target = path.join("marker-copy");
+                        fs::rename(&marker, &target).unwrap();
+                        std::os::unix::fs::symlink(target, marker).unwrap();
+                    }
+                }))
+            });
+            assert!(area.evict(&root.id).is_err());
+            assert!(root.path.is_dir());
+        }
+    }
+
+    #[test]
+    fn prune_and_scratch_sweep_keep_replacements() {
+        let (_temp, barge) = fixture();
+        let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+        let root = area.create_root("slot").unwrap();
+        let held = replace_on_resolve(&area, &root);
+        assert!(barge.prune("disk", false).unwrap().evicted.is_empty());
+        assert_replacement(&area, &root, &held);
+        drop(held);
+
+        let scratch = barge.scratch("disk", "project").unwrap();
+        let root = scratch.create("run", Duration::ZERO).unwrap();
+        let held = replace_on_resolve(scratch.area(), &root);
+        assert!(scratch.sweep().unwrap().deleted.is_empty());
+        assert_replacement(scratch.area(), &root, &held);
+    }
 }

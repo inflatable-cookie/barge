@@ -29,6 +29,35 @@ pub(crate) fn effective_uid() -> u32 {
     }
 }
 
+/// Open a marker without following a symlink at either the root or marker.
+pub(crate) fn open_marker(folder: &Path, name: &str) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(folder)?;
+    let name = CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    // SAFETY: the directory descriptor and NUL-terminated name are valid;
+    // a successful openat returns a new descriptor owned by File.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: openat returned a valid new descriptor, now owned by File.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
 /// The platform facts Barge needs. Tests replace this with [`FakeOs`].
 pub trait Os: fmt::Debug + Send + Sync {
     /// The volume UUID that owns `mount`, or `None` when it cannot be read.

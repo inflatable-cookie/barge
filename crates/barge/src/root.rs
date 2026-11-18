@@ -124,7 +124,11 @@ pub(crate) enum MarkerRead {
 /// Read the marker in `folder`.
 pub(crate) fn read_marker(folder: &Path) -> MarkerRead {
     let path = folder.join(MARKER_NAME);
-    let bytes = match fs::read(&path) {
+    let bytes = match crate::os::open_marker(folder, MARKER_NAME).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Missing,
         Err(source) => {
