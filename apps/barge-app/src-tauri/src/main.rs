@@ -1,93 +1,51 @@
+//! The Barge app's Tauri host.
+//!
+//! The renderer talks to typed commands; the host composes Barge's library, one
+//! preferences store and Longhorn's settings and notification surfaces.
+
+mod commands;
+mod popover;
 mod preferences;
 mod settings;
 mod storage;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
-use tauri_plugin_autostart::ManagerExt;
-
-#[tauri::command]
-fn preferences_get(
-    store: tauri::State<'_, preferences::Store>,
-) -> Result<preferences::Preferences, String> {
-    store.get()
-}
-
-#[tauri::command]
-fn preferences_set(
-    app: tauri::AppHandle,
-    store: tauri::State<'_, preferences::Store>,
-    preferences: preferences::Preferences,
-) -> Result<(), String> {
-    let old = store.get()?;
-    let changed_login = old.launch_at_login != preferences.launch_at_login;
-    if changed_login {
-        let manager = app.autolaunch();
-        if preferences.launch_at_login {
-            manager.enable()
-        } else {
-            manager.disable()
-        }
-        .map_err(|error| error.to_string())?;
-    }
-    if let Err(error) = store.set(preferences) {
-        if changed_login {
-            if old.launch_at_login {
-                let _ = app.autolaunch().enable();
-            } else {
-                let _ = app.autolaunch().disable();
-            }
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn storage_volumes() -> Result<Vec<storage::VolumeSummary>, String> {
-    let account = barge::Barge::open_read_only().map_err(|error| error.to_string())?;
-    storage::volumes(&account).map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn open_main_window(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(popover) = app.get_webview_window("popover") {
-        popover.hide().map_err(|error| error.to_string())?;
-    }
-    #[cfg(target_os = "macos")]
-    app.set_activation_policy(tauri::ActivationPolicy::Regular)
-        .map_err(|error| error.to_string())?;
-    if let Some(window) = app.get_webview_window("main") {
-        window.show().map_err(|error| error.to_string())?;
-        window.set_focus().map_err(|error| error.to_string())?;
-    } else {
-        WebviewWindowBuilder::new(&app, "main", WebviewUrl::App("index.html".into()))
-            .title("Barge")
-            .inner_size(800.0, 560.0)
-            .min_inner_size(580.0, 400.0)
-            .build()
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
-}
 
 fn main() {
-    tauri::Builder::default()
+    if let Err(error) = run() {
+        eprintln!("Barge failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+/// The menu-bar template icon: black with alpha, which macOS tints to match the
+/// menu bar. A 2x asset keeps it sharp on Retina.
+fn tray_icon(scale: f64) -> tauri::image::Image<'static> {
+    if scale >= 2.0 {
+        tauri::include_image!("icons/tray-template@2x.png")
+    } else {
+        tauri::include_image!("icons/tray-template.png")
+    }
+}
+
+fn run() -> tauri::Result<()> {
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .setup(|app| {
             let root = std::env::var_os("BARGE_APP_CONFIG_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or(app.path().app_config_dir()?);
             let store = preferences::Store::open(&root).map_err(std::io::Error::other)?;
+            // One store, two surfaces: the renderer's commands and Longhorn's
+            // settings registry share this handle.
+            let settings = longhorn_tauri_settings::SettingsHandlerAssembly::new(store.clone());
+            let show_window = store
+                .get()
+                .map(|preferences| preferences.show_window_at_launch)
+                .unwrap_or(true);
             app.manage(store);
-            let settings_store = preferences::Store::open(&root).map_err(std::io::Error::other)?;
-            let service = longhorn_tauri_settings::SettingsHandlerAssembly::new(settings_store);
             app.manage(longhorn_tauri_settings::TauriSettingsState::new(
-                std::sync::Arc::new(service),
+                std::sync::Arc::new(settings),
             ));
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -109,16 +67,13 @@ fn main() {
                     let _ = blur_window.hide();
                 }
             });
-            let mut pixels = vec![0u8; 18 * 18 * 4];
-            for y in 4..14 {
-                for x in 2..16 {
-                    if y == 4 || y == 13 || x == 2 || x == 15 || (y == 9 && (5..13).contains(&x)) {
-                        pixels[(y * 18 + x) * 4 + 3] = 255;
-                    }
-                }
-            }
+            let scale = app
+                .primary_monitor()
+                .ok()
+                .flatten()
+                .map_or(1.0, |monitor| monitor.scale_factor());
             tauri::tray::TrayIconBuilder::new()
-                .icon(tauri::image::Image::new_owned(pixels, 18, 18))
+                .icon(tray_icon(scale))
                 .icon_as_template(true)
                 .tooltip("Barge")
                 .on_tray_icon_event(|tray, event| {
@@ -129,17 +84,15 @@ fn main() {
                         ..
                     } = event
                     {
-                        if let Some(window) = tray.app_handle().get_webview_window("popover") {
-                            let _ = window.set_position(tauri::PhysicalPosition::new(
-                                position.x as i32 - 160,
-                                position.y as i32,
-                            ));
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        popover::show(tray.app_handle(), position);
                     }
                 })
                 .build(app)?;
+            // macOS can park the menu-bar item off-screen, so the window opens
+            // on launch unless the operator turned that off.
+            if show_window {
+                commands::window::show_main(app.handle())?;
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -153,14 +106,37 @@ fn main() {
             let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
-            storage_volumes,
-            open_main_window,
-            quit_app,
-            preferences_get,
-            preferences_set,
+            commands::storage::storage_volumes,
+            commands::window::open_main_window,
+            commands::window::quit_app,
+            commands::preferences::preferences_get,
+            commands::preferences::preferences_set,
             longhorn_tauri_settings::longhorn_settings_registry,
             longhorn_tauri_settings::longhorn_settings_load
         ])
-        .run(tauri::generate_context!())
-        .unwrap_or_else(|error| eprintln!("Barge failed: {error}"));
+        .build(tauri::generate_context!())?;
+    app.run(|app, event| {
+        // A second launch reaches the running app here. Reopen the window
+        // rather than leaving the operator with an unreachable app.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } = event
+        {
+            if !has_visible_windows {
+                let app = app.clone();
+                // A window is built through the event loop, so build it from a
+                // worker rather than from inside the loop's own callback.
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = commands::window::show_main(&app) {
+                        eprintln!("Barge could not reopen its window: {error}");
+                    }
+                });
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (app, event);
+    });
+    Ok(())
 }

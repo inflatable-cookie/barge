@@ -32,9 +32,16 @@ Its visual system is replaced by Poodle.
   - one storage line (volume present or absent, free space, doctor ok or a
     count of findings);
   - Open Barge.
-- **Window on demand:** opened from the popover or by launching the app again.
-  The app shows a Dock icon only while the window is open
-  (`ActivationPolicy::Accessory` otherwise).
+- **The app is never reachable only through the menu bar.** macOS parks menu-bar
+  items off-screen when the space beside the notch is full, so:
+  - the window opens when the app launches, controlled by the "Show window at
+    launch" setting (on by default);
+  - launching the app again while it runs reopens the window (macOS
+    `RunEvent::Reopen`);
+  - the window says where the menu-bar item lives and that macOS may hide it
+    when the menu bar is full.
+- **Window on demand:** also opened from the popover. The app shows a Dock icon
+  only while the window is open (`ActivationPolicy::Accessory` otherwise).
 - **Launch at login** is a setting, off by default.
 
 ## First release scope
@@ -81,8 +88,8 @@ appear, which the view says plainly.
 
 ### Settings
 
-Launch at login, the refresh interval, notifications on or off per kind, and
-the theme (Poodle's system, light or dark).
+Launch at login, show window at launch, the refresh interval, notifications on
+or off per kind, and the theme (Poodle's system, light or dark).
 
 ### Out of the first release
 
@@ -144,8 +151,11 @@ Tauri Rust host (apps/barge-app/src-tauri)
   - `longhorn-credential-keyring` if keys move to the Keychain (see
     [Keys](#keys)).
 
-  Rust crates are taken by git tag; TypeScript packages from npm at pinned
-  versions.
+  Rust crates are taken by git tag; TypeScript packages are pinned in
+  `apps/barge-app/bun.lock`, which bun installs and the Effigy selectors use.
+  The scaffold's renderer talks to its own typed commands, so it does not import
+  Longhorn's TypeScript packages yet; they return when the Longhorn settings
+  surface or agent control is rendered.
 - **The menu bar** uses Tauri's tray API. Longhorn has no menu-bar system
   today.
 - **Poodle components,** a first mapping:
@@ -178,15 +188,25 @@ interfaces never disagree.
 
 ## Repository layout
 
-- `apps/barge-app/`: the Tauri app; Svelte renderer and `src-tauri`.
+- `apps/barge-app/`: the Tauri app; Svelte renderer, `src-tauri` and
+  `bun.lock`.
 - `src-tauri` is a workspace member, so the workspace checks cover it. Oxide
   links only `crates/barge`, whose dependency tree must not change because of
   the app.
+
+## Running it
+
+`effigy app:dev` from the repository root installs the renderer's dependencies
+from `bun.lock` and starts the app; it is the only command needed. The window
+opens on launch, so the app is usable even when macOS hides its menu-bar item.
 
 ## Testing
 
 - Renderer: Vitest and Svelte Testing Library over every view's states:
   online, unreachable, pending, absent volume, mismatch, drift, and empty.
+  `apps/barge-app/fixtures.html?view=<view>&scenario=<scenario>` mounts the real
+  renderer against a fake api, so a view's states can be screenshotted without a
+  build.
 - Rust: command tests against the fake OS identity and a loopback `barged`
   stub, as the crates already do.
 - End-to-end through Longhorn's agent-control surface, when it's added.

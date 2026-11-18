@@ -9,7 +9,7 @@ import "./style.css";
 const api: AppApi = {
   volumes: () => invoke<VolumeSummary[]>("storage_volumes"),
   preferences: () => invoke<Preferences>("preferences_get"),
-  savePreferences: (preferences) => invoke("preferences_set", { preferences }),
+  savePreferences: (preferences) => invoke<Preferences>("preferences_set", { preferences }),
   openWindow: () => invoke("open_main_window"),
   quit: () => invoke("quit_app"),
 };
