@@ -1,7 +1,9 @@
 # Resources and bindings
 
-Status: design approved by Tom, 2026-11-18. Steps 1 and 2 are built; later steps remain planned. The lean storage core in [architecture](architecture.md) is the mechanism
-this design builds on and does not change.
+Status: design approved by Tom, 2026-11-18. Steps 1, 2 and 5 are built;
+steps 3 and 4 remain planned. The lean storage core in
+[architecture](architecture.md) is the mechanism this design builds on and does
+not change.
 
 ## The problem
 
@@ -240,20 +242,22 @@ Changing where a class lives is the operation the Stash tidy needs, so it is
 one command with a plan:
 
 ```
-barge move <class|area> <new-path> --plan    # writes nothing
-barge move <class|area> <new-path> --apply   # after operator approval
+barge move <class> <new-path> --plan > plan.json
+barge move --item <path> --into <class>/<sub> --plan > plan.json
+barge move --apply --plan plan.json --confirm-stopped
 ```
 
-The plan lists:
+The reviewed JSON plan records volume and filesystem identities and lists:
 - the data to move. A move within one APFS volume is a rename: instant,
   atomic, and with no copy.
 - every binding that points at the old path, with its exact change;
 - the workflow blocks to regenerate;
-- the consumers that must be stopped first.
+- the consumers that must be stopped first;
+- area declarations carried by a moved folder, whose consumers must update their declarations.
 
 Barge doesn't scan processes, so for tool-owned data the operator confirms the
 tool is stopped. For Barge-owned roots, holds already prove it. Apply renames,
-then updates each binding, then runs doctor. A failure leaves both the old
+then updates each binding and any moved area declaration and layout, then runs doctor. An item inside an area cannot be moved out on its own because that would orphan its root. A failure leaves both the old
 binding and the old data in place, or rolls the rename back. The apply step
 always needs Tom's explicit approval for live data (AGENTS.md guardrail).
 
@@ -305,7 +309,7 @@ Each step is its own brief, reviewed as usual.
    Cargo links is the operator's step after merge.
 3. `init` with workflow blocks; adopt this repository, then Effigy's.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
-5. `move --plan|--apply`; the Stash layout lane then uses it item by item.
+5. **Built:** `move --plan|--apply`; the Stash layout lane then uses it item by item.
 
 ## Questions
 

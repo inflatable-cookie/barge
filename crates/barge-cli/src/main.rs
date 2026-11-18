@@ -30,6 +30,8 @@ mod survey;
 use survey::*;
 mod bind;
 use bind::*;
+mod move_resource;
+use move_resource::*;
 mod doctor;
 use doctor::*;
 mod volume;
@@ -100,6 +102,7 @@ fn dispatch(command: &str, rest: &[String], json: bool) -> Result<()> {
         "area" => area(rest, json),
         "root" => root(rest, json),
         "bind" => bind(rest, json),
+        "move" => move_resource(rest, json),
         "prune" => prune(rest, json),
         "scratch" => scratch(rest, json),
         "machine" => machine(rest, json),
@@ -140,6 +143,9 @@ usage: barge [--json] <command>
   bind apply --plan FILE|- [--replace]    apply exactly that reviewed plan
   bind adopt --consumer C --class K --link PATH
   bind undo <consumer>                    restore what was there before
+  move <class> <new-path> --plan           review a class move
+  move --item PATH --into CLASS[/SUB] --plan
+  move --apply --plan FILE|- [--confirm-stopped]
   doctor                                  volumes, layout and binding drift
   prune --volume V [--dry-run]            evict idle roots to meet policy
   scratch new --volume V --project P --label L [--ttl SECONDS]

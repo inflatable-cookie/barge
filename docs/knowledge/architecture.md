@@ -241,6 +241,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 - `path <class> [--project p]`; `env [--shell zsh|bash|fish]`;
 - `survey <volume> [--no-bytes]`;
 - `bind list | plan | apply | adopt | undo`;
+- `move --plan | --apply`;
 - `doctor`;
 - `machine add | list | remove | wake | status | sleep | restart | shutdown | cancel`
   ([machines](machines.md)).
@@ -297,7 +298,7 @@ path keeps the hold descriptor inherited.
 
 Designed separately, not yet built:
 
-- **Setting and workflow bindings, cache and kept placements, and moves:**
+- **Setting and workflow bindings, cache and kept placements:**
   [resources](resources.md). Link bindings and `doctor` are built.
 - **Worktree pools:** areas of git worktrees leased through holds; see
   [vision](vision.md#direction).
