@@ -1,6 +1,8 @@
 mod common;
 
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use barge::{Absent, AreaSpec, Barge, Class, Placement, VolumeRegistration};
 use common::Fixture;
@@ -54,8 +56,10 @@ fn layout_round_trip_drift_and_import() {
 
 #[test]
 fn path_and_survey_are_read_only() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
+    f.root_dir = "data".into();
     f.register();
+    fs::create_dir(f.base()).unwrap();
     f.barge
         .set_layout(
             Class::Scratch,
@@ -68,18 +72,29 @@ fn path_and_survey_are_read_only() {
         )
         .unwrap();
     f.barge
+        .set_layout(Class::Caches, placement("caches", Absent::Fail))
+        .unwrap();
+    assert_eq!(
+        f.barge.volume_layout("Builds").unwrap().unwrap().classes[&Class::Caches].path,
+        "caches"
+    );
+    f.barge
         .area(AreaSpec::new("test", "pool", "Builds").folder("legacy"))
         .unwrap();
-    fs::create_dir(f.mount.join("scratch")).unwrap();
-    fs::create_dir(f.mount.join("legacy")).unwrap();
-    fs::write(f.mount.join("unknown"), b"hello").unwrap();
+    fs::create_dir(f.base().join("scratch")).unwrap();
+    fs::create_dir(f.base().join("legacy")).unwrap();
+    fs::write(f.base().join("unknown"), b"hello").unwrap();
+    fs::create_dir(f.base().join(".barge")).unwrap();
+    assert!(f.mount.join(".barge/layout.json").is_file());
+    assert!(!f.base().join(".barge/layout.json").exists());
+    let before = snapshot(f.temp.path());
     let read =
         Barge::open_read_only_with(f.barge.state_dir(), f.os.clone(), f.clock.clone()).unwrap();
     assert_eq!(
         read.resource_path(Class::Scratch, Some("proj"))
             .unwrap()
             .path,
-        f.mount.join("scratch/proj")
+        f.base().join("scratch/proj")
     );
     let items = read.survey("Builds", true).unwrap();
     assert!(items.iter().any(|i| i.classification == "class:scratch"));
@@ -88,26 +103,33 @@ fn path_and_survey_are_read_only() {
     assert!(items
         .iter()
         .any(|i| i.classification == "unknown" && i.bytes == Some(5)));
-    let before = fs::read(f.barge.state_dir().join("layout.json")).unwrap();
     read.layout().unwrap();
     read.layout_disagrees("Builds").unwrap();
     read.survey("Builds", false).unwrap();
-    assert_eq!(
-        before,
-        fs::read(f.barge.state_dir().join("layout.json")).unwrap()
-    );
+    for shell in ["zsh", "bash", "fish"] {
+        let (assignment, fallback) = read.resource_env(shell).unwrap();
+        assert!(assignment.contains("BARGE_SCRATCH"));
+        assert!(!fallback);
+    }
+    assert_eq!(before, snapshot(f.temp.path()));
     f.os.add_volume(f.mount.clone(), None, 0);
+    let before = snapshot(f.temp.path());
     assert!(read.resource_path(Class::Scratch, None).unwrap().fallback);
+    assert!(read.resource_env("bash").unwrap().1);
+    assert_eq!(before, snapshot(f.temp.path()));
     let fallback = placement("scratch", Absent::Fail);
     // Policy is changed while the volume is present.
     f.os.add_volume(f.mount.clone(), Some(common::UUID), common::TIB);
     f.barge.set_layout(Class::Scratch, fallback).unwrap();
     f.os.add_volume(f.mount.clone(), None, 0);
+    let before = snapshot(f.temp.path());
+    assert!(read.resource_env("bash").is_err());
     assert!(read
         .resource_path(Class::Scratch, None)
         .unwrap_err()
         .message()
         .contains("attach"));
+    assert_eq!(before, snapshot(f.temp.path()));
 }
 
 #[test]
@@ -125,4 +147,25 @@ fn shell_assignments_quote_paths() {
         barge::layout::shell_assignment("fish", "BARGE_SCRATCH", path).unwrap(),
         "set -gx BARGE_SCRATCH '/some path/it\\'s here';"
     );
+}
+
+fn snapshot(root: &Path) -> Vec<(PathBuf, SystemTime, Option<Vec<u8>>)> {
+    fn visit(path: &Path, result: &mut Vec<(PathBuf, SystemTime, Option<Vec<u8>>)>) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let contents = if metadata.is_file() {
+            Some(fs::read(path).unwrap())
+        } else {
+            None
+        };
+        result.push((path.to_path_buf(), metadata.modified().unwrap(), contents));
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(&entry.unwrap().path(), result);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    visit(root, &mut result);
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
 }

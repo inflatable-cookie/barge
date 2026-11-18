@@ -56,8 +56,9 @@ expendable area (Q-006), so pruning can never reach them.
 
 ### Layout
 
-The **layout** places each class on a volume and a folder within it. It has two
-copies, with one authority:
+The **layout** places each class on a volume and a folder under its `root_dir`
+(or the mount when `root_dir` is empty). Survey lists items at that same base.
+It has two copies, with one authority:
 
 - **The account layout** (`layout.json` in account state, `barge.layout/1`) is
   the authority on this machine. It covers every volume, so Barge still knows

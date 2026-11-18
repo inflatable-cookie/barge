@@ -266,7 +266,7 @@ impl Barge {
             .ok_or_else(|| Error::not_found(format!("class {} has no layout", class.name())))?;
         let volume = self.volume(&placement.volume)?;
         let (mut path, fallback) = match volume.state()? {
-            VolumeState::Present => (volume.spec().mount.join(&placement.path), false),
+            VolumeState::Present => (volume.base().join(&placement.path), false),
             VolumeState::Absent => match &placement.absent {
                 Absent::Fail => {
                     return Err(Error::refused(format!(
@@ -301,17 +301,18 @@ impl Barge {
     /// List top-level items, classifying known placement and area paths.
     pub fn survey(&self, name: &str, with_bytes: bool) -> Result<Vec<SurveyItem>> {
         let volume = self.volume(name)?;
-        let mount = volume.require_present()?;
+        volume.require_present()?;
+        let base = volume.base();
         let layout = self.layout()?;
         let areas = self.core.state.read_areas()?;
         let mut items = Vec::new();
-        for entry in fs::read_dir(&mount).map_err(|e| Error::io("cannot list", &mount, &e))? {
-            let entry = entry.map_err(|e| Error::io("cannot list", &mount, &e))?;
+        for entry in fs::read_dir(&base).map_err(|e| Error::io("cannot list", &base, &e))? {
+            let entry = entry.map_err(|e| Error::io("cannot list", &base, &e))?;
             let path = entry.path();
             let classification = if entry.file_name() == ".barge" {
                 "barge".to_string()
             } else if let Some((class, _)) = layout.classes.iter().find(|(_, placement)| {
-                placement.volume == name && mount.join(&placement.path).starts_with(&path)
+                placement.volume == name && base.join(&placement.path).starts_with(&path)
             }) {
                 format!("class:{}", class.name())
             } else if let Some(area) = areas.iter().find(|area| {

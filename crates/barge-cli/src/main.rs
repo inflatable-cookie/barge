@@ -50,6 +50,7 @@ fn run(arguments: &[String], json: bool) -> Result<()> {
         "status" => status(rest, json),
         "layout" => layout(rest, json),
         "path" => resource_path(rest, json),
+        "env" if json => Err(Error::usage("env does not support --json")),
         "env" => resource_env(rest),
         "survey" => survey(rest, json),
         "volume" => volume(rest, json),
@@ -77,7 +78,7 @@ usage: barge [--json] <command>
   status                                  every volume, area and free space
   volume register --name N --mount PATH   register a volume (reads its UUID)
     [--uuid U] [--root-dir DIR] [--availability permanent|ephemeral]
-    [--durability expendable|kept] [--reserve SIZE] [--floor SIZE]
+    [--durability expendable|kept] [--reserve SIZE] [--floor SIZE] [--import-layout]
   volume list                             registered volumes and their state
   volume status <name>                    one volume's identity and space
   area declare --namespace NS --name A --volume V
