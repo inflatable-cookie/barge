@@ -37,6 +37,26 @@ for visual design:
   address.
 - Launching Moonlight against the PC is a convenience action in the UI.
 
+## Registry state
+
+The registry is `machines.json` in the account state directory, the same
+directory where `barge` keeps `volumes.json`, `areas/` and the bindings
+record. Both publish through a temporary file and an atomic rename, and both
+take the one `lock` file there, so a registry write and a storage write never
+interleave.
+
+`crates/barge-machine` keeps its own copy of that publication step and the
+lock instead of depending on `crates/barge`: the storage library's dependency
+tree stays what Oxide accepts, and a machine client (the CLI today, the UI
+later) does not pull in the storage mechanics. The copies are changed
+together; `crates/barge/src/state.rs` is the reference.
+
+A record read from disk is validated on every read. An unreadable document, an
+unknown schema, a duplicate name, a non-canonical MAC address or any other
+invalid field is an unknown state — exit 3 — never an empty registry. A value
+an operator gives, such as `barge machine add --port 0`, is a usage error —
+exit 2 — and is refused where the machine is built.
+
 ## Protocol and trust
 
 - HTTP with JSON over the tailnet. `barged` binds only the single address in

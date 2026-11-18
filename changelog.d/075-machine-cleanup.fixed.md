@@ -1,0 +1,1 @@
+Fix `barge-machine`'s registry error kinds: a stored record it cannot validate is an unknown state (exit 3) and a bad port is a usage error (exit 2). Validate ports where a machine is built, document every public item, and cover the registry's failure cases with tests.

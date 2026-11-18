@@ -558,6 +558,41 @@ fn machine_power_refuses_an_out_of_range_delay() {
 }
 
 #[test]
+fn a_machine_the_registry_cannot_validate_is_an_internal_error() {
+    let fixture = Fixture::new();
+    // A bad name that the builder would have refused (operator input) is an
+    // unknown state when it is found on disk, so the CLI exits 3, not 2.
+    std::fs::write(
+        fixture.state.join("machines.json"),
+        r#"{"schema":"barge.machines/1","machines":[{"name":"not a name","hostname":"pc.local","tailscale_name":null,"mac":"00:11:22:33:44:ff","broadcast":"255.255.255.255","port":9,"daemon_port":9777}]}"#,
+    )
+    .unwrap();
+    let list = fixture.run(&["machine", "list"]);
+    assert_eq!(list.status.code(), Some(3), "{}", stderr(&list));
+    assert!(
+        stderr(&list).contains("machine name must be"),
+        "{}",
+        stderr(&list)
+    );
+
+    // A port is operator input, refused where the machine is built.
+    let add = fixture.run(&[
+        "machine",
+        "add",
+        "--name",
+        "pc",
+        "--hostname",
+        "pc.local",
+        "--mac",
+        "00:11:22:33:44:ff",
+        "--port",
+        "0",
+    ]);
+    assert_eq!(add.status.code(), Some(2), "{}", stderr(&add));
+    assert!(stderr(&add).contains("1-65535"), "{}", stderr(&add));
+}
+
+#[test]
 fn bindings_record_drift_and_doctor_report_it() {
     let fixture = Fixture::new();
     assert!(register(&fixture).status.success());

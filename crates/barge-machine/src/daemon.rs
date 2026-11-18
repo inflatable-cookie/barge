@@ -53,7 +53,7 @@ impl DaemonClient {
         } else {
             host.to_string()
         };
-        Self::at(format!("http://{host}:{}", machine.daemon_port))
+        Self::at(format!("http://{host}:{}", machine.daemon_port()))
     }
 
     /// The base URL this client dials; also the name an error reports.
@@ -193,6 +193,7 @@ impl DaemonClient {
 
 /// How a human path confirms a power action that needs it.
 pub trait Confirmation {
+    /// Ask, and report whether the action may go ahead.
     fn confirm(&self, action: PowerActionKind, machine: &str, delay_s: u32) -> bool;
 }
 
@@ -220,7 +221,8 @@ pub fn needs_confirmation(action: PowerActionKind) -> bool {
     matches!(action, PowerActionKind::Restart | PowerActionKind::Shutdown)
 }
 
-/// Confirm a restart or shutdown, then send the request.///
+/// Confirm a restart or shutdown, then send the request.
+///
 /// This lives beside the client so every caller — the CLI now, the UI later —
 /// applies the same rule, and so a declined confirmation sends nothing.
 pub fn request_power(
@@ -474,13 +476,16 @@ mod tests {
     fn machine_address_uses_the_tailnet_name_and_recorded_port() {
         let machine = crate::Machine::new("pc", "pc.local", "00:11:22:33:44:ff")
             .unwrap()
-            .tailscale_name(Some("pc.tailnet.ts.net".to_string()))
-            .daemon_port(9777);
+            .with_tailscale_name(Some("pc.tailnet.ts.net".to_string()))
+            .with_daemon_port(9777)
+            .unwrap();
         assert_eq!(
             DaemonClient::for_machine(&machine).base(),
             "http://pc.tailnet.ts.net:9777"
         );
-        let v6 = machine.clone().tailscale_name(Some("fd7a::1".to_string()));
+        let v6 = machine
+            .clone()
+            .with_tailscale_name(Some("fd7a::1".to_string()));
         assert_eq!(
             DaemonClient::for_machine(&v6).base(),
             "http://[fd7a::1]:9777"
