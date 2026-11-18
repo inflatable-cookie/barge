@@ -54,9 +54,24 @@ each reinvent drive handling link Barge's library or call its CLI instead.
 Barge's larger aim (Tom, 2026-11-17) is to distribute developer resources
 across machines: storage, compute, memory and networking, with the glue
 between them. That means a library, a CLI for agents, a daemon for machine
-management and cross-network reach, and an operator UI. Storage on this
-machine is the first resource. Nothing beyond local storage is designed yet,
-and none of it may make Oxide depend on a running Barge.
+management and cross-network reach, and an operator UI. None of it may make
+Oxide depend on a running Barge.
+
+Tom's rulings of 2026-11-18 set the next steps:
+
+- **One policy surface for storage.** Barge owns the Stash layout at a general
+  level. Other tools subscribe to it rather than each carrying its own drive
+  handling, and the drive is tidied through Barge rather than piecemeal. See
+  [resources](resources.md).
+- **Worktrees are Barge's domain.** Warm, reusable worktree pools are built
+  into Barge, in the style of Treehouse. Oxide stays standalone because it is a
+  drop-in Cargo replacement that only lightly touches Barge's domain.
+- **Barge controls machines.** A daemon on the Bazzite PC and a Barge UI
+  replace MoonDeck Buddy and MoonDeck Remote. The UI is a fresh Tauri app,
+  professionally laid out for the much larger job. See [machines](machines.md).
+
+Compute scheduling across machines (Tailscale, Nomad) follows machine control
+as a spike.
 
 ## Authority
 

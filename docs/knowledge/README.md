@@ -1,6 +1,6 @@
 # Knowledge map
 
-[Vision](vision.md) owns scope, Tom's rulings, direction and authority. [Architecture](architecture.md) owns the lean storage design: safety model, concepts, layout, library surface, space policy, CLI, testing and the boundary with Oxide. [Questions](questions.md) owns design decisions. [Retirements](retired.toml) records removed concepts.
+[Vision](vision.md) owns scope, Tom's rulings, direction and authority. [Architecture](architecture.md) owns the lean storage design: safety model, concepts, layout, library surface, space policy, CLI, testing and the boundary with Oxide. [Resources](resources.md) owns the proposed resource classes, layout manifest, bindings and doctor. [Machines](machines.md) owns machine control: the daemon, protocol and UI. [Questions](questions.md) owns design decisions. [Retirements](retired.toml) records removed concepts.
 
 Contracts:
 
