@@ -318,6 +318,13 @@ The list is data (`crates/barge/src/known_links.rs`): adding a place is adding a
 row, not an adapter. A link a tool keeps anywhere else is still the operator's to
 find, and the plan's manual steps say so.
 
+Every folder on the way below the home folder must be a real folder: a symlink at
+`.colima`, `_lima`, a profile folder or `.cargo` is not followed, so a documented
+location can never be reached through a link and apply can only retarget the one
+link the pattern ends at. The home folder itself is resolved once, because where
+the account's home lives is a platform fact. Apply re-plans first, so a location
+that stopped being real between plan and apply is refused as a changed plan.
+
 ## Survey
 
 `barge survey <volume>` is read-only. It lists every top-level item with its

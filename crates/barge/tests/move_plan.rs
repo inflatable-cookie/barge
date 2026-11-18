@@ -442,3 +442,40 @@ fn a_recorded_disk_link_is_not_an_unrecorded_one() {
         f.mount.join("machines/colima/disk")
     );
 }
+
+#[test]
+fn a_linked_colima_folder_does_not_widen_the_known_locations() {
+    let f = Fixture::new();
+    f.register();
+    vms_layout(&f);
+    let disk = f.mount.join("vms/colima/disk");
+    fs::create_dir(disk.parent().unwrap()).unwrap();
+    fs::write(&disk, b"disk-image").unwrap();
+    // A disk link of the documented shape, sitting behind a linked `.colima`
+    // folder: the plan must not discover it, and apply must never retarget it.
+    let elsewhere = f.temp.folder("elsewhere").unwrap();
+    let profile = elsewhere.join("_lima/colima");
+    fs::create_dir_all(&profile).unwrap();
+    let link = profile.join("disk");
+    symlink(&disk, &link).unwrap();
+    let home = f.temp.folder("home").unwrap();
+    symlink(&elsewhere, home.join(".colima")).unwrap();
+    let barge = f.barge.clone().with_home(&home);
+
+    let plan = barge.plan_class_move(Class::Vms, "machines").unwrap();
+    assert!(
+        plan.unrecorded_links.is_empty(),
+        "a link behind a symlinked folder is not a documented location"
+    );
+    let report = barge.apply_move(&plan, retargeting(false)).unwrap();
+    assert!(report.doctor.ok, "{report:?}");
+    // Barge wrote nothing outside the documented locations: the link still holds
+    // what it held, and the data is safe at the moved path. The plan's manual
+    // step is the operator's cue for a link Barge cannot name.
+    assert_eq!(fs::read_link(&link).unwrap(), disk);
+    assert!(!disk.exists());
+    assert_eq!(
+        fs::read(f.mount.join("machines/colima/disk")).unwrap(),
+        b"disk-image"
+    );
+}

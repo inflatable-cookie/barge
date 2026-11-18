@@ -8,6 +8,12 @@
 //! A link found here that points inside a moved source, and that no binding
 //! records, is a link the move would strand. The plan names it, the command that
 //! adopts it after the move, and the value it must hold afterwards.
+//!
+//! The walk never follows a symlink on the way: every folder the pattern names
+//! below the home folder must be a real folder, so a documented location cannot
+//! be reached through a link and `barge move --apply` can only ever retarget the
+//! one link the pattern ends at. The home folder itself is resolved once, because
+//! where the account's home lives is a platform fact, not a link inside it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,16 +69,24 @@ pub struct Candidate {
 }
 
 /// Every path the list names under `home` that exists now, in list order and
-/// then name order. Nothing else is read: no folder is walked.
+/// then name order. Nothing else is read: no folder is walked beyond the segments
+/// a row names, and no symlinked folder is followed.
 pub fn candidates(home: &Path) -> Result<Vec<Candidate>> {
+    let home = match fs::canonicalize(home) {
+        Ok(home) => home,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(Error::io("cannot resolve", home, &source)),
+    };
     let mut found = Vec::new();
     for known in KNOWN_LINKS {
-        let mut level = vec![(home.to_path_buf(), Vec::new())];
-        for segment in known.pattern.split('/') {
+        let mut segments = known.pattern.split('/').peekable();
+        let mut level = vec![(home.clone(), Vec::new())];
+        while let Some(segment) = segments.next() {
+            let last = segments.peek().is_none();
             let mut next = Vec::new();
             for (path, names) in level {
                 if segment == "*" {
-                    for child in entries(&path)? {
+                    for child in real_directories(&path)? {
                         let Some(name) = child.file_name() else {
                             continue;
                         };
@@ -80,16 +94,23 @@ pub fn candidates(home: &Path) -> Result<Vec<Candidate>> {
                         names.push(name.to_string_lossy().into_owned());
                         next.push((child, names));
                     }
+                    continue;
+                }
+                let child = path.join(segment);
+                // The pattern ends at the link itself, which may be a symlink.
+                // Every folder on the way must be real, so the walk never leaves
+                // the documented location through one.
+                if if last {
+                    fs::symlink_metadata(&child).is_ok()
                 } else {
-                    next.push((path.join(segment), names));
+                    is_real_directory(&child)
+                } {
+                    next.push((child, names));
                 }
             }
             level = next;
         }
         for (path, names) in level {
-            if fs::symlink_metadata(&path).is_err() {
-                continue;
-            }
             found.push(Candidate {
                 known: *known,
                 path,
@@ -100,8 +121,12 @@ pub fn candidates(home: &Path) -> Result<Vec<Candidate>> {
     Ok(found)
 }
 
-/// The entries of one folder, sorted, and empty when the folder is absent.
-fn entries(folder: &Path) -> Result<Vec<PathBuf>> {
+/// The real subdirectories of a real directory, sorted, with none when it is
+/// absent or is itself a symlink.
+fn real_directories(folder: &Path) -> Result<Vec<PathBuf>> {
+    if !is_real_directory(folder) {
+        return Ok(Vec::new());
+    }
     let mut paths = Vec::new();
     let reader = match fs::read_dir(folder) {
         Ok(reader) => reader,
@@ -110,10 +135,20 @@ fn entries(folder: &Path) -> Result<Vec<PathBuf>> {
     };
     for entry in reader {
         let entry = entry.map_err(|source| Error::io("cannot read", folder, &source))?;
-        paths.push(entry.path());
+        let path = entry.path();
+        if is_real_directory(&path) {
+            paths.push(path);
+        }
     }
     paths.sort();
     Ok(paths)
+}
+
+/// Whether `path` is a directory that is not itself a symlink.
+fn is_real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 /// The consumer name for one candidate, from the row's template.
@@ -163,11 +198,12 @@ fn safe_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn named_places_are_found_in_list_order() {
         let temp = TempDir::new("known-links").unwrap();
-        let home = temp.folder("home").unwrap();
+        let home = fs::canonicalize(temp.folder("home").unwrap()).unwrap();
         for profile in ["b", "a"] {
             fs::create_dir_all(home.join(".colima/_lima").join(profile)).unwrap();
             fs::write(home.join(".colima/_lima").join(profile).join("disk"), b"").unwrap();
@@ -219,6 +255,61 @@ mod tests {
         let home = temp.folder("home").unwrap();
         assert!(candidates(&home).unwrap().is_empty());
         assert!(candidates(&temp.path().join("absent")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_linked_folder_on_the_way_is_never_followed() {
+        let temp = TempDir::new("known-links-symlink").unwrap();
+        let home = fs::canonicalize(temp.folder("home").unwrap()).unwrap();
+        let elsewhere = temp.folder("elsewhere").unwrap();
+        // A real documented location is found.
+        fs::create_dir_all(home.join(".colima/_lima/colima")).unwrap();
+        fs::write(home.join(".colima/_lima/colima/disk"), b"").unwrap();
+        assert_eq!(candidates(&home).unwrap().len(), 1);
+
+        // The Colima folder replaced by a link: nothing is discovered through it,
+        // although the same shape sits behind the link.
+        fs::create_dir_all(elsewhere.join("_lima/colima")).unwrap();
+        fs::write(elsewhere.join("_lima/colima/disk"), b"").unwrap();
+        fs::remove_dir_all(home.join(".colima")).unwrap();
+        symlink(&elsewhere, home.join(".colima")).unwrap();
+        assert!(
+            candidates(&home).unwrap().is_empty(),
+            "a linked folder is not a documented location"
+        );
+
+        // A linked profile folder is not followed either, so an enumerated name
+        // can never come from outside the documented shape.
+        fs::remove_file(home.join(".colima")).unwrap();
+        fs::create_dir_all(home.join(".colima/_lima")).unwrap();
+        symlink(
+            elsewhere.join("_lima/colima"),
+            home.join(".colima/_lima/colima"),
+        )
+        .unwrap();
+        assert!(candidates(&home).unwrap().is_empty());
+
+        // An intermediate folder of another row behaves the same way.
+        fs::create_dir_all(elsewhere.join("cargo")).unwrap();
+        fs::write(elsewhere.join("cargo/registry"), b"").unwrap();
+        symlink(elsewhere.join("cargo"), home.join(".cargo")).unwrap();
+        assert!(candidates(&home).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_linked_home_folder_is_resolved_once() {
+        let temp = TempDir::new("known-links-linked-home").unwrap();
+        let real = temp.folder("real-home").unwrap();
+        fs::create_dir_all(real.join(".cargo")).unwrap();
+        fs::write(real.join(".cargo/registry"), b"").unwrap();
+        let link = temp.child("linked-home");
+        symlink(&real, &link).unwrap();
+        let found = candidates(&link).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].path,
+            fs::canonicalize(&real).unwrap().join(".cargo/registry")
+        );
     }
 
     #[test]
