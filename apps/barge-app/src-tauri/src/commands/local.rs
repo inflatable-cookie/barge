@@ -4,12 +4,12 @@ use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct LocalMachine {
-    name: String,
-    model: Option<String>,
-    uptime_seconds: Option<u64>,
-    volumes: Vec<crate::storage::VolumeSummary>,
-    doctor_findings: Option<usize>,
-    storage_error: Option<String>,
+    pub name: String,
+    pub model: Option<String>,
+    pub uptime_seconds: Option<u64>,
+    pub volumes: Vec<crate::storage::VolumeSummary>,
+    pub doctor_findings: Option<usize>,
+    pub storage_error: Option<String>,
 }
 
 fn system_value(command: &str, args: &[&str]) -> Option<String> {
@@ -28,7 +28,7 @@ fn system_value(command: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-fn local_machine() -> LocalMachine {
+pub fn local_machine() -> LocalMachine {
     let name = system_value("hostname", &[]).unwrap_or_else(|| "This Mac".into());
     let model = system_value("sysctl", &["-n", "hw.model"]);
     let uptime_seconds = system_value("sysctl", &["-n", "kern.boottime"])

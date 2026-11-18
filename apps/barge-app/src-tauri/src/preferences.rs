@@ -407,7 +407,7 @@ impl longhorn_tauri_settings::SettingsAuthority for Store {
     }
 }
 fn authorize(caller: &str) -> Result<(), longhorn_tauri_settings::SettingsHostError> {
-    if caller == "main" || caller == "popover" {
+    if caller == "main" {
         Ok(())
     } else {
         Err(longhorn_tauri_settings::SettingsHostError::authority(

@@ -5,12 +5,12 @@
 
 mod commands;
 mod machines;
-mod popover;
 mod preferences;
 mod settings;
 mod storage;
+mod tray;
 
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::Manager;
 
 fn main() {
     if let Err(error) = run() {
@@ -51,45 +51,12 @@ fn run() -> tauri::Result<()> {
             ));
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            let popover = WebviewWindowBuilder::new(
-                app,
-                "popover",
-                WebviewUrl::App("index.html#popover".into()),
-            )
-            .title("Barge")
-            .inner_size(320.0, 300.0)
-            .decorations(false)
-            .resizable(false)
-            .visible(false)
-            .skip_taskbar(true)
-            .build()?;
-            let blur_window = popover.clone();
-            popover.on_window_event(move |event| {
-                if matches!(event, tauri::WindowEvent::Focused(false)) {
-                    let _ = blur_window.hide();
-                }
-            });
             let scale = app
                 .primary_monitor()
                 .ok()
                 .flatten()
                 .map_or(1.0, |monitor| monitor.scale_factor());
-            tauri::tray::TrayIconBuilder::new()
-                .icon(tray_icon(scale))
-                .icon_as_template(true)
-                .tooltip("Barge")
-                .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click {
-                        position,
-                        button: tauri::tray::MouseButton::Left,
-                        button_state: tauri::tray::MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        popover::show(tray.app_handle(), position);
-                    }
-                })
-                .build(app)?;
+            tray::start(app.handle(), tray_icon(scale))?;
             // macOS can park the menu-bar item off-screen, so the window opens
             // on launch unless the operator turned that off.
             if show_window {

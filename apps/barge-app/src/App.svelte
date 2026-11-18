@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
+  import Machines from "./Machines.svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { SidebarNav, EmptyState, Button, Callout, Select, Switch, TimeAgo } from "@inflatable-cookie/poodle-svelte";
   import { applyThemeAttributes } from "@inflatable-cookie/poodle-core/tokens/runtime";
   import type { AppApi, Preferences, Theme, VolumeSummary } from "./types";
 
-  let { api, popover = false, initialView = "machines" }: { api: AppApi; popover?: boolean; initialView?: string } = $props();
+  let { api, initialView = "machines" }: { api: AppApi; initialView?: string } = $props();
 
   const savedDefaults: Preferences = { launch_at_login: false, refresh_interval: 10, theme: "system", show_window_at_launch: true };
   const groups = [{ id: "main", items: ["Machines", "Storage", "Activity", "Settings"].map(label => ({ label, value: label.toLowerCase() })) }];
@@ -82,18 +84,16 @@
   onMount(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const changed = () => applyTheme();
-    // The popover exists for the whole session and is shown on demand, so a
-    // focus event is the popover opening: read storage then, and only then.
-    const opened = () => { if (popover) void readStorage(); };
     media.addEventListener("change", changed);
-    window.addEventListener("focus", opened);
+    let unlisten: (() => void) | undefined;
+    if ("__TAURI_INTERNALS__" in window) void listen("show-settings", () => { view = "settings"; }).then(dispose => { unlisten = dispose; });
     void api.preferences()
       .then(value => { preferences = value; saved = value; applyTheme(); })
       .catch(reason => { settingsError = `Could not load settings: ${describe(reason)}`; });
     void readStorage();
     return () => {
       media.removeEventListener("change", changed);
-      window.removeEventListener("focus", opened);
+      unlisten?.();
     };
   });
 </script>
@@ -106,28 +106,11 @@
   {#if storageError}<Callout tone="danger" announceMode="assertive" title="Storage could not be read" message={storageError} />{/if}
 {/snippet}
 
-{#if popover}
-  <main class="popover">
-    <h1>Barge</h1>
-    <section aria-label="Machines"><h2>Machines</h2><p>No machines yet</p></section>
-    <section aria-label="Storage"><h2>Storage</h2>
-      {#if loading}<p>Checking storage…</p>
-      {:else}
-        {@render storageErrorNote()}
-        {#if observedAt !== null}
-          {@render observed(observedAt)}
-          {#if volumes.length === 0}<p>No volumes registered</p>{:else}{#each volumes as volume}<p><strong>{volume.name}</strong> · {space(volume)}</p>{/each}{/if}
-        {:else if !storageError}<p>No storage read yet</p>{/if}
-      {/if}
-    </section>
-    <div class="actions"><Button onClick={() => void api.openWindow()}>Open Barge</Button><Button variant="ghost" onClick={() => void api.quit()}>Quit</Button></div>
-  </main>
-{:else}
   <div class="shell">
     <aside><div class="brand">Barge</div><SidebarNav {groups} bind:value={view} ariaLabel="Barge navigation" /></aside>
     <main class="content">
       {#if view === "machines"}
-        <h1>Machines</h1><EmptyState title="No machines yet" message="Machines registered with Barge will appear here." />
+        <Machines {api} refreshInterval={preferences.refresh_interval} />
       {:else if view === "storage"}
         <div class="heading"><h1>Storage</h1><Button variant="ghost" onClick={() => void readStorage()}>Refresh</Button></div>
         {#if loading}<p>Checking storage…</p>
@@ -164,4 +147,3 @@
       {/if}
     </main>
   </div>
-{/if}

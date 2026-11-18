@@ -9,13 +9,13 @@ aside { background: var(--poodle-color-background-surface); border-right: 1px so
 .brand { font-weight: 700; padding: 0 12px 24px; }
 .content { display: flex; flex-direction: column; padding: 32px; min-width: 0; }
 .heading { display: flex; align-items: baseline; justify-content: space-between; }
-.popover { width: 100%; padding: 20px; }
-.popover h1 { margin-bottom: 1rem; }
-.popover section { border-top: 1px solid var(--poodle-color-border-subtle); padding: 14px 0; }
-.popover section p { margin: 0; }
-.actions { display: flex; gap: 8px; border-top: 1px solid var(--poodle-color-border-subtle); padding-top: 14px; }
 .observed { color: var(--poodle-color-text-secondary); font-size: .85rem; margin: 0 0 12px; }
 .volumes { padding: 0; list-style: none; }
 .volumes li, .setting { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 16px 0; border-bottom: 1px solid var(--poodle-color-border-subtle); }
 .volumes span { color: var(--poodle-color-text-secondary); }
 .setting > :last-child { flex: 0 0 auto; min-width: 160px; display: flex; justify-content: flex-end; }
+
+.machines-layout { display: grid; grid-template-columns: minmax(11rem, 1fr) minmax(16rem, 2fr); gap: var(--poodle-space-inline-lg); align-items: start; }
+.machine-list { display: flex; flex-direction: column; gap: var(--poodle-space-stack-sm); }
+.machine-actions { display: flex; flex-wrap: wrap; gap: var(--poodle-space-inline-sm); margin-top: var(--poodle-space-stack-md); }
+@media (max-width: 680px) { .machines-layout { grid-template-columns: 1fr; } }

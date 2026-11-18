@@ -13,38 +13,46 @@ pub async fn machines_list(
     state: tauri::State<'_, MachineState>,
 ) -> Result<Vec<MachineView>, String> {
     let observations = Arc::clone(&state.0);
-    super::blocking(move || {
-        let registry = Registry::discover().map_err(|error| error.to_string())?;
-        let machines = registry.list().map_err(|error| error.to_string())?;
-        let reads = std::thread::scope(|scope| {
-            let handles: Vec<_> = machines
-                .iter()
-                .map(|machine| {
-                    let registry = &registry;
-                    scope.spawn(move || {
-                        let key = registry.key(machine.name());
-                        let lan = matches!(&key, Ok(Some(_)));
-                        let result = key
-                            .and_then(|_| client(registry, machine))
-                            .and_then(|client| client.state())
-                            .map_err(|error| error.to_string());
-                        (machine, lan, result)
-                    })
+    super::blocking(move || poll(&observations)).await
+}
+
+pub fn poll(observations: &Arc<Mutex<Observations>>) -> Result<Vec<MachineView>, String> {
+    let registry = Registry::discover().map_err(|error| error.to_string())?;
+    poll_registry(&registry, observations)
+}
+
+fn poll_registry(
+    registry: &Registry,
+    observations: &Arc<Mutex<Observations>>,
+) -> Result<Vec<MachineView>, String> {
+    let machines = registry.list().map_err(|error| error.to_string())?;
+    let reads = std::thread::scope(|scope| {
+        let handles: Vec<_> = machines
+            .iter()
+            .map(|machine| {
+                let registry = &registry;
+                scope.spawn(move || {
+                    let key = registry.key(machine.name());
+                    let lan = matches!(&key, Ok(Some(_)));
+                    let result = key
+                        .and_then(|_| client(registry, machine))
+                        .and_then(|client| client.state())
+                        .map_err(|error| error.to_string());
+                    (machine, lan, result)
                 })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().map_err(|_| "Machine check failed".to_owned()))
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        let mut observations = observations.lock().map_err(|error| error.to_string())?;
-        observations.retain(&machines);
-        Ok(reads
+            })
+            .collect();
+        handles
             .into_iter()
-            .map(|(machine, lan, result)| observations.update(machine, lan, result))
-            .collect())
-    })
-    .await
+            .map(|handle| handle.join().map_err(|_| "Machine check failed".to_owned()))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let mut observations = observations.lock().map_err(|error| error.to_string())?;
+    observations.retain(&machines);
+    Ok(reads
+        .into_iter()
+        .map(|(machine, lan, result)| observations.update(machine, lan, result))
+        .collect())
 }
 
 #[derive(serde::Deserialize)]
@@ -153,6 +161,49 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn empty_and_registered_machines_use_only_the_fixture_registry() {
+        let temp = barge::testing::TempDir::new("app-machine-poll").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        let observations = Arc::new(Mutex::new(Observations::default()));
+        assert!(poll_registry(&registry, &observations).unwrap().is_empty());
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        registry
+            .add(
+                Machine::new("pc", "127.0.0.1", "00:11:22:33:44:55")
+                    .unwrap()
+                    .with_daemon_port(port)
+                    .unwrap(),
+            )
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"schema":"barge.machine-state/1","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let first = poll_registry(&registry, &observations).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].reachable);
+        assert_eq!(
+            first[0].observation.as_ref().unwrap().power,
+            barge_machine::PowerState::Awake
+        );
+        assert!(first[0].observation.as_ref().unwrap().pending.is_some());
+        server.join().unwrap();
+        let failed = poll_registry(&registry, &observations).unwrap();
+        assert!(!failed[0].reachable);
+        assert_eq!(failed[0].observation, first[0].observation);
+    }
 
     #[test]
     fn cancel_refusal_from_daemon_is_visible() {

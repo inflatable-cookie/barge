@@ -14,7 +14,6 @@ import "./style.css";
 const params = new URLSearchParams(location.search);
 const view = params.get("view") ?? "machines";
 const scenario = params.get("scenario") ?? "storage";
-const popover = params.get("popover") === "1";
 
 const volumes: VolumeSummary[] = [
   { name: "Builds", presence: "present", free_bytes: 214 * 1024 ** 3 },
@@ -38,13 +37,16 @@ const api: AppApi = {
   },
   openWindow: async () => {},
   quit: async () => {},
+  localMachine: async () => ({ name: "Tom’s Mac", model: "Mac15,7", uptime_seconds: 54000, volumes, doctor_findings: 0, storage_error: null }),
+  machines: async () => scenario === "empty" ? [] : [{ name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", address: "bazzite.local", reachable: scenario !== "unreachable", error: scenario === "unreachable" ? "Connection timed out" : null, observation: { power: "awake", observed_at_unix_ms: Date.now() - 12000, pending: scenario === "pending" ? { action: "sleep", deadline_unix_ms: Date.now() + 12000 } : null } }],
+  addMachine: async () => {}, pairMachine: async () => {}, removeMachine: async () => {}, machineAction: async () => {}, moonlight: async () => {},
 };
 
 const target = document.getElementById("app");
-if (target) mount(App, { target, props: { api, popover, initialView: view } });
+if (target) mount(App, { target, props: { api, initialView: view } });
 
 function press(label: string) {
-  const button = [...document.querySelectorAll("button")].find(node => node.textContent?.trim() === label);
+  const button = [...document.querySelectorAll("button")].find(node => node.textContent?.trim().startsWith(label));
   button?.click();
 }
 
@@ -57,3 +59,5 @@ if (scenario === "save-failed") {
     document.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Launch at login"]')?.click();
   }, 150);
 }
+
+if (["awake", "unreachable", "pending"].includes(scenario)) setTimeout(() => press(`bazzite · LAN · ${scenario === "unreachable" ? "Unreachable" : scenario === "pending" ? "Action pending" : "Awake"}`), 150);
