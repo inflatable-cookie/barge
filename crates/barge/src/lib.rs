@@ -52,7 +52,7 @@ pub use doctor::{
 pub use error::{Error, ErrorKind, Result};
 pub use hold::{Hold, Mode};
 pub use layout::{Class, Layout, Placement, ResourcePath, SurveyItem};
-pub use move_plan::{MoveBinding, MoveIdentity, MoveLayout, MovePlan};
+pub use move_plan::{MoveBinding, MoveIdentity, MoveLayout, MovePlan, MoveReport};
 pub use os::{FakeOs, Os};
 pub use root::{Listing, Root, RootInfo, Straggler};
 pub use scratch::Scratch;

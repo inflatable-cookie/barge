@@ -120,7 +120,7 @@ impl Layout {
         }
         Ok(())
     }
-    fn for_volume(&self, volume: &str) -> Self {
+    pub(crate) fn for_volume(&self, volume: &str) -> Self {
         Self {
             schema: self.schema.clone(),
             classes: self
@@ -147,7 +147,7 @@ fn read(path: &Path) -> Result<Option<Layout>> {
     Ok(Some(layout))
 }
 
-fn write(path: &Path, layout: &Layout) -> Result<()> {
+pub(crate) fn write(path: &Path, layout: &Layout) -> Result<()> {
     layout.validate()?;
     let bytes = serde_json::to_vec_pretty(layout)
         .map_err(|e| Error::unknown_state(format!("cannot encode layout: {e}")))?;

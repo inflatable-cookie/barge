@@ -228,7 +228,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 `barge` wraps the library: `volume register|list|status`, `area list`,
 `root list [--bytes]|pin|unpin|evict`, `prune [--dry-run]`, `scratch new|sweep`,
 `status`, `layout show|set`, `path`, `env`, `survey`,
-`bind list|plan|apply|adopt|undo`, `doctor`. `--json` prints one
+`bind list|plan|apply|adopt|undo`, `move --plan|--apply`, `doctor`. `--json` prints one
 document with a top-level `schema` field
 (`barge.<kind>/<n>`); consumers check it and refuse unknown versions. `env`
 refuses `--json` because its output is shell code. Exit
@@ -281,7 +281,7 @@ path keeps the hold descriptor inherited.
 
 Designed separately, not yet built:
 
-- **Setting and workflow bindings, cache and kept placements, and moves:**
+- **Setting and workflow bindings, cache and kept placements:**
   [resources](resources.md). Link bindings and `doctor` are built.
 - **Worktree pools:** areas of git worktrees leased through holds; see
   [vision](vision.md#direction).

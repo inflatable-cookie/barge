@@ -72,6 +72,7 @@ fn dispatch(command: &str, rest: &[String], json: bool) -> Result<()> {
         "area" => area(rest, json),
         "root" => root(rest, json),
         "bind" => bind(rest, json),
+        "move" => move_resource(rest, json),
         "prune" => prune(rest, json),
         "scratch" => scratch(rest, json),
         "machine" => machine(rest, json),
@@ -112,6 +113,9 @@ usage: barge [--json] <command>
   bind apply --plan FILE|- [--replace]    apply exactly that reviewed plan
   bind adopt --consumer C --class K --link PATH
   bind undo <consumer>                    restore what was there before
+  move <class> <new-path> --plan           review a class move
+  move --item PATH --into CLASS[/SUB] --plan
+  move --apply --plan FILE|- [--confirm-stopped]
   doctor                                  volumes, layout and binding drift
   prune --volume V [--dry-run]            evict idle roots to meet policy
   scratch new --volume V --project P --label L [--ttl SECONDS]
@@ -695,6 +699,62 @@ fn bind(arguments: &[String], json: bool) -> Result<()> {
             "unknown bind command {other:?}; use list, plan, apply, adopt or undo"
         ))),
     }
+}
+
+fn move_resource(arguments: &[String], json: bool) -> Result<()> {
+    if arguments.iter().any(|arg| arg == "--apply") {
+        let options = Options::parse(arguments, &["plan"], &["apply", "confirm-stopped"])?;
+        expect_no_positionals(&options)?;
+        let path = options.required("plan")?;
+        let source = if path == "-" {
+            std::io::read_to_string(std::io::stdin().lock())
+                .map_err(|e| Error::new(ErrorKind::Io, format!("cannot read plan: {e}")))?
+        } else {
+            std::fs::read_to_string(&path)
+                .map_err(|e| Error::usage(format!("cannot read plan {path}: {e}")))?
+        };
+        let plan: barge::MovePlan = serde_json::from_str(&source)
+            .map_err(|e| Error::usage(format!("invalid move plan: {e}")))?;
+        let report = Barge::open()?.apply_move(&plan, options.flag("confirm-stopped"))?;
+        if json {
+            document("barge.move/1", vec![("report", json!(report))])?;
+        } else {
+            println!(
+                "moved {} -> {}\ndoctor: {}",
+                plan.source.display(),
+                plan.destination.display(),
+                if report.doctor.ok {
+                    "ok"
+                } else {
+                    "issues found"
+                }
+            );
+        }
+        return Ok(());
+    }
+    let options = Options::parse(arguments, &["item", "into"], &["plan"])?;
+    if !options.flag("plan") {
+        return Err(Error::usage("move requires --plan or --apply --plan FILE"));
+    }
+    let barge = Barge::open_read_only()?;
+    let plan = if let Some(item) = options.get("item") {
+        expect_no_positionals(&options)?;
+        let into = options.required("into")?;
+        let (class, sub) = into.split_once('/').unwrap_or((&into, ""));
+        barge.plan_item_move(Path::new(&item), class.parse()?, sub)?
+    } else {
+        if options.get("into").is_some() {
+            return Err(Error::usage("--into requires --item"));
+        }
+        let (class, path) = options.two_positionals("move")?;
+        barge.plan_class_move(class.parse()?, &path)?
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&plan)
+            .map_err(|e| Error::unknown_state(format!("cannot encode move plan: {e}")))?
+    );
+    Ok(())
 }
 
 fn binding_from_options(options: &Options) -> Result<Binding> {

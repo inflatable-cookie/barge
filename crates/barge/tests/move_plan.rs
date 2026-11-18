@@ -44,3 +44,106 @@ fn plans_class_and_item_moves_without_writing() {
     assert!(item.bindings.is_empty());
     assert!(f.mount.join("Example.pvm").exists());
 }
+
+#[test]
+fn apply_retargets_links_and_rejects_drift() {
+    let f = Fixture::new();
+    f.register();
+    f.barge
+        .set_layout(
+            Class::Vms,
+            Placement {
+                volume: "Builds".into(),
+                path: "vms".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+    fs::create_dir(f.mount.join("vms")).unwrap();
+    for name in ["one", "two"] {
+        fs::create_dir(f.mount.join("vms").join(name)).unwrap();
+        let link = f.temp.path().join(name);
+        symlink(f.mount.join("vms").join(name), &link).unwrap();
+        f.barge
+            .bindings()
+            .adopt(&Binding::link(name, Class::Vms, link))
+            .unwrap();
+    }
+    let plan = f.barge.plan_class_move(Class::Vms, "machines").unwrap();
+    assert!(f.barge.apply_move(&plan, false).is_err());
+    fs::create_dir(&plan.destination).unwrap();
+    assert!(f.barge.apply_move(&plan, true).is_err());
+    fs::remove_dir(&plan.destination).unwrap();
+    let link = f.temp.path().join("one");
+    fs::remove_file(&link).unwrap();
+    symlink(f.mount.join("vms/two"), &link).unwrap();
+    assert!(f.barge.apply_move(&plan, true).is_err());
+    fs::remove_file(&link).unwrap();
+    symlink(f.mount.join("vms/one"), &link).unwrap();
+    let result = f.barge.apply_move(&plan, true).unwrap();
+    assert!(result.doctor.ok);
+    for name in ["one", "two"] {
+        assert_eq!(
+            fs::read_link(f.temp.path().join(name)).unwrap(),
+            f.mount.join("machines").join(name)
+        );
+    }
+    assert_eq!(
+        f.barge.layout().unwrap().classes[&Class::Vms].path,
+        "machines"
+    );
+}
+
+#[test]
+fn source_replacement_and_absent_volume_are_refused() {
+    let f = Fixture::new();
+    f.register();
+    f.barge
+        .set_layout(
+            Class::Vms,
+            Placement {
+                volume: "Builds".into(),
+                path: "vms".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+    fs::create_dir(f.mount.join("vms")).unwrap();
+    let plan = f.barge.plan_class_move(Class::Vms, "machines").unwrap();
+    fs::rename(f.mount.join("vms"), f.mount.join("old")).unwrap();
+    fs::create_dir(f.mount.join("vms")).unwrap();
+    assert!(f.barge.apply_move(&plan, true).is_err());
+    fs::remove_dir(f.mount.join("vms")).unwrap();
+    fs::rename(f.mount.join("old"), f.mount.join("vms")).unwrap();
+    f.os.add_volume(f.mount.clone(), Some(common::OTHER_UUID), common::TIB);
+    assert!(f.barge.apply_move(&plan, true).is_err());
+}
+
+#[test]
+fn held_root_inside_source_refuses_move() {
+    let f = Fixture::new();
+    f.register();
+    f.barge
+        .set_layout(
+            Class::Builds,
+            Placement {
+                volume: "Builds".into(),
+                path: "builds".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+    let area = f
+        .barge
+        .area(barge::AreaSpec::new("test", "pool", "Builds").folder("builds/test/pool"))
+        .unwrap();
+    let root = area.create_root("one").unwrap();
+    let hold = area.hold(&root.id, barge::Mode::Exclusive).unwrap();
+    let plan = f
+        .barge
+        .plan_class_move(Class::Builds, "new-builds")
+        .unwrap();
+    let error = f.barge.apply_move(&plan, true).unwrap_err();
+    assert!(error.message().contains("held"));
+    drop(hold);
+}

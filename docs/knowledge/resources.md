@@ -237,8 +237,9 @@ Changing where a class lives is the operation the Stash tidy needs, so it is
 one command with a plan:
 
 ```
-barge move <class|area> <new-path> --plan    # writes nothing
-barge move <class|area> <new-path> --apply   # after operator approval
+barge move <class> <new-path> --plan > plan.json
+barge move --item <path> --into <class>/<sub> --plan > plan.json
+barge move --apply --plan plan.json --confirm-stopped
 ```
 
 The plan lists:

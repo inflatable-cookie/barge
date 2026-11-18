@@ -268,3 +268,36 @@ mod tests {
         }
     }
 }
+
+/// Rename only if the destination is absent, without a check-then-rename race.
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let from =
+        CString::new(from.as_os_str().as_bytes()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let to =
+        CString::new(to.as_os_str().as_bytes()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    // SAFETY: both paths are valid NUL-terminated strings and the calls do not retain them.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        }
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
