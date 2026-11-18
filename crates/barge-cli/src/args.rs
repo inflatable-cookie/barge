@@ -31,30 +31,6 @@ pub(super) fn parse_size(text: &str) -> Result<u64> {
         .ok_or_else(|| Error::usage(format!("size {text:?} is too large")))
 }
 
-pub(super) fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-/// A size a tree walk could not take exactly is shown as approximate.
-pub(super) fn describe_size(bytes: u64, approximate: bool) -> String {
-    if approximate {
-        format!("~{} (approximate)", format_size(bytes))
-    } else {
-        format_size(bytes)
-    }
-}
-
 pub(super) fn parse_bool(field: &str, text: &str) -> Result<bool> {
     match text {
         "true" | "yes" => Ok(true),
