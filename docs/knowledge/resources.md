@@ -1,6 +1,6 @@
 # Resources and bindings
 
-Status: design proposal, 2026-11-18, for Tom's sign-off. Nothing here is built
+Status: design proposal, 2026-11-18, revised with Tom's answers the same day. Nothing here is built
 yet. The lean storage core in [architecture](architecture.md) is the mechanism
 this design builds on and does not change.
 
@@ -48,39 +48,50 @@ The starting set:
 | `vms` | kept | the tool | Colima and Parallels disks |
 | `archives` | kept | the operator | archives and old projects |
 
-**Durability belongs to the class, not the volume.** Q-002 assumed two drives,
-Builds for expendable data and Vault for kept data. There is one, Stash, and it
-holds both. Kept classes sit outside every expendable area (Q-006), so pruning
-can never reach them.
+**Durability belongs to the class, not the volume** (Tom, 2026-11-18). Each
+class is placed on one registered volume, and different classes can live on
+different volumes. One drive can hold both expendable and kept classes, as
+Stash does today. A second drive can take some classes over by moving them
+(see [Moving a class](#moving-a-class)). Kept classes sit outside every
+expendable area (Q-006), so pruning can never reach them.
 
-### Layout manifest
+### Layout
 
-A **layout** maps each class to one folder on a volume. It is stored **on the
-volume**, at `<mount>/.barge/layout.json` (`barge.layout/1`), so it travels
-with the drive and every machine that mounts it agrees on where things are.
-Account state keeps only which volumes are registered.
+The **layout** places each class on a volume and a folder within it. It has two
+copies, with one authority:
+
+- **The account layout** (`layout.json` in account state, `barge.layout/1`) is
+  the authority on this machine. It covers every volume, so Barge still knows
+  where each class belongs while a drive is absent: `barge path scratch` with
+  Stash unplugged applies that class's absent policy rather than guessing
+  (Tom, 2026-11-18).
+- **The volume record** (`<mount>/.barge/layout.json`) lists the classes that
+  volume holds and their folders. Barge rewrites it whenever the account layout
+  changes. It lets a drive describe itself: another machine, or a fresh
+  account, can import it on registration instead of rediscovering the folders.
+  `barge doctor` reports any disagreement between the two copies, and the
+  operator picks which one wins. Barge never resolves it silently.
 
 ```json
 {
   "schema": "barge.layout/1",
-  "volume": "Stash",
   "classes": {
-    "scratch":   { "path": "scratch" },
-    "worktrees": { "path": "worktrees" },
-    "builds":    { "path": "builds" },
-    "caches":    { "path": "caches" },
-    "evidence":  { "path": "evidence" },
-    "vms":       { "path": "vms" },
-    "archives":  { "path": "archives" }
+    "scratch":   { "volume": "Stash", "path": "scratch" },
+    "worktrees": { "volume": "Stash", "path": "worktrees" },
+    "builds":    { "volume": "Stash", "path": "builds" },
+    "caches":    { "volume": "Stash", "path": "caches" },
+    "evidence":  { "volume": "Stash", "path": "evidence" },
+    "vms":       { "volume": "Stash", "path": "vms" },
+    "archives":  { "volume": "Stash", "path": "archives" }
   }
 }
 ```
 
 A consumer area (`oxide/pool`) sits inside its class folder by default
-(`builds/oxide/pool`) and can be overridden to an existing path, as Oxide's
-two areas are today ([architecture](architecture.md#layout-on-a-volume)), until
-a move puts them under the class folder. The Stash layout lane settles the actual target layout. The
-folder names above are a first proposal.
+(`builds/oxide/pool`) and can be overridden to an existing path, as Oxide's two
+areas are today ([architecture](architecture.md#layout-on-a-volume)), until a
+move puts them under the class folder. The Stash layout lane settles the actual
+target layout. The folder names above are a first proposal.
 
 ### Bindings
 
@@ -137,21 +148,44 @@ Rules:
 First adapters, from today's real bindings:
 - **Paseo:** worktree root.
 - **Nucleus:** `workRoot`.
+- **Effigy:** scratch root.
 - **Colima:** profile mounts (Q-009).
 - **Shell environment variables for caches:** a managed block in a file Barge
   owns, which the operator sources once.
 
 The Cargo `registry` and `git` symlinks become `link` bindings.
 
-### Agent workflows
+### Reaching tools and agents without coupling
 
-`barge init` writes a managed block into a repository's `AGENTS.md`, the way
-`oxide init` does. The block is generated from the layout: where scratch goes,
-how to get a scratch root (`barge scratch new`), and never to write to a home
-folder or a drive root. `barge init --check` fails when the block is stale. A
-repository adds it to its docs check, so the written workflow cannot drift from
-the real layout. This replaces the hand-written Stash rules in Effigy's,
-Acowtancy's and other repositories' `AGENTS.md`.
+Tom (2026-11-18): don't complicate Nucleus or Effigy, or tie them to Barge.
+The rule that keeps this clean: **dependencies point from Barge to the tools,
+never back.** No tool needs Barge installed, linked or running.
+
+- **A tool keeps the one location setting it already has.** Nucleus has
+  `workRoot`, Paseo its worktree root, Effigy its scratch root in
+  `~/.effigy/config.toml`. Barge sets those values through a `setting` binding,
+  and doctor checks them. The tool reads its own config as it does today and
+  never learns that Barge exists.
+- **A process gets its location from whatever started it.** Nucleus already
+  gives each run its own `TMPDIR` under `workRoot`, and Effigy gives each
+  selector its own scratch. Those values already come from the settings above,
+  so Barge's layout reaches every run with no injection and no code change in
+  either tool. `TMPDIR` is the standard contract every program already honours.
+- **Interactive agents get a generated workflow block.** `barge init` writes a
+  managed block into a repository's `AGENTS.md`, the way `oxide init` does: the
+  scratch folder for that project, and never to write to a home folder or a
+  drive root. `barge init --check` reports a stale block. Today these rules are
+  hand-written, and Effigy's already carries notes about a path that moved. A
+  repository may run the check in its docs check, but nothing requires it.
+- **Voluntary use stays possible.** A tool that wants a fresh scratch root can
+  call `barge scratch new` when Barge is installed, falling back to its own
+  setting when it isn't. Nothing depends on it.
+
+Rejected:
+- Nucleus or Effigy injecting `barge env`: it couples them to Barge's
+  installation and output format.
+- A new shared locations file that every tool reads: a new cross-tool format
+  to version and maintain.
 
 ### Doctor
 
@@ -231,14 +265,16 @@ Each step is its own brief, reviewed as usual.
 
 1. Classes and the layout manifest; `path` and `env`; `survey`.
 2. Binding records, the `link` kind and `doctor`; adopt the Cargo links.
-3. `init` with workflow blocks; adopt Effigy and this repository.
-4. Adapters: Paseo, Nucleus, Colima, shell environment.
+3. `init` with workflow blocks; adopt this repository, then Effigy's.
+4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
 5. `move --plan|--apply`; the Stash layout lane then uses it item by item.
 
-## Open questions
+## Questions
 
-- [Q-014](questions.md#q-014--where-does-the-layout-manifest-live): layout on
-  the volume (proposed) or in account state?
+- [Q-002](questions.md#q-002--which-volume-owns-which-data-when-several-are-registered):
+  each class is placed on one volume; durability belongs to the class.
+- [Q-014](questions.md#q-014--where-does-the-layout-manifest-live): the account
+  layout is the authority; the volume record describes the drive.
 - [Q-015](questions.md#q-015--how-do-agents-get-their-scratch-and-worktree-locations):
-  should Nucleus and Effigy inject `barge env` into the agents and runs they
-  start, so agents never need to read the workflow block?
+  through each tool's own setting and the standard `TMPDIR`, with no
+  injection. See [Reaching tools and agents](#reaching-tools-and-agents-without-coupling).

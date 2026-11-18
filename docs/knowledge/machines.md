@@ -82,10 +82,11 @@ the build brief.
    review.
 4. The Tauri app: Machines plus the menu-bar entry.
 5. Retire MoonDeck Buddy on the PC. This changes host software, so it needs
-   Tom's go-ahead.
+   Tom's go-ahead. The Steam Deck needs a `barged` client first, or loses
+   remote control until it has one.
 
-## Open
+## MoonDeck Buddy scope
 
-- Whether `barged` should also replace any game-launch features of MoonDeck
-  Buddy that the Steam Deck uses. MoonDeck Remote never used them, so the
-  assumption is no; confirm before retiring Buddy.
+Tom used MoonDeck Buddy on the Steam Deck only for remote control of the PC
+(2026-11-18), so `barged` replaces it entirely. No game-launch features carry
+over. The Steam Deck becomes a client of `barged` once a client exists for it.

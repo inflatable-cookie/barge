@@ -10,9 +10,8 @@ Answer: per kind: build output uses a visible local fallback; caches and scratch
 
 ## Q-002 — Which volume owns which data when several are registered?
 
-Status: answered 2026-10-26; revision proposed 2026-11-18
-Answer: one home per placement chosen by durability: expendable data on Builds, kept data on Vault; moves are explicit (Tom); see [architecture](architecture.md#concepts).
-Proposed revision: there is one external drive, Stash, holding both. Durability belongs to the resource class, not the volume, and kept classes sit outside every expendable area; see [resources](resources.md#resource-classes). Awaiting Tom's sign-off.
+Status: revised 2026-11-18
+Answer: each resource class is placed on one registered volume, and different classes can live on different volumes; durability belongs to the class, not the volume (Tom, 2026-11-18, replacing the 2026-10-26 Builds/Vault split); see [resources](resources.md#resource-classes).
 
 ## Q-003 — How does Barge change another tool's configuration?
 
@@ -59,17 +58,10 @@ governing record's (Tom's Q-G decision `12729764`); see the
 
 ## Q-014 — Where does the layout manifest live?
 
-Open (Barge planner, 2026-11-18). Proposed: on the volume, at
-`<mount>/.barge/layout.json`, so the layout travels with the drive and every
-machine agrees on it. Bindings stay per machine in account state. The
-alternative keeps the layout in account state, which is simpler but lets two
-machines disagree about one drive. See [resources](resources.md#layout-manifest).
+Status: answered 2026-11-18
+Answer: in both places, with one authority. The account layout is authoritative and covers every volume, so Barge knows where classes belong while a drive is absent. Each volume carries a record of the classes it holds, for import and drift checks (Tom, 2026-11-18); see [resources](resources.md#layout).
 
 ## Q-015 — How do agents get their scratch and worktree locations?
 
-Open (Barge planner, 2026-11-18). Today agents follow hand-written `AGENTS.md`
-rules. Proposed: `barge init` writes a generated workflow block, and Nucleus
-and Effigy inject `barge env` into the agents and runs they start, so the
-location reaches the process without the agent reading any docs. Injection
-needs agreement from the Nucleus and Effigy owners. See
-[resources](resources.md#agent-workflows).
+Status: proposed 2026-11-18, for Tom's sign-off
+Answer: without coupling. Each tool keeps its own location setting, which Barge sets and checks. Processes inherit locations from the tool that starts them through the standard `TMPDIR`. Interactive agents read a generated `AGENTS.md` block. Nucleus and Effigy change nothing and never depend on Barge (Tom asked for a clean solution, 2026-11-18); see [resources](resources.md#reaching-tools-and-agents-without-coupling).
