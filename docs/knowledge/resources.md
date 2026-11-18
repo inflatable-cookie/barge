@@ -43,9 +43,13 @@ The starting set:
 | `worktrees` | expendable, LRU | Barge | warm git worktree pools, Paseo and Nucleus workspaces |
 | `builds` | expendable, LRU | the consumer, via areas | Oxide's pool and outputs |
 | `caches` | expendable, LRU | the tool | Cargo registry and git, npm, bun, pip |
-| `evidence` | expendable, with expiry | the tool | Effigy, Praxis and Nucleus run evidence |
 | `vms` | kept | the tool | Colima and Parallels disks |
 | `archives` | kept | the operator | archives and old projects |
+
+**Run evidence is scratch** (Tom, 2026-11-18). A tool's run evidence is placed
+under the `scratch` class, `scratch/<tool>/…`, with that tool's own expiry;
+there is no separate class for it. A stored layout that still names `evidence`
+is refused, naming the retired class, rather than misread.
 
 **Durability belongs to the class, not the volume** (Tom, 2026-11-18). Each
 class is placed on one registered volume, and different classes can live on
@@ -80,7 +84,6 @@ It has two copies, with one authority:
     "worktrees": { "volume": "Stash", "path": "worktrees" },
     "builds":    { "volume": "Stash", "path": "builds" },
     "caches":    { "volume": "Stash", "path": "caches" },
-    "evidence":  { "volume": "Stash", "path": "evidence" },
     "vms":       { "volume": "Stash", "path": "vms" },
     "archives":  { "volume": "Stash", "path": "archives" }
   }
@@ -264,21 +267,24 @@ plan.
 ## Library and CLI additions
 
 ```rust
-let layout = barge.layout("Stash")?;                // read, or the default proposal
-layout.path(Class::Scratch)?;                       // resolved, with the absent policy applied
-barge.bindings()?.doctor()?;                        // Report
-barge.bind(Binding::setting("paseo", Class::Worktrees))?.plan()?;   // Change; apply is explicit
+let layout = barge.layout()?;                       // the account's placements
+let path = barge.resource_path(Class::Scratch, Some("oxide"))?;  // absent policy applied
+let report = barge.doctor()?;                       // read-only drift report
+let bindings = barge.bindings();
+let plan = bindings.plan(&binding)?;                // the exact before and after
+bindings.apply(&binding, &plan, ApplyOptions::default())?;   // takes that plan back
 ```
 
-CLI:
+CLI, as built:
 - `barge layout show|set`
 - `barge path <class> [--project p]`
-- `barge env [--shell zsh]`
-- `barge bind list|plan|apply|undo`
+- `barge env [--shell zsh|bash|fish]`
+- `barge bind list|plan|apply|adopt|undo`
 - `barge doctor`
-- `barge init [--check]`
-- `barge survey`
-- `barge move --plan|--apply`
+- `barge survey <volume>`
+
+Planned with their steps below: `barge init [--check]` and
+`barge move --plan|--apply`.
 
 ## What stays out
 

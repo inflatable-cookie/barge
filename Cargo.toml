@@ -1,5 +1,6 @@
-# Barge's workspace: one library that holds every mechanic and one thin CLI
-# over it (docs/knowledge/architecture.md, "Library surface").
+# Barge's workspace: the storage library, the thin CLI over it, the machine
+# registry and the machine daemon (docs/knowledge/architecture.md, "Library
+# surface"; docs/knowledge/machines.md, "Repository layout").
 [workspace]
 members = ["crates/barge", "crates/barge-cli", "crates/barge-machine", "crates/barged"]
 resolver = "2"
@@ -11,12 +12,39 @@ edition = "2021"
 # same channel), so Barge's MSRV follows that consumer rather than inventing its
 # own.
 rust-version = "1.97.1"
-# No registry is chosen in stage 1; the library is consumed by path or git.
+# Barge is consumed by path or Git revision; it is never published to a registry.
 publish = false
 
-# Workspace lints: clippy::all plus two rustc lints for API and unsafe hygiene.
-# Threshold lints (cognitive complexity, too_many_lines, type_complexity) are
-# deliberately not gates.
+# Shared dependency requirements. They are caret requirements, so a consumer
+# that links Barge is not forced onto one exact patch release; `Cargo.lock`
+# still pins every version this workspace builds.
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+# The one platform dependency. Every use of it sits behind the `os` layer
+# (volume identity and free space) and the hold's `flock`; no other module names
+# a syscall or errno.
+libc = "0.2.190"
+
+# The `barged` client: default features are off, so this is plain blocking
+# HTTP/1.1 with no TLS stack, because the daemon speaks plain HTTP over the
+# tailnet (docs/knowledge/machines.md, "Protocol and trust").
+ureq = { version = "3.4.2", default-features = false }
+
+# The daemon's server. Blocking, one thread, no async runtime: it answers three
+# endpoints for one operator.
+tiny_http = "0.12.0"
+
+# logind over D-Bus, Linux only. The macOS workspace checks never build it, so
+# the daemon still compiles (and reports state) on the Mac.
+zbus = "5.19.0"
+
+# Workspace lints: clippy::all plus the rustc lints for API and unsafe hygiene,
+# and the three "no panics outside tests" clippy lints. `clippy.toml` grants test
+# code its exception (`allow-*-in-tests`), so a test may unwrap or panic while
+# the shipped crates may not. Threshold lints (cognitive complexity,
+# too_many_lines, type_complexity) are deliberately not gates.
 [workspace.lints.rust]
 missing_debug_implementations = "deny"
 unsafe_op_in_unsafe_fn = "deny"
@@ -26,6 +54,10 @@ all = { level = "deny", priority = -1 }
 # RUST-UNSAFE-001's named mechanical check: every unsafe block states the
 # invariant it relies on in a SAFETY comment. Only the `os` macOS seam has any.
 undocumented_unsafe_blocks = { level = "deny", priority = -1 }
+# Panicking is never how a library or a binary reports a refusal.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
 
 # Shared workspace profile: our own units keep the toolchain's dev debug
 # recipe, while dependency units carry no debug info, so a test build stays
