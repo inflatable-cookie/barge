@@ -38,6 +38,19 @@ describe("tray popover", () => {
     expect(screen.getByText(/Absent/)).toBeInTheDocument();
     expect(screen.getByText(/Different volume at mount/)).toBeInTheDocument();
   });
+  it("refreshes storage when the popover is opened again", async () => {
+    const api = fixture([{ name: "Builds", presence: "present", free_bytes: 1024 ** 3 }]);
+    render(App, { props: { api, popover: true } });
+    expect(await screen.findByText(/1.0 GB free/)).toBeInTheDocument();
+
+    vi.mocked(api.volumes).mockResolvedValue([{ name: "Builds", presence: "absent", free_bytes: null }]);
+    await fireEvent.blur(window);
+    await fireEvent.focus(window);
+
+    expect(await screen.findByText(/Absent/)).toBeInTheDocument();
+    expect(screen.queryByText(/1.0 GB free/)).not.toBeInTheDocument();
+    expect(api.volumes).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("window navigation", () => {

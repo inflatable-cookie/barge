@@ -33,10 +33,15 @@
   onMount(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const changed = () => applyTheme();
+    const opened = () => { if (popover) void refresh(); };
     media.addEventListener("change", changed);
+    window.addEventListener("focus", opened);
     void api.preferences().then(value => { preferences = value; applyTheme(); }).catch(reason => { error = `Could not load settings: ${String(reason)}`; });
     void refresh();
-    return () => media.removeEventListener("change", changed);
+    return () => {
+      media.removeEventListener("change", changed);
+      window.removeEventListener("focus", opened);
+    };
   });
   $effect(() => {
     const timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, preferences.refresh_interval * 1000);
