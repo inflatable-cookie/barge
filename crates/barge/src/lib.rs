@@ -17,6 +17,7 @@
 )]
 
 pub mod area;
+pub mod area_spec;
 pub mod bindings;
 pub mod clock;
 pub mod doctor;
@@ -24,6 +25,7 @@ pub mod error;
 pub mod hold;
 pub mod layout;
 pub mod os;
+pub mod pin;
 pub mod root;
 pub mod scratch;
 pub mod space;
@@ -56,7 +58,6 @@ pub use space::{
     EvictedRoot, KeepReason, KeptRoot, PruneReason, PruneReport, SkippedRoot, Space, SweepReport,
     SweptRoot,
 };
-pub use state::StateLock;
 pub use volume::{
     Availability, Durability, Volume, VolumeRegistration, VolumeSpec, VolumeState, VolumeStatus,
 };
@@ -87,6 +88,40 @@ impl Core {
             .find(|spec| spec.name == name)
             .map(|spec| Volume::new(self.clone(), spec))
             .ok_or_else(|| Error::not_found(format!("volume {name} is not registered")))
+    }
+
+    pub(crate) fn declare_area(&self, proposed: AreaRecord) -> Result<Area> {
+        proposed.validate()?;
+        let volume = self.volume(&proposed.volume)?;
+        let _lock = if self.read_only {
+            None
+        } else {
+            Some(self.state.lock()?)
+        };
+        let record = match self.state.read_area(&proposed.key())? {
+            Some(stored) => {
+                let differing = stored.differing_fields(&proposed);
+                if !differing.is_empty() {
+                    return Err(Error::refused(format!(
+                        "area {} is already declared with different {}",
+                        proposed.key().label(),
+                        differing.join(", ")
+                    )));
+                }
+                stored
+            }
+            None if self.read_only => {
+                return Err(Error::refused(format!(
+                    "area {} is not declared on a read-only account",
+                    proposed.key().label()
+                )))
+            }
+            None => {
+                self.state.write_area(&proposed)?;
+                proposed
+            }
+        };
+        Ok(Area::new(self.clone(), record, volume))
     }
 }
 
@@ -151,58 +186,6 @@ impl Barge {
         self.core.state.root()
     }
 
-    /// Register a volume, reading its identity at the mount when the caller did
-    /// not supply one.
-    pub fn register_volume(&self, registration: VolumeRegistration) -> Result<Volume> {
-        self.core.ensure_writable()?;
-        let mut spec = registration.into_spec()?;
-        let _lock = self.core.state.lock()?;
-        let mut stored = self.core.state.read_volumes()?;
-        let found = match self.core.os.volume_identity(&spec.mount)? {
-            Some(found) => found,
-            None => {
-                return Err(Error::refused(format!(
-                    "cannot read a volume identity at {}; mount the volume first",
-                    spec.mount.display()
-                )))
-            }
-        };
-        if !spec.uuid.is_empty() && !spec.uuid.eq_ignore_ascii_case(&found) {
-            return Err(Error::refused(format!(
-                "volume at {} is {found}, not the declared {}",
-                spec.mount.display(),
-                spec.uuid
-            )));
-        }
-        spec.uuid = found;
-        for existing in &stored {
-            if existing.name != spec.name && existing.uuid.eq_ignore_ascii_case(&spec.uuid) {
-                return Err(Error::refused(format!(
-                    "volume identity {} is already registered as {}",
-                    spec.uuid, existing.name
-                )));
-            }
-        }
-        match stored
-            .iter()
-            .position(|existing| existing.name == spec.name)
-        {
-            Some(index) => {
-                if !stored[index].uuid.eq_ignore_ascii_case(&spec.uuid) {
-                    return Err(Error::refused(format!(
-                        "volume {} is registered as {}, not {}",
-                        spec.name, stored[index].uuid, spec.uuid
-                    )));
-                }
-                stored[index] = spec.clone();
-            }
-            None => stored.push(spec.clone()),
-        }
-        stored.sort_by(|left, right| left.name.cmp(&right.name));
-        self.core.state.write_volumes(&stored)?;
-        Ok(Volume::new(self.core.clone(), spec))
-    }
-
     /// Every registered volume, in name order.
     pub fn volumes(&self) -> Result<Vec<Volume>> {
         Ok(self
@@ -222,47 +205,7 @@ impl Barge {
     /// Declare an area. The stored declaration is authoritative: a second
     /// declaration that differs is refused, naming the differing fields.
     pub fn area(&self, spec: AreaSpec) -> Result<Area> {
-        let proposed = spec.into_record();
-        proposed.validate()?;
-        let volume_name = proposed.volume.clone();
-        if self.core.read_only {
-            self.volume(&volume_name)?;
-            let stored = self.core.state.read_area(&proposed.key())?.ok_or_else(|| {
-                Error::refused(format!(
-                    "area {} is not declared on a read-only account",
-                    proposed.key().label()
-                ))
-            })?;
-            let differing = stored.differing_fields(&proposed);
-            if !differing.is_empty() {
-                return Err(Error::refused(format!(
-                    "area {} is already declared with different {}",
-                    proposed.key().label(),
-                    differing.join(", ")
-                )));
-            }
-            return self.area_from_record(stored);
-        }
-        let _lock = self.core.state.lock()?;
-        self.volume(&volume_name)?;
-        let stored = self.core.state.read_area(&proposed.key())?;
-        match stored {
-            Some(stored) => {
-                let differing = stored.differing_fields(&proposed);
-                if !differing.is_empty() {
-                    return Err(Error::refused(format!(
-                        "area {} is already declared with different {}",
-                        proposed.key().label(),
-                        differing.join(", ")
-                    )));
-                }
-                self.area_from_record(stored)
-            }
-            None => {
-                self.core.state.write_area(&proposed)?;
-                self.area_from_record(proposed)
-            }
-        }
+        self.core.declare_area(spec.into_record())
     }
 
     /// Every stored area declaration, ordered by namespace then name.
@@ -361,15 +304,16 @@ impl Barge {
     /// for a consumer's diagnostics.
     pub fn status(&self) -> Result<Vec<VolumeStatus>> {
         let mut volumes = Vec::new();
+        let all_areas = self.areas()?;
         for volume in self.volumes()? {
             let state = volume.state()?;
             let free_bytes = match &state {
-                VolumeState::Present => self.core.os.free_bytes(&volume.spec().mount).ok(),
+                VolumeState::Present => Some(self.core.os.free_bytes(&volume.spec().mount)?),
                 VolumeState::Mismatch { .. } => None,
                 VolumeState::Absent => None,
             };
             let mut areas = Vec::new();
-            for area in self.areas()? {
+            for area in &all_areas {
                 if area.record().volume != volume.spec().name {
                     continue;
                 }

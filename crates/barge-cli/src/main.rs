@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -511,9 +511,10 @@ fn resource_env(arguments: &[String]) -> Result<()> {
         return Err(Error::usage("shell must be zsh, bash or fish"));
     }
     let barge = Barge::open_read_only()?;
-    match barge.resource_env(&shell) {
-        Ok((assignment, fallback)) => {
-            if fallback {
+    match barge.resource_path(Class::Scratch, None) {
+        Ok(resolved) => {
+            let assignment = shell_assignment(&shell, "BARGE_SCRATCH", &resolved.path)?;
+            if resolved.fallback {
                 eprintln!("barge: using fallback for scratch");
             }
             println!("{assignment}");
@@ -524,6 +525,21 @@ fn resource_env(arguments: &[String]) -> Result<()> {
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+/// Render one shell assignment, quoting paths without invoking a shell.
+fn shell_assignment(shell: &str, name: &str, value: &Path) -> Result<String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| Error::usage("resource path is not valid UTF-8"))?;
+    match shell {
+        "bash" | "zsh" => Ok(format!("export {name}='{}'", value.replace('\'', "'\\''"))),
+        "fish" => Ok(format!(
+            "set -gx {name} '{}';",
+            value.replace('\\', "\\\\").replace('\'', "\\'")
+        )),
+        _ => Err(Error::usage("shell must be zsh, bash or fish")),
+    }
 }
 
 fn survey(arguments: &[String], json: bool) -> Result<()> {
@@ -1625,6 +1641,19 @@ impl Options {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_assignments_quote_paths() {
+        let path = std::path::Path::new("/some path/it's here");
+        assert_eq!(
+            super::shell_assignment("bash", "BARGE_SCRATCH", path).unwrap(),
+            "export BARGE_SCRATCH='/some path/it'\\''s here'"
+        );
+        assert_eq!(
+            super::shell_assignment("fish", "BARGE_SCRATCH", path).unwrap(),
+            "set -gx BARGE_SCRATCH '/some path/it\\'s here';"
+        );
+    }
+
     use super::*;
     use std::io;
     use std::net::SocketAddr;

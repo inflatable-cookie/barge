@@ -9,244 +9,35 @@
 //! fallback root a consumer still uses stays listed, holdable and pinnable after
 //! the volume returns.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+
+pub use crate::area_spec::{Absent, AreaKey, AreaRecord, AreaSpec, AREA_SCHEMA};
 
 use crate::error::{Error, Result};
 use crate::hold::{self, Hold, Mode};
 use crate::os::TreeSize;
+use crate::pin::pin_state;
 use crate::root::{
-    self, folder_name, mint_id, read_marker, tree_bytes, Listing, MarkerRead, Root, RootInfo,
+    self, derived_folder, mint_id, read_marker, tree_bytes, Listing, MarkerRead, Root, RootInfo,
     RootMarker, Straggler, ROOT_SCHEMA,
 };
 use crate::space::{SkippedRoot, SweepReport, SweptRoot};
-use crate::state::{publish, validate_name, validate_relative_path};
 use crate::volume::{Volume, VolumeState};
 use crate::Core;
 
-/// The schema name of a stored area declaration.
-pub const AREA_SCHEMA: &str = "barge.area/1";
 /// The schema name of a pin record.
-pub const PIN_SCHEMA: &str = "barge.pin/1";
+pub use crate::pin::PIN_SCHEMA;
 
-const BARGE_DIR: &str = ".barge";
-const TRASH_DIR: &str = ".trash";
-const LOCKS_DIR: &str = "locks";
-const PINS_DIR: &str = "pins";
-const ACTIVITY_DIR: &str = "activity";
+pub(crate) const BARGE_DIR: &str = ".barge";
+pub(crate) const TRASH_DIR: &str = ".trash";
+pub(crate) const LOCKS_DIR: &str = "locks";
+pub(crate) const PINS_DIR: &str = "pins";
+pub(crate) const ACTIVITY_DIR: &str = "activity";
 const AREA_LOCK: &str = "area.lock";
-
-/// What an area does when its volume is absent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Absent {
-    /// Report the volume to attach; caches and scratch use this.
-    Fail,
-    /// Use an explicit internal path and say so in the result and in status.
-    Fallback { path: PathBuf },
-}
-
-/// The `<namespace>/<area>` name of an area.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AreaKey {
-    namespace: String,
-    name: String,
-}
-
-impl AreaKey {
-    /// Validate and build a key.
-    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Result<Self> {
-        let key = Self {
-            namespace: namespace.into(),
-            name: name.into(),
-        };
-        validate_name("area namespace", &key.namespace)?;
-        validate_name("area name", &key.name)?;
-        Ok(key)
-    }
-
-    /// Parse `<namespace>/<area>`.
-    pub fn parse(text: &str) -> Result<Self> {
-        let (namespace, name) = text.split_once('/').ok_or_else(|| {
-            Error::usage(format!("area {text:?} must be written <namespace>/<area>"))
-        })?;
-        Self::new(namespace, name)
-    }
-
-    pub fn namespace(&self) -> &str {
-        &self.namespace
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// `<namespace>/<area>`, the name a consumer and a marker use.
-    pub fn label(&self) -> String {
-        format!("{}/{}", self.namespace, self.name)
-    }
-
-    /// The state file's stem, `<namespace>.<area>`.
-    pub(crate) fn file_stem(&self) -> String {
-        format!("{}.{}", self.namespace, self.name)
-    }
-}
-
-/// A consumer's area declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AreaSpec {
-    pub namespace: String,
-    pub name: String,
-    pub volume: String,
-    /// Folder inside the volume base; `None` means `<namespace>/<area>`.
-    pub folder: Option<String>,
-    pub absent: Absent,
-    pub soft_cap_bytes: Option<u64>,
-    pub counts_toward_reserve: bool,
-}
-
-impl AreaSpec {
-    /// A declaration whose path defaults to `<root_dir>/<namespace>/<area>`, that
-    /// fails when its volume is absent and counts toward the reserve.
-    pub fn new(
-        namespace: impl Into<String>,
-        name: impl Into<String>,
-        volume: impl Into<String>,
-    ) -> Self {
-        Self {
-            namespace: namespace.into(),
-            name: name.into(),
-            volume: volume.into(),
-            folder: None,
-            absent: Absent::Fail,
-            soft_cap_bytes: None,
-            counts_toward_reserve: true,
-        }
-    }
-
-    pub fn folder(mut self, folder: impl Into<String>) -> Self {
-        self.folder = Some(folder.into());
-        self
-    }
-
-    pub fn absent(mut self, absent: Absent) -> Self {
-        self.absent = absent;
-        self
-    }
-
-    pub fn soft_cap_bytes(mut self, soft_cap_bytes: Option<u64>) -> Self {
-        self.soft_cap_bytes = soft_cap_bytes;
-        self
-    }
-
-    pub fn counts_toward_reserve(mut self, counts: bool) -> Self {
-        self.counts_toward_reserve = counts;
-        self
-    }
-
-    pub(crate) fn into_record(self) -> AreaRecord {
-        AreaRecord {
-            schema: AREA_SCHEMA.to_string(),
-            namespace: self.namespace,
-            name: self.name,
-            volume: self.volume,
-            folder: self.folder,
-            absent: self.absent,
-            soft_cap_bytes: self.soft_cap_bytes,
-            counts_toward_reserve: self.counts_toward_reserve,
-        }
-    }
-}
-
-/// A stored area declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AreaRecord {
-    pub schema: String,
-    pub namespace: String,
-    pub name: String,
-    pub volume: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub folder: Option<String>,
-    pub absent: Absent,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub soft_cap_bytes: Option<u64>,
-    pub counts_toward_reserve: bool,
-}
-
-impl AreaRecord {
-    /// The area's key.
-    pub fn key(&self) -> AreaKey {
-        AreaKey {
-            namespace: self.namespace.clone(),
-            name: self.name.clone(),
-        }
-    }
-
-    /// The folder this area uses inside the volume base.
-    pub fn effective_folder(&self) -> String {
-        self.folder
-            .clone()
-            .unwrap_or_else(|| format!("{}/{}", self.namespace, self.name))
-    }
-
-    /// Validate every stored field before the record is used as truth.
-    pub fn validate(&self) -> Result<()> {
-        if self.schema != AREA_SCHEMA {
-            return Err(Error::unknown_state(format!(
-                "area {}/{} has schema {}, not {AREA_SCHEMA}",
-                self.namespace, self.name, self.schema
-            )));
-        }
-        validate_name("area namespace", &self.namespace)?;
-        validate_name("area name", &self.name)?;
-        crate::state::validate_volume_name("area volume", &self.volume)?;
-        if let Some(folder) = &self.folder {
-            if folder.is_empty() {
-                return Err(Error::usage(format!(
-                    "area {}/{} folder override must not be empty",
-                    self.namespace, self.name
-                )));
-            }
-            validate_relative_path("area folder", folder)?;
-        }
-        if let Absent::Fallback { path } = &self.absent {
-            if !path.is_absolute() {
-                return Err(Error::unknown_state(format!(
-                    "area {}/{} fallback {} is not absolute",
-                    self.namespace,
-                    self.name,
-                    path.display()
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// The fields that differ between this stored declaration and a proposed one,
-    /// in a stable order. Empty means the declarations agree.
-    pub fn differing_fields(&self, proposed: &Self) -> Vec<&'static str> {
-        let mut fields = Vec::new();
-        if self.volume != proposed.volume {
-            fields.push("volume");
-        }
-        if self.folder != proposed.folder {
-            fields.push("folder");
-        }
-        if self.absent != proposed.absent {
-            fields.push("absent");
-        }
-        if self.soft_cap_bytes != proposed.soft_cap_bytes {
-            fields.push("soft_cap_bytes");
-        }
-        if self.counts_toward_reserve != proposed.counts_toward_reserve {
-            fields.push("counts_toward_reserve");
-        }
-        fields
-    }
-}
 
 /// Where an area's roots live right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,7 +85,7 @@ pub struct Eviction {
 /// One declared area with the volume it belongs to.
 #[derive(Debug, Clone)]
 pub struct Area {
-    core: Core,
+    pub(crate) core: Core,
     record: AreaRecord,
     volume: Volume,
 }
@@ -364,7 +155,7 @@ impl Area {
             )));
         }
         let key = self.key().label();
-        let mut candidates = Vec::new();
+        let mut candidate = None;
         for (directory, _) in self.search_dirs()? {
             let path = directory.join(folder);
             match fs::symlink_metadata(&path) {
@@ -375,19 +166,20 @@ impl Area {
                             path.display()
                         )));
                     }
-                    candidates.push((directory, path, metadata));
+                    if candidate.is_none() {
+                        candidate = Some((directory, path, metadata));
+                    }
                 }
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                 Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
             }
         }
-        let (directory, path, metadata) = candidates.into_iter().next().ok_or_else(|| {
+        let (directory, path, metadata) = candidate.ok_or_else(|| {
             Error::not_found(format!(
                 "root folder {folder:?} does not exist directly inside area {}",
                 self.key().label()
             ))
         })?;
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if metadata.uid() != crate::os::effective_uid() {
             return Err(Error::refused(format!(
                 "root folder {} is not owned by the calling user",
@@ -409,6 +201,8 @@ impl Area {
             }
         });
 
+        self.ensure_layout(&directory)?;
+        let _lock = AreaLock::acquire(&directory)?;
         match read_marker(&path) {
             MarkerRead::Valid(marker) => {
                 let mut differences = Vec::new();
@@ -418,7 +212,7 @@ impl Area {
                 if marker
                     .folder
                     .as_deref()
-                    .unwrap_or(&folder_name(&marker.label, &marker.id))
+                    .unwrap_or(&derived_folder(&marker.label, &marker.id))
                     != folder
                 {
                     differences.push("folder");
@@ -429,7 +223,7 @@ impl Area {
                 if marker.id != id {
                     differences.push("id");
                 }
-                if differences.is_empty() {
+                if marker_matches(&marker, &key, id, label, folder) {
                     return Ok(root_from_marker(path, marker));
                 }
                 return Err(Error::refused(format!(
@@ -445,8 +239,6 @@ impl Area {
             }
             MarkerRead::Missing => {}
         }
-        self.ensure_layout(&directory)?;
-        let _lock = AreaLock::acquire(&directory)?;
         // Two adoptions can find the folder free at the same moment, so the
         // duplicate-ID check belongs under the lock that serialises them: an
         // earlier reading never authorises a second root with the same ID.
@@ -468,21 +260,7 @@ impl Area {
             expires_unix_ms: None,
             folder: Some(folder.to_string()),
         };
-        match read_marker(&path) {
-            MarkerRead::Missing => root::write_marker(&path, &marker)?,
-            MarkerRead::Valid(existing)
-                if existing.area == marker.area
-                    && existing.id == marker.id
-                    && existing.label == marker.label
-                    && root::marker_folder(&existing) == folder =>
-            {
-                return Ok(root_from_marker(path, existing));
-            }
-            MarkerRead::Valid(_) => {
-                return Err(Error::refused("root marker changed during adoption"))
-            }
-            MarkerRead::Invalid(reason) => return Err(Error::refused(reason)),
-        }
+        root::write_marker(&path, &marker)?;
         Ok(root_from_marker(path, marker))
     }
 
@@ -501,7 +279,7 @@ impl Area {
         let mut attempts = 0;
         loop {
             let id = mint_id()?;
-            let path = directory.join(folder_name(label, &id));
+            let path = directory.join(derived_folder(label, &id));
             match fs::create_dir(&path) {
                 Ok(()) => {
                     let marker = RootMarker {
@@ -518,7 +296,7 @@ impl Area {
                         return Err(error);
                     }
                     self.record_activity(&directory, &id, now);
-                    let folder = folder_name(label, &id);
+                    let folder = derived_folder(label, &id);
                     return Ok(Root {
                         id,
                         label: label.to_string(),
@@ -554,81 +332,56 @@ impl Area {
         LIST_CALLS.with(|calls| calls.set(calls.get() + 1));
         let mut listing = Listing::default();
         let key = self.key().label();
-        for (directory, on_volume) in self.search_dirs()? {
-            let entries = match fs::read_dir(&directory) {
-                Ok(entries) => entries,
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(source) => {
-                    return Err(Error::io("cannot list the area at", &directory, &source))
-                }
-            };
+        for (directory, on_volume, path, marker_read) in self.scan()? {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
             let barge = directory.join(BARGE_DIR);
             let locks = barge.join(LOCKS_DIR);
             let activity = barge.join(ACTIVITY_DIR);
-            for entry in entries {
-                let entry = entry
-                    .map_err(|source| Error::io("cannot list the area at", &directory, &source))?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if matches!(name.as_str(), BARGE_DIR | TRASH_DIR) {
-                    continue;
-                }
-                let path = entry.path();
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
-                };
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    continue;
-                }
-                match read_marker(&path) {
-                    MarkerRead::Missing => listing.stragglers.push(Straggler {
+            match marker_read {
+                MarkerRead::Missing => listing.stragglers.push(Straggler {
+                    path,
+                    reason: format!("no {}", root::MARKER_NAME),
+                }),
+                MarkerRead::Invalid(reason) => listing.stragglers.push(Straggler { path, reason }),
+                MarkerRead::Valid(marker) if marker.area != key => {
+                    listing.stragglers.push(Straggler {
                         path,
-                        reason: format!("no {}", root::MARKER_NAME),
-                    }),
-                    MarkerRead::Invalid(reason) => {
-                        listing.stragglers.push(Straggler { path, reason })
-                    }
-                    MarkerRead::Valid(marker) if marker.area != key => {
+                        reason: format!("its marker belongs to area {}", marker.area),
+                    })
+                }
+                MarkerRead::Valid(marker) => {
+                    if name != root::marker_folder(&marker) {
                         listing.stragglers.push(Straggler {
                             path,
-                            reason: format!("its marker belongs to area {}", marker.area),
-                        })
-                    }
-                    MarkerRead::Valid(marker) => {
-                        if name != root::marker_folder(&marker) {
-                            listing.stragglers.push(Straggler {
-                                path,
-                                reason: "its folder name does not match its marker".to_string(),
-                            });
-                            continue;
-                        }
-                        let held = hold::is_locked(&locks.join(format!("{}.lock", marker.id)))?;
-                        // An unreadable pin is never read as "unpinned": unknown is
-                        // never safe. Eviction reports the real reason.
-                        let pinned = pin_state(&directory, &marker.id).unwrap_or(true);
-                        let last_used = hold::read_activity(&activity, &marker.id)
-                            .unwrap_or(marker.created_unix_ms)
-                            .max(marker.created_unix_ms);
-                        let size = if include_bytes {
-                            tree_bytes(&path)
-                        } else {
-                            TreeSize::default()
-                        };
-                        listing.roots.push(RootInfo {
-                            id: marker.id.clone(),
-                            label: marker.label.clone(),
-                            path,
-                            created_unix_ms: marker.created_unix_ms,
-                            last_used_unix_ms: last_used,
-                            expires_unix_ms: marker.expires_unix_ms,
-                            held,
-                            pinned,
-                            bytes: size.bytes,
-                            bytes_approximate: size.approximate,
-                            on_volume,
+                            reason: "its folder name does not match its marker".to_string(),
                         });
+                        continue;
                     }
+                    let held = hold::is_locked(&locks.join(format!("{}.lock", marker.id)))?;
+                    // An unreadable pin is never read as "unpinned": unknown is
+                    // never safe. Eviction reports the real reason.
+                    let pinned = pin_state(&directory, &marker.id).unwrap_or(true);
+                    let last_used = hold::read_activity(&activity, &marker.id)
+                        .unwrap_or(marker.created_unix_ms)
+                        .max(marker.created_unix_ms);
+                    let size = if include_bytes {
+                        tree_bytes(&path)
+                    } else {
+                        TreeSize::default()
+                    };
+                    listing.roots.push(RootInfo {
+                        id: marker.id.clone(),
+                        label: marker.label.clone(),
+                        path,
+                        created_unix_ms: marker.created_unix_ms,
+                        last_used_unix_ms: last_used,
+                        expires_unix_ms: marker.expires_unix_ms,
+                        held,
+                        pinned,
+                        bytes: size.bytes,
+                        bytes_approximate: size.approximate,
+                        on_volume,
+                    });
                 }
             }
         }
@@ -678,32 +431,48 @@ impl Area {
         size
     }
 
+    fn scan(&self) -> Result<Vec<(PathBuf, bool, PathBuf, MarkerRead)>> {
+        let mut found = Vec::new();
+        for (directory, on_volume) in self.search_dirs()? {
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::io("cannot list the area at", &directory, &e)),
+            };
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| Error::io("cannot list the area at", &directory, &e))?;
+                if matches!(entry.file_name().to_str(), Some(BARGE_DIR | TRASH_DIR)) {
+                    continue;
+                }
+                let path = entry.path();
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(Error::io("cannot inspect", &path, &e)),
+                };
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    let marker = read_marker(&path);
+                    found.push((directory.clone(), on_volume, path, marker));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Find a root by its ID, on the volume or in the fallback.
     pub fn resolve(&self, id: &str) -> Result<Root> {
         root::validate_id(id)?;
         let key = self.key().label();
-        for (directory, _) in self.search_dirs()? {
-            let entries = match fs::read_dir(&directory) {
-                Ok(entries) => entries,
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(source) => {
-                    return Err(Error::io("cannot list the area at", &directory, &source))
-                }
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let path = entry.path();
-                let Ok(metadata) = fs::symlink_metadata(&path) else {
-                    continue;
-                };
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    continue;
-                }
-                if let MarkerRead::Valid(marker) = read_marker(&path) {
-                    if marker.area == key && marker.id == id && name == root::marker_folder(&marker)
-                    {
-                        return Ok(root_from_marker(path, marker));
-                    }
+        for (_, _, path, marker) in self.scan()? {
+            if let MarkerRead::Valid(marker) = marker {
+                if marker.area == key
+                    && marker.id == id
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name == root::marker_folder(&marker).as_str())
+                {
+                    return Ok(root_from_marker(path, marker));
                 }
             }
         }
@@ -765,215 +534,6 @@ impl Area {
             current.path,
             self.core.clock.clone(),
         )))
-    }
-
-    /// Protect a root from prune and eviction until it is unpinned.
-    pub fn pin(&self, id: &str, reason: &str) -> Result<()> {
-        self.core.ensure_writable()?;
-        let root = self.resolve(id)?;
-        #[cfg(test)]
-        PIN_HOOK.with(|hook| {
-            let callback = hook.borrow_mut().take();
-            if let Some(hook) = callback {
-                hook();
-            }
-        });
-        let directory = parent(&root.path)?;
-        self.ensure_layout(&directory)?;
-        let _lock = AreaLock::acquire(&directory)?;
-        // Eviction renames under this same lock, so the root resolved a moment
-        // ago can already be trash: pin only the root this path still is.
-        if !unchanged_marker(&root, &self.key().label()) {
-            return Err(Error::refused(format!(
-                "root {id} in area {} changed before it could be pinned; nothing was pinned",
-                self.key().label()
-            )));
-        }
-        let record = PinRecord {
-            schema: PIN_SCHEMA.to_string(),
-            root_id: id.to_string(),
-            reason: reason.to_string(),
-            pinned_unix_ms: self.core.clock.now_unix_ms(),
-        };
-        let bytes = serde_json::to_vec_pretty(&record)
-            .map_err(|source| Error::unknown_state(format!("cannot encode a pin: {source}")))?;
-        publish(&pin_path(&directory, id), &bytes)
-    }
-
-    /// Remove a root's pin.
-    pub fn unpin(&self, id: &str) -> Result<()> {
-        self.core.ensure_writable()?;
-        root::validate_id(id)?;
-        let mut removed = false;
-        for (directory, _) in self.search_dirs()? {
-            if !directory.is_dir() {
-                continue;
-            }
-            self.ensure_layout(&directory)?;
-            let _lock = AreaLock::acquire(&directory)?;
-            match fs::remove_file(pin_path(&directory, id)) {
-                Ok(()) => removed = true,
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(Error::io(
-                        "cannot remove the pin at",
-                        &pin_path(&directory, id),
-                        &source,
-                    ))
-                }
-            }
-        }
-        if removed {
-            Ok(())
-        } else {
-            Err(Error::not_found(format!(
-                "root {id} in area {} is not pinned",
-                self.key().label()
-            )))
-        }
-    }
-
-    /// Evict a root: refuse when it is held or pinned, otherwise rename it into
-    /// the area's trash and delete it there.
-    pub fn evict(&self, id: &str) -> Result<Eviction> {
-        self.core.ensure_writable()?;
-        let root = self.resolve(id)?;
-        #[cfg(test)]
-        EVICT_HOOK.with(|hook| {
-            let callback = hook.borrow_mut().take();
-            if let Some(hook) = callback {
-                hook();
-            }
-        });
-        let directory = parent(&root.path)?;
-        self.ensure_layout(&directory)?;
-        let lock_path = directory
-            .join(BARGE_DIR)
-            .join(LOCKS_DIR)
-            .join(format!("{id}.lock"));
-        let Some(_lock_file) = lock_root(&lock_path, Mode::Exclusive, false)? else {
-            return Err(Error::refused(format!(
-                "root {id} is held; refusing to evict it"
-            )));
-        };
-        let _area_lock = AreaLock::acquire(&directory)?;
-        if pin_state(&directory, id)? {
-            return Err(Error::refused(format!(
-                "root {id} is pinned; refusing to evict it"
-            )));
-        }
-        let size = tree_bytes(&root.path);
-        let trash = directory.join(TRASH_DIR);
-        fs::create_dir_all(&trash)
-            .map_err(|source| Error::io("cannot create the trash at", &trash, &source))?;
-        let trash_path = unique_trash_path(&trash, &root.folder_name());
-        if !unchanged_marker(&root, &self.key().label()) {
-            return Err(Error::refused("root marker changed before eviction"));
-        }
-        fs::rename(&root.path, &trash_path)
-            .map_err(|source| Error::io("cannot evict the root to", &trash_path, &source))?;
-        // The root is renamed: a waiting holder wakes to a missing root and the
-        // lock file is no longer useful. Unlinking it does not release our lock;
-        // dropping the descriptor does.
-        let _ = fs::remove_file(&lock_path);
-        let (deleted, kept_reason) =
-            match crate::trash::remove_owned_tree_for_id(&trash_path, &self.key().label(), id) {
-                Ok(deletion) if deletion.skipped.is_empty() => (true, None),
-                Ok(deletion) => (
-                    false,
-                    Some(format!(
-                        "{} entr{} stayed in place, starting at {}",
-                        deletion.skipped.len(),
-                        if deletion.skipped.len() == 1 {
-                            "y"
-                        } else {
-                            "ies"
-                        },
-                        deletion.skipped[0].display()
-                    )),
-                ),
-                Err(error) => (false, Some(error.message().to_string())),
-            };
-        let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
-        let _ = fs::remove_file(hold::activity_path(&activity, id));
-        let pin = pin_path(&directory, id);
-        let _ = fs::remove_file(&pin);
-        Ok(Eviction {
-            area: self.key().label(),
-            id: id.to_string(),
-            label: root.label,
-            path: root.path,
-            trash_path,
-            bytes: size.bytes,
-            bytes_approximate: size.approximate,
-            deleted,
-            kept_reason,
-        })
-    }
-
-    /// Delete every owned trash entry of this area.
-    pub fn sweep_trash(&self) -> Result<SweepReport> {
-        self.core.ensure_writable()?;
-        let mut report = SweepReport::default();
-        let key = self.key().label();
-        for (directory, _) in self.search_dirs()? {
-            let trash = directory.join(TRASH_DIR);
-            let entries = match fs::read_dir(&trash) {
-                Ok(entries) => entries,
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(source) => return Err(Error::io("cannot list the trash at", &trash, &source)),
-            };
-            self.ensure_layout(&directory)?;
-            let _lock = AreaLock::acquire(&directory)?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
-                };
-                if metadata.file_type().is_symlink() {
-                    report.kept.push(SkippedRoot {
-                        path,
-                        reason: "a symbolic link, never followed".to_string(),
-                    });
-                    continue;
-                }
-                if metadata.is_dir() {
-                    match read_marker(&path) {
-                        MarkerRead::Valid(marker) if marker.area == key => {
-                            match crate::trash::remove_owned_tree(&path, &key) {
-                                Ok(deletion) => report.deleted.push(SweptRoot {
-                                    path,
-                                    bytes: deletion.bytes,
-                                }),
-                                Err(error) => report.kept.push(SkippedRoot {
-                                    path,
-                                    reason: error.message().to_string(),
-                                }),
-                            }
-                        }
-                        MarkerRead::Valid(marker) => report.kept.push(SkippedRoot {
-                            path,
-                            reason: format!("its marker belongs to area {}", marker.area),
-                        }),
-                        MarkerRead::Missing => report.kept.push(SkippedRoot {
-                            path,
-                            reason: format!("no {}", root::MARKER_NAME),
-                        }),
-                        MarkerRead::Invalid(reason) => {
-                            report.kept.push(SkippedRoot { path, reason })
-                        }
-                    }
-                } else {
-                    report.kept.push(SkippedRoot {
-                        path,
-                        reason: "not a folder".to_string(),
-                    });
-                }
-            }
-        }
-        Ok(report)
     }
 
     /// Evict expired, idle, unpinned roots. Scratch uses this.
@@ -1055,7 +615,7 @@ impl Area {
 
     /// Where this area's roots may exist: the volume when it is present, and the
     /// declared fallback always.
-    fn search_dirs(&self) -> Result<Vec<(PathBuf, bool)>> {
+    pub(crate) fn search_dirs(&self) -> Result<Vec<(PathBuf, bool)>> {
         let mut directories = Vec::new();
         if self.volume.state()? == VolumeState::Present {
             directories.push((
@@ -1069,7 +629,7 @@ impl Area {
         Ok(directories)
     }
 
-    fn ensure_layout(&self, directory: &Path) -> Result<()> {
+    pub(crate) fn ensure_layout(&self, directory: &Path) -> Result<()> {
         let barge = directory.join(BARGE_DIR);
         for folder in [
             barge.join(LOCKS_DIR),
@@ -1112,39 +672,24 @@ pub struct AreaStatus {
     pub unavailable: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PinRecord {
-    schema: String,
-    root_id: String,
-    reason: String,
-    pinned_unix_ms: u64,
-}
-
 /// The area lock: pinning, unpinning, eviction and the trash sweep take it, so a
 /// pin cannot land between an eviction's pin recheck and its rename.
 #[derive(Debug)]
-struct AreaLock {
+pub(crate) struct AreaLock {
     #[allow(dead_code)]
     file: File,
 }
 
 impl AreaLock {
-    fn acquire(directory: &Path) -> Result<Self> {
+    pub(crate) fn acquire(directory: &Path) -> Result<Self> {
         let path = directory.join(BARGE_DIR).join(AREA_LOCK);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| Error::io("cannot open the area lock", &path, &source))?;
-        hold::flock(&file, Mode::Exclusive, true)?;
+        let file = crate::os::open_lock(&path, "cannot open the area lock")?;
+        crate::os::flock(&file, Mode::Exclusive, true)?;
         Ok(Self { file })
     }
 }
 
-fn parent(path: &Path) -> Result<PathBuf> {
+pub(crate) fn parent(path: &Path) -> Result<PathBuf> {
     path.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| Error::unknown_state(format!("{} has no parent folder", path.display())))
@@ -1161,36 +706,24 @@ fn root_from_marker(path: PathBuf, marker: RootMarker) -> Root {
     }
 }
 
-fn pin_path(directory: &Path, id: &str) -> PathBuf {
-    directory
-        .join(BARGE_DIR)
-        .join(PINS_DIR)
-        .join(format!("{id}.json"))
-}
-
-/// Whether a pin protects a root. A pin path that exists but cannot be
-/// inspected counts as pinned: unknown is never safe.
-fn pin_state(directory: &Path, id: &str) -> Result<bool> {
-    let path = pin_path(directory, id);
-    match fs::symlink_metadata(&path) {
-        Ok(_) => Ok(true),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(Error::io("cannot inspect the pin at", &path, &source)),
-    }
-}
-
 /// Whether a resolved root's marker still names its area, ID, label and folder.
 /// Eviction and pinning both hold the area lock when they ask, so a `false` here
 /// means the root was replaced since it was resolved.
-fn unchanged_marker(root: &Root, area: &str) -> bool {
-    matches!(
-        read_marker(&root.path),
-        MarkerRead::Valid(marker)
-            if marker.area == area
-                && marker.id == root.id
-                && marker.label == root.label
-                && root::marker_folder(&marker) == root.folder
-    )
+pub(crate) fn marker_matches(
+    marker: &RootMarker,
+    area: &str,
+    id: &str,
+    label: &str,
+    folder: &str,
+) -> bool {
+    marker.area == area
+        && marker.id == id
+        && marker.label == label
+        && root::marker_folder(marker) == folder
+}
+
+pub(crate) fn unchanged_marker(root: &Root, area: &str) -> bool {
+    matches!(read_marker(&root.path), MarkerRead::Valid(marker) if marker_matches(&marker, area, &root.id, &root.label, &root.folder))
 }
 
 /// Open the root's hold lock and take it, then require the descriptor to be the
@@ -1201,15 +734,9 @@ fn unchanged_marker(root: &Root, area: &str) -> bool {
 /// the same ID would then reopen and lock the same root twice. A descriptor that
 /// does not match the path is dropped and the attempt repeated once; a second
 /// mismatch is refused.
-fn lock_root(lock_path: &Path, mode: Mode, wait: bool) -> Result<Option<File>> {
+pub(crate) fn lock_root(lock_path: &Path, mode: Mode, wait: bool) -> Result<Option<File>> {
     for attempt in 0..2 {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
-            .map_err(|source| Error::io("cannot open the hold lock", lock_path, &source))?;
+        let file = crate::os::open_lock(lock_path, "cannot open the hold lock")?;
         // The window an eviction exploits: the file is open, the lock is not yet
         // taken, so an eviction may rename the root, unlink this file and a
         // caller may re-adopt the folder with the same ID before the lock lands.
@@ -1220,7 +747,7 @@ fn lock_root(lock_path: &Path, mode: Mode, wait: bool) -> Result<Option<File>> {
                 hook();
             }
         });
-        if !hold::flock(&file, mode, wait)? {
+        if !crate::os::flock(&file, mode, wait)? {
             return Ok(None);
         }
         #[cfg(test)]
@@ -1256,7 +783,7 @@ fn lock_is_current(file: &File, path: &Path) -> Result<bool> {
     Ok(now == Some(held))
 }
 
-fn unique_trash_path(trash: &Path, name: &str) -> PathBuf {
+pub(crate) fn unique_trash_path(trash: &Path, name: &str) -> PathBuf {
     let mut candidate = trash.join(name);
     let mut counter = 0;
     while candidate.exists() {
@@ -1268,8 +795,8 @@ fn unique_trash_path(trash: &Path, name: &str) -> PathBuf {
 
 #[cfg(test)]
 thread_local! {
-    static EVICT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
-    static PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    pub(crate) static EVICT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    pub(crate) static PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ADOPT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static LOCK_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
     static LOCK_OPEN_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1582,12 +1109,12 @@ mod eviction_identity_tests {
 
         let probe = File::open(&path).unwrap();
         assert!(
-            !hold::flock(&probe, Mode::Exclusive, false).unwrap(),
+            !crate::os::flock(&probe, Mode::Exclusive, false).unwrap(),
             "the hold is visible on the file the path names"
         );
         drop(hold);
         assert!(
-            hold::flock(&probe, Mode::Exclusive, false).unwrap(),
+            crate::os::flock(&probe, Mode::Exclusive, false).unwrap(),
             "dropping the hold frees that same file"
         );
     }

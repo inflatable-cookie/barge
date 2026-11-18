@@ -2,7 +2,7 @@
 
 Barge is one Rust library and a thin CLI over it. Oxide links the library and
 works with nothing else installed. Other tools use the CLI and its JSON output.
-There is no daemon: state lives in small files, guarded by file locks.
+Storage needs no daemon: state lives in small files, guarded by file locks.
 
 This is the lean design adopted on 2026-11-17 ([vision](vision.md#authority)).
 It replaces the earlier design, whose files are deleted together with its code.
@@ -104,6 +104,14 @@ at the drive root) is expressed as `root_dir = ""` with Oxide's two areas
 overridden to their existing folder names, so adoption moves nothing.
 
 ## Library surface
+
+Storage declarations, areas, pins, roots, holds, trash, space policy and scratch
+live in separate library modules. Account state and platform operations live in
+`state` and `os`; command-line rendering stays in the CLI. A volume layout
+record can be repaired from the authoritative account copy with
+`repair_volume_layout` after an interrupted write. Survey marks macOS system
+entries separately, so doctor does not treat them as unknown.
+
 
 The names below are indicative; the implementation may adjust them where the
 code reads better, as long as the behaviour holds.

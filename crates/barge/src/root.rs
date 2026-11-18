@@ -53,11 +53,6 @@ pub struct Root {
 }
 
 impl Root {
-    /// The root's actual folder name.
-    pub fn folder_name(&self) -> String {
-        self.folder.clone()
-    }
-
     /// Whether this root's expiry has passed at `now_unix_ms`.
     pub fn is_expired(&self, now_unix_ms: u64) -> bool {
         self.expires_unix_ms
@@ -163,6 +158,13 @@ fn read_marker_opened(opened: std::io::Result<File>, folder: &Path) -> MarkerRea
             marker.schema
         ));
     }
+    if crate::area::AreaKey::parse(&marker.area).is_err() || validate_label(&marker.label).is_err()
+    {
+        return MarkerRead::Invalid(format!("{} has an invalid area or label", path.display()));
+    }
+    if marker.schema == ROOT_SCHEMA && marker.folder.is_some() {
+        return MarkerRead::Invalid(format!("{} has a folder in a v1 marker", path.display()));
+    }
     if !valid_id(&marker.id) {
         return MarkerRead::Invalid(format!(
             "{} has an invalid root id {:?}",
@@ -192,7 +194,7 @@ pub(crate) fn write_marker(folder: &Path, marker: &RootMarker) -> Result<()> {
 }
 
 /// The folder name of an owned root.
-pub fn folder_name(label: &str, id: &str) -> String {
+pub(crate) fn derived_folder(label: &str, id: &str) -> String {
     format!("{label}-{id}")
 }
 
@@ -249,7 +251,7 @@ pub fn marker_folder(marker: &RootMarker) -> String {
     marker
         .folder
         .clone()
-        .unwrap_or_else(|| folder_name(&marker.label, &marker.id))
+        .unwrap_or_else(|| derived_folder(&marker.label, &marker.id))
 }
 
 /// Mint a new root ID from the operating system's random source.
@@ -270,8 +272,10 @@ pub(crate) fn mint_id() -> Result<String> {
         )
     })?;
     let mut id = String::with_capacity(MINT_ID_BYTES * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in bytes {
-        id.push_str(&format!("{byte:02x}"));
+        id.push(char::from(HEX[usize::from(byte >> 4)]));
+        id.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     Ok(id)
 }
@@ -329,6 +333,52 @@ mod tree_size_tests {
         let root = temp.path().join("slot-0123456789abcdef");
         fs::create_dir(&root).unwrap();
         (temp, root)
+    }
+
+    #[test]
+    fn validators_check_root_components() {
+        for value in ["", "-a", "a-", "A", "a/b"] {
+            assert!(validate_label(value).is_err(), "{value:?}");
+        }
+        assert!(validate_label("a-1").is_ok());
+        for value in ["", "-a", "a/b", "a.b"] {
+            assert!(!valid_id(value), "{value:?}");
+        }
+        assert!(valid_id("A_1-2"));
+        for value in ["", ".", "..", "a/b", "a\\b", "a\n"] {
+            assert!(!valid_folder(value), "{value:?}");
+        }
+        assert!(valid_folder("a folder"));
+    }
+
+    #[test]
+    fn invalid_marker_fields_are_rejected() {
+        let (_tmp, path) = folder("marker-validation");
+        let marker = RootMarker {
+            schema: ROOT_SCHEMA.to_string(),
+            area: "test/area".into(),
+            id: "abc".into(),
+            label: "root".into(),
+            created_unix_ms: 0,
+            expires_unix_ms: None,
+            folder: None,
+        };
+        for field in 0..4 {
+            let mut invalid = marker.clone();
+            match field {
+                0 => invalid.area = "bad".into(),
+                1 => invalid.label = "Bad".into(),
+                2 => invalid.folder = Some("folder".into()),
+                _ => invalid.schema = "barge.root/99".into(),
+            }
+            write_marker(&path, &invalid).unwrap();
+            assert!(matches!(read_marker(&path), MarkerRead::Invalid(_)));
+        }
+        let mut adopted = marker;
+        adopted.schema = ADOPTED_ROOT_SCHEMA.into();
+        adopted.folder = Some("folder".into());
+        write_marker(&path, &adopted).unwrap();
+        assert!(matches!(read_marker(&path), MarkerRead::Valid(_)));
     }
 
     #[test]

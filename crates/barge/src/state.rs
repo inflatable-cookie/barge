@@ -28,18 +28,19 @@ static PUBLISH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A directory that holds Barge's account state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StateDir {
+pub(crate) struct StateDir {
     root: PathBuf,
 }
 
 impl StateDir {
     /// The state directory named by `BARGE_STATE_DIR`, or the platform default.
-    pub fn discover() -> Result<PathBuf> {
+    pub(crate) fn discover() -> Result<PathBuf> {
         if let Some(explicit) = std::env::var_os("BARGE_STATE_DIR") {
             if !explicit.is_empty() {
                 return Ok(PathBuf::from(explicit));
             }
         }
+        #[cfg(target_os = "linux")]
         if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
             if !state_home.is_empty() {
                 return Ok(PathBuf::from(state_home).join("barge"));
@@ -61,7 +62,7 @@ impl StateDir {
     }
 
     /// Open (creating when needed) an account state directory.
-    pub fn open(root: PathBuf) -> Result<Self> {
+    pub(crate) fn open(root: PathBuf) -> Result<Self> {
         if !root.is_absolute() {
             return Err(Error::usage(format!(
                 "state directory {} is not absolute",
@@ -80,7 +81,7 @@ impl StateDir {
     }
 
     /// Open an account path for reads without creating it or any child.
-    pub fn open_read_only(root: PathBuf) -> Result<Self> {
+    pub(crate) fn open_read_only(root: PathBuf) -> Result<Self> {
         if !root.is_absolute() {
             return Err(Error::usage(format!(
                 "state directory {} is not absolute",
@@ -90,7 +91,7 @@ impl StateDir {
         Ok(Self { root })
     }
 
-    pub fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
@@ -107,12 +108,12 @@ impl StateDir {
     }
 
     /// Take the account state lock, waiting for another writer.
-    pub fn lock(&self) -> Result<StateLock> {
+    pub(crate) fn lock(&self) -> Result<StateLock> {
         StateLock::acquire(&self.root)
     }
 
     /// Read `volumes.json`. A missing file is an empty account.
-    pub fn read_volumes(&self) -> Result<Vec<VolumeSpec>> {
+    pub(crate) fn read_volumes(&self) -> Result<Vec<VolumeSpec>> {
         let path = self.volumes_path();
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -130,13 +131,14 @@ impl StateDir {
             )));
         }
         for spec in &document.volumes {
-            spec.validate()?;
+            spec.validate()
+                .map_err(|e| Error::unknown_state(format!("invalid {}: {e}", path.display())))?;
         }
         Ok(document.volumes)
     }
 
     /// Publish `volumes.json` by atomic rename.
-    pub fn write_volumes(&self, volumes: &[VolumeSpec]) -> Result<()> {
+    pub(crate) fn write_volumes(&self, volumes: &[VolumeSpec]) -> Result<()> {
         let document = VolumesDocument {
             schema: VOLUMES_SCHEMA.to_string(),
             volumes: volumes.to_vec(),
@@ -147,7 +149,7 @@ impl StateDir {
     }
 
     /// Read one area declaration, `None` when it was never declared.
-    pub fn read_area(&self, key: &AreaKey) -> Result<Option<AreaRecord>> {
+    pub(crate) fn read_area(&self, key: &AreaKey) -> Result<Option<AreaRecord>> {
         let path = self.area_path(key);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -157,7 +159,9 @@ impl StateDir {
         let record: AreaRecord = serde_json::from_slice(&bytes).map_err(|source| {
             Error::unknown_state(format!("cannot parse {}: {source}", path.display()))
         })?;
-        record.validate()?;
+        record
+            .validate()
+            .map_err(|e| Error::unknown_state(format!("invalid {}: {e}", path.display())))?;
         if record.key() != *key {
             return Err(Error::unknown_state(format!(
                 "{} declares area {}, not {}",
@@ -170,7 +174,7 @@ impl StateDir {
     }
 
     /// Read every area declaration in the account.
-    pub fn read_areas(&self) -> Result<Vec<AreaRecord>> {
+    pub(crate) fn read_areas(&self) -> Result<Vec<AreaRecord>> {
         let dir = self.areas_dir();
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -189,14 +193,23 @@ impl StateDir {
             let record: AreaRecord = serde_json::from_slice(&bytes).map_err(|source| {
                 Error::unknown_state(format!("cannot parse {}: {source}", path.display()))
             })?;
-            record.validate()?;
+            record
+                .validate()
+                .map_err(|e| Error::unknown_state(format!("invalid {}: {e}", path.display())))?;
+            if path != self.area_path(&record.key()) {
+                return Err(Error::unknown_state(format!(
+                    "{} declares area {}, but its file name differs",
+                    path.display(),
+                    record.key().label()
+                )));
+            }
             records.push(record);
         }
         Ok(records)
     }
 
     /// Publish one area declaration by atomic rename.
-    pub fn write_area(&self, record: &AreaRecord) -> Result<()> {
+    pub(crate) fn write_area(&self, record: &AreaRecord) -> Result<()> {
         record.validate()?;
         if record.schema != AREA_SCHEMA {
             return Err(Error::unknown_state(format!(
@@ -219,32 +232,18 @@ struct VolumesDocument {
 
 /// The held account state lock. Dropping it releases the lock.
 #[derive(Debug)]
-pub struct StateLock {
+pub(crate) struct StateLock {
     /// Held only for the lock its descriptor carries; dropping it releases the
     /// lock, so the value is never read.
-    #[allow(dead_code)]
-    file: File,
+    _file: File,
 }
 
 impl StateLock {
     fn acquire(root: &Path) -> Result<Self> {
         let path = root.join(LOCK_NAME);
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| Error::io("cannot open the state lock", &path, &source))?;
-        crate::hold::flock(&file, Mode::Exclusive, true)?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for StateLock {
-    fn drop(&mut self) {
-        // Closing the descriptor releases the lock; there is no explicit unlock
-        // call, and taking the lock again here would be wrong.
+        let file = crate::os::open_lock(&path, "cannot open the state lock")?;
+        crate::os::flock(&file, Mode::Exclusive, true)?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -341,4 +340,106 @@ pub fn validate_relative_path(field: &str, value: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorKind;
+
+    #[test]
+    fn validators_reject_unsafe_names_and_paths() {
+        for name in ["", ".", "..", "Upper", "a/b", "-a"] {
+            assert!(validate_name("name", name).is_err(), "{name:?}");
+        }
+        for name in ["a", "a-b_c.d", "0"] {
+            assert!(validate_name("name", name).is_ok(), "{name:?}");
+        }
+        for path in ["/a", "a/../b", "a//b", "a/./b", "a\\b"] {
+            assert!(validate_relative_path("path", path).is_err(), "{path:?}");
+        }
+        assert!(validate_relative_path("path", "a/b").is_ok());
+    }
+
+    #[test]
+    fn area_filename_and_invalid_state_are_rejected() {
+        let tmp = crate::testing::TempDir::new("state-read").unwrap();
+        let state = StateDir::open(tmp.path().to_path_buf()).unwrap();
+        let key = AreaKey::new("test", "area").unwrap();
+        let record = crate::area::AreaSpec::new("test", "area", "Builds").into_record();
+        state.write_area(&record).unwrap();
+        fs::rename(state.area_path(&key), state.areas_dir().join("wrong.json")).unwrap();
+        assert_eq!(
+            state.read_areas().unwrap_err().kind(),
+            ErrorKind::UnknownState
+        );
+        fs::write(state.volumes_path(), br#"{"schema":"future","volumes":[]}"#).unwrap();
+        assert_eq!(
+            state.read_volumes().unwrap_err().kind(),
+            ErrorKind::UnknownState
+        );
+    }
+
+    #[test]
+    fn invalid_stored_records_are_unknown_state() {
+        let tmp = crate::testing::TempDir::new("invalid-state").unwrap();
+        let state = StateDir::open(tmp.path().to_path_buf()).unwrap();
+        let key = AreaKey::new("test", "area").unwrap();
+        let mut record = crate::area::AreaSpec::new("test", "area", "Builds").into_record();
+        record.folder = Some("../escape".into());
+        fs::write(state.area_path(&key), serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(
+            state.read_area(&key).unwrap_err().kind(),
+            ErrorKind::UnknownState
+        );
+        assert_eq!(
+            state.read_areas().unwrap_err().kind(),
+            ErrorKind::UnknownState
+        );
+        let volume = crate::volume::VolumeSpec {
+            name: "Builds".into(),
+            uuid: "invalid".into(),
+            mount: tmp.path().to_path_buf(),
+            root_dir: String::new(),
+            availability: crate::Availability::Permanent,
+            durability: crate::Durability::Expendable,
+            reserve_bytes: 0,
+            floor_bytes: 0,
+        };
+        state.write_volumes(&[volume]).unwrap();
+        assert_eq!(
+            state.read_volumes().unwrap_err().kind(),
+            ErrorKind::UnknownState
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ignores_xdg_state_home() {
+        const CHILD: &str = "BARGE_TEST_STATE_DISCOVERY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let expected = PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join("Library/Application Support/barge");
+            assert_eq!(StateDir::discover().unwrap(), expected);
+            return;
+        }
+        let tmp = crate::testing::TempDir::new("state-discovery").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "state::tests::macos_ignores_xdg_state_home"])
+            .env(CHILD, "1")
+            .env_remove("BARGE_STATE_DIR")
+            .env("HOME", tmp.path())
+            .env("XDG_STATE_HOME", tmp.child("xdg"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn failed_publish_removes_temporary_file() {
+        let tmp = crate::testing::TempDir::new("publish").unwrap();
+        let destination = tmp.folder("destination").unwrap();
+        assert!(publish(&destination, b"data").is_err());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
 }
