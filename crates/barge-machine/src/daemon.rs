@@ -153,7 +153,10 @@ impl DaemonClient {
 
     fn post(&self, path: &str, document: &impl Serialize) -> Result<(u16, String)> {
         let encoded = serde_json::to_string(document).map_err(|error| {
-            Error::new(ErrorKind::Usage, format!("cannot encode request: {error}"))
+            Error::new(
+                ErrorKind::UnknownState,
+                format!("cannot encode request: {error}"),
+            )
         })?;
         let mut request = self
             .agent
@@ -234,7 +237,7 @@ impl DaemonClient {
             detail
         };
         let kind = match status {
-            400 => ErrorKind::Usage,
+            400 => ErrorKind::Refused,
             401 | 403 | 409 => ErrorKind::Refused,
             404 => ErrorKind::NotFound,
             _ => ErrorKind::Io,

@@ -900,11 +900,17 @@ fn usage_and_passive_commands_do_not_create_state() {
             .output()
             .unwrap()
     };
+    let list = run(&["machine", "list"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    assert!(!missing.exists(), "machine list created state");
     for args in [
         vec!["volume", "bogus"],
         vec!["root", "bogus"],
         vec!["scratch", "bogus"],
         vec!["machine", "bogus"],
+        vec!["machine", "add"],
+        vec!["--json", "machine", "restart", "pc"],
+        vec!["--json", "machine", "shutdown", "pc"],
         vec!["layout", "bogus"],
         vec!["area", "bogus"],
         vec!["bind", "bogus"],

@@ -254,6 +254,14 @@ pub(super) fn machine_power(
             .map_err(|_| Error::usage("--delay must be whole seconds"))?,
         None => DEFAULT_POWER_DELAY_S,
     };
+    if json
+        && !options.flag("yes")
+        && matches!(action, PowerActionKind::Restart | PowerActionKind::Shutdown)
+    {
+        return Err(Error::usage(
+            "--json requires --yes for restart or shutdown",
+        ));
+    }
     let machine = registry.get(&name).map_err(machine_error)?;
     let (client, _) = machine_client(registry, &machine)?;
     let result = if options.flag("yes") {

@@ -464,33 +464,42 @@ impl Registry {
     /// The registry in the account state directory named by `BARGE_STATE_DIR`,
     /// `XDG_STATE_HOME` or the platform default.
     pub fn discover() -> Result<Self> {
-        let state_dir = if let Some(path) =
-            std::env::var_os("BARGE_STATE_DIR").filter(|v| !v.is_empty())
-        {
-            PathBuf::from(path)
-        } else if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-            PathBuf::from(path).join("barge")
-        } else {
-            let home = std::env::var_os("HOME")
-                .filter(|v| !v.is_empty())
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::UnknownState,
-                        "cannot locate Barge account state; set BARGE_STATE_DIR",
-                    )
-                })?;
-            if cfg!(target_os = "macos") {
-                PathBuf::from(home).join("Library/Application Support/barge")
+        let state_dir =
+            if let Some(path) = std::env::var_os("BARGE_STATE_DIR").filter(|v| !v.is_empty()) {
+                PathBuf::from(path)
+            } else if let Some(path) = std::env::var_os("XDG_STATE_HOME")
+                .filter(|v| cfg!(target_os = "linux") && !v.is_empty())
+            {
+                PathBuf::from(path).join("barge")
             } else {
-                PathBuf::from(home).join(".local/state/barge")
-            }
-        };
-        Self::open(state_dir)
+                let home = std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::UnknownState,
+                            "cannot locate Barge account state; set BARGE_STATE_DIR",
+                        )
+                    })?;
+                if cfg!(target_os = "macos") {
+                    PathBuf::from(home).join("Library/Application Support/barge")
+                } else {
+                    PathBuf::from(home).join(".local/state/barge")
+                }
+            };
+        Self::open_read_only(state_dir)
     }
 
     /// The registry in an explicit state directory, created when it does not
     /// exist.
     pub fn open(state_dir: impl Into<PathBuf>) -> Result<Self> {
+        let registry = Self::open_read_only(state_dir)?;
+        fs::create_dir_all(&registry.state_dir)
+            .map_err(|e| io_error("cannot create state directory", &registry.state_dir, &e))?;
+        Ok(registry)
+    }
+
+    /// Open an account path without creating state; writes create it on demand.
+    pub fn open_read_only(state_dir: impl Into<PathBuf>) -> Result<Self> {
         let state_dir = state_dir.into();
         if !state_dir.is_absolute() {
             return Err(Error::usage(format!(
@@ -498,8 +507,6 @@ impl Registry {
                 state_dir.display()
             )));
         }
-        fs::create_dir_all(&state_dir)
-            .map_err(|e| io_error("cannot create state directory", &state_dir, &e))?;
         Ok(Self {
             path: state_dir.join("machines.json"),
             state_dir,
@@ -851,6 +858,8 @@ struct StateLock {
 
 impl StateLock {
     fn acquire(root: &Path) -> Result<Self> {
+        fs::create_dir_all(root)
+            .map_err(|e| io_error("cannot create state directory", root, &e))?;
         let path = root.join("lock");
         let file = fs::OpenOptions::new()
             .read(true)
