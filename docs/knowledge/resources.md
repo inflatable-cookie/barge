@@ -1,6 +1,6 @@
 # Resources and bindings
 
-Status: design approved by Tom, 2026-11-18. Steps 1 and 2 are built; later steps remain planned. The lean storage core in [architecture](architecture.md) is the mechanism
+Status: design approved by Tom, 2026-11-18. Steps 1-3 are built; later steps remain planned. The lean storage core in [architecture](architecture.md) is the mechanism
 this design builds on and does not change.
 
 ## The problem
@@ -114,7 +114,7 @@ Bindings are per machine, stored in account state (`bindings.json`,
 and key, link path, or repository), the value Barge applied, when it applied
 it, and what was there before, so undo restores it exactly.
 
-Only the `link` kind is built. Its rules:
+The `link` kind's rules:
 
 - `plan` shows the exact before and after, with the destination already resolved
   as the link will hold it; `apply` takes that plan document back, so the entry
@@ -138,6 +138,27 @@ Only the `link` kind is built. Its rules:
 
 One record names one consumer, so a tool with two links records two consumers
 (`cargo-registry`, `cargo-git`).
+
+The `workflow` kind is built too. Its rules:
+
+- a repository renders the block from the account layout: the project's scratch
+  folder under the scratch class, how to get a fresh scratch root with
+  `barge scratch new`, and the rule never to write scratch to a home folder or
+  a drive root. Worktrees are not mentioned until that class has a binding;
+- the block sits between `<!-- barge:workflow:start -->` and
+  `<!-- barge:workflow:end -->`, with a line saying edits between them are
+  replaced. `init` inserts the block at the end of a file without one and
+  replaces only the content between existing markers, keeping every other byte.
+  A file with unbalanced or duplicate markers is refused;
+- the project defaults to the repository folder's name and can be overridden
+  with `--project`. `init` publishes the file by atomic rename and records the
+  block as a `workflow` binding whose consumer is the repository path;
+- `barge init --check` exits 0 when the block is current and 1 when it is stale
+  or missing, prints a diff, writes nothing and works on a read-only account;
+- the block names a location, not a mounted path: it renders from the layout
+  while the scratch class's volume is away, and the output says the volume is
+  absent. `init` merges into the file, so the record keeps no earlier copy and
+  `bind undo` refuses a workflow binding.
 
 **Cache and kept placements** are `link` or `setting` bindings for tool-owned
 data:
@@ -227,9 +248,13 @@ Rejected:
 
 As built, `0` requires every volume to be present with an agreeing layout, every
 class folder to exist and every binding to be `ok`; an absent or mismatched
-volume, a disagreeing copy, a missing class folder, and a `drifted`, `missing`
-or `unavailable` binding all exit 1. Doctor writes nothing and works on a
-read-only account.
+volume, a disagreeing copy, a missing class folder, and a `drifted`, `stale`,
+`missing` or `unavailable` binding all exit 1. A workflow binding is `ok` when
+its block matches what the layout renders, `stale` when the block or its markers
+no longer do, and `missing` when the file or the block is gone. A stale block is
+reported even while the volume is away, because the block names a location
+rather than a mounted path. Doctor writes nothing and works on a read-only
+account.
 
 ## Moving a class
 
@@ -267,6 +292,9 @@ plan.
 let layout = barge.layout("Stash")?;                // read, or the default proposal
 layout.path(Class::Scratch)?;                       // resolved, with the absent policy applied
 barge.bindings()?.doctor()?;                        // Report
+let block = barge.workflow("project")?;             // the managed AGENTS.md block
+let report = barge.init(repo, None)?;               // insert or replace it, and record it
+let check = barge.init_check(repo, None)?;          // current, stale or missing
 barge.bind(Binding::setting("paseo", Class::Worktrees))?.plan()?;   // Change; apply is explicit
 ```
 
@@ -297,7 +325,8 @@ Each step is its own brief, reviewed as usual.
 1. **Built:** classes and the layout manifest; `path` and `env`; `survey`.
 2. **Built:** binding records, the `link` kind and `doctor`. Adopting the real
    Cargo links is the operator's step after merge.
-3. `init` with workflow blocks; adopt this repository, then Effigy's.
+3. **Built:** `init` with workflow blocks. Adopting this repository, then
+   Effigy's, is the operator's step after merge.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
 5. `move --plan|--apply`; the Stash layout lane then uses it item by item.
 

@@ -6,10 +6,16 @@
 //! the prior state exactly. Writes take the state lock and publish by atomic
 //! rename; reads never create anything.
 //!
-//! Only the `link` kind is built. It owns a symlink at the tool's own path. A
-//! real directory or file is never replaced unless the plan showed it and the
-//! caller passed the explicit replace; it is renamed aside and undo renames it
-//! back. Deleting a link removes the link itself, never what it points at.
+//! The `link` kind owns a symlink at the tool's own path. A real directory or
+//! file is never replaced unless the plan showed it and the caller passed the
+//! explicit replace; it is renamed aside and undo renames it back. Deleting a
+//! link removes the link itself, never what it points at.
+//!
+//! The `workflow` kind records the managed block `barge init` writes into a
+//! repository's `AGENTS.md`, so `barge doctor` can report the block as current
+//! or stale. Its consumer is the repository path. `init` merges into the file
+//! instead of replacing an entry, so the record keeps no earlier copy and undo
+//! refuses it.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -61,12 +67,18 @@ impl BindingKind {
     }
 }
 
-/// Where a binding points. A link path today; the tagged shape leaves room for
-/// the setting file and key, and the repository, that later steps add.
+/// Where a binding points: the link Barge owns, or the repository whose
+/// `AGENTS.md` carries a managed workflow block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BindingTarget {
-    Link { path: PathBuf },
+    Link {
+        path: PathBuf,
+    },
+    Workflow {
+        repository: PathBuf,
+        project: String,
+    },
 }
 
 /// The kind of entry a preserved target held.
@@ -88,6 +100,9 @@ pub enum Prior {
     /// A real directory or file was there; it was renamed aside and undo renames
     /// it back.
     Preserved { path: PathBuf, entry: EntryKind },
+    /// The file was merged into in place, as a workflow block is, so the record
+    /// keeps no earlier copy. Undo refuses it.
+    InPlace,
 }
 
 impl fmt::Display for Prior {
@@ -104,6 +119,7 @@ impl fmt::Display for Prior {
                 },
                 path.display()
             ),
+            Self::InPlace => formatter.write_str("edited in place"),
         }
     }
 }
@@ -130,10 +146,14 @@ pub struct BindingRecord {
 }
 
 impl BindingRecord {
-    /// The link path this record owns.
-    pub fn link_path(&self) -> &Path {
+    /// The path this record owns: the link Barge made, or the file carrying the
+    /// workflow block.
+    pub fn owned_path(&self) -> PathBuf {
         match &self.target {
-            BindingTarget::Link { path } => path,
+            BindingTarget::Link { path } => path.clone(),
+            BindingTarget::Workflow { repository, .. } => {
+                repository.join(crate::workflow::AGENTS_FILE)
+            }
         }
     }
 }
@@ -448,18 +468,32 @@ impl Bindings {
     }
 
     /// Undo one consumer's binding, restoring exactly what was there before and
-    /// removing the record.
+    /// removing the record. A `workflow` binding has no earlier copy to restore,
+    /// so undo refuses it rather than guessing at the file's previous text.
     pub fn undo(&self, consumer: &str) -> Result<BindingRecord> {
         self.core.ensure_writable()?;
-        validate_name("binding consumer", consumer)?;
         let _lock = self.core.state.lock()?;
         let mut records = read(&self.core)?;
-        let index = records
+        let index = match records
             .iter()
             .position(|record| record.consumer == consumer)
-            .ok_or_else(|| Error::not_found(format!("consumer {consumer} has no binding")))?;
+        {
+            Some(index) => index,
+            None => {
+                validate_name("binding consumer", consumer)?;
+                return Err(Error::not_found(format!(
+                    "consumer {consumer} has no binding"
+                )));
+            }
+        };
         let record = records[index].clone();
-        let link = record.link_path().to_path_buf();
+        if record.kind == BindingKind::Workflow {
+            return Err(Error::refused(format!(
+                "{} is a workflow binding; `barge init` manages the block and there is no earlier copy to restore",
+                record.consumer
+            )));
+        }
+        let link = record.owned_path();
         match observe(&link)? {
             Observed::Absent => {}
             Observed::Link { .. } => {
@@ -512,7 +546,7 @@ impl Bindings {
         }
         if let Some(record) = records
             .iter()
-            .find(|record| same_target(record.link_path(), link))
+            .find(|record| same_target(&record.owned_path(), link))
         {
             return Err(Error::refused(format!(
                 "target {} is already recorded for consumer {}; undo it first",
@@ -647,6 +681,9 @@ fn make_way(link: &Path, prior: &Prior) -> Result<()> {
         Prior::Link { .. } => remove_link(link),
         Prior::Preserved { path, .. } => fs::rename(link, path)
             .map_err(|source| Error::io("cannot preserve the entry at", link, &source)),
+        Prior::InPlace => Err(Error::refused(
+            "an in-place change has no entry to move aside",
+        )),
     }
 }
 
@@ -670,6 +707,9 @@ fn restore_prior(link: &Path, prior: &Prior) -> Result<()> {
             fs::rename(path, link)
                 .map_err(|source| Error::io("cannot restore the preserved entry to", link, &source))
         }
+        Prior::InPlace => Err(Error::refused(
+            "an in-place change has no earlier entry to restore",
+        )),
     }
 }
 
@@ -827,7 +867,7 @@ struct BindingsDocument {
     bindings: Vec<BindingRecord>,
 }
 
-fn read(core: &Core) -> Result<Vec<BindingRecord>> {
+pub(crate) fn read(core: &Core) -> Result<Vec<BindingRecord>> {
     let path = core.state.root().join(BINDINGS_NAME);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -858,7 +898,7 @@ fn read(core: &Core) -> Result<Vec<BindingRecord>> {
     Ok(document.bindings)
 }
 
-fn write(core: &Core, records: &[BindingRecord]) -> Result<()> {
+pub(crate) fn write(core: &Core, records: &[BindingRecord]) -> Result<()> {
     let mut consumers = BTreeSet::new();
     for record in records {
         validate_record(record)?;
@@ -878,15 +918,50 @@ fn write(core: &Core, records: &[BindingRecord]) -> Result<()> {
     publish(&core.state.root().join(BINDINGS_NAME), &bytes)
 }
 
-fn validate_record(record: &BindingRecord) -> Result<()> {
-    validate_name("binding consumer", &record.consumer)?;
+pub(crate) fn validate_record(record: &BindingRecord) -> Result<()> {
     match (&record.kind, &record.target) {
         (BindingKind::Link, BindingTarget::Link { path }) => {
+            validate_name("binding consumer", &record.consumer)?;
             if !path.is_absolute() {
                 return Err(Error::unknown_state(format!(
                     "binding {} has a relative link path {}",
                     record.consumer,
                     path.display()
+                )));
+            }
+        }
+        (
+            BindingKind::Workflow,
+            BindingTarget::Workflow {
+                repository,
+                project,
+            },
+        ) => {
+            if !Path::new(&record.consumer).is_absolute() {
+                return Err(Error::unknown_state(format!(
+                    "workflow binding consumer {} is not a repository path",
+                    record.consumer
+                )));
+            }
+            if !repository.is_absolute() {
+                return Err(Error::unknown_state(format!(
+                    "workflow binding {} has a relative repository {}",
+                    record.consumer,
+                    repository.display()
+                )));
+            }
+            validate_name("workflow project", project).map_err(|error| {
+                Error::unknown_state(format!(
+                    "workflow binding {} has an invalid project: {}",
+                    record.consumer,
+                    error.message()
+                ))
+            })?;
+            if record.class != Class::Scratch {
+                return Err(Error::unknown_state(format!(
+                    "workflow binding {} is for class {}, not scratch",
+                    record.consumer,
+                    record.class.name()
                 )));
             }
         }
@@ -921,6 +996,15 @@ fn validate_record(record: &BindingRecord) -> Result<()> {
                     "binding {} records a relative preserved path {}",
                     record.consumer,
                     path.display()
+                )));
+            }
+        }
+        Prior::InPlace => {
+            if record.kind != BindingKind::Workflow {
+                return Err(Error::unknown_state(format!(
+                    "binding {} records an in-place change for a {} binding",
+                    record.consumer,
+                    record.kind.name()
                 )));
             }
         }

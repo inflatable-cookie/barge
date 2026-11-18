@@ -72,7 +72,7 @@ fn plan_and_apply_a_new_link() {
     assert_eq!(canonical(&link), canonical(&destination));
     assert_eq!(record.consumer, "cargo-registry");
     assert_eq!(record.class, Class::Caches);
-    assert_eq!(record.link_path(), link);
+    assert_eq!(record.owned_path(), link);
     assert_eq!(record.prior, Prior::Absent);
     assert_eq!(record.applied.value, canonical(&destination));
     assert!(record.applied.at_unix_ms > 0);
@@ -530,7 +530,7 @@ fn doctor_reports_ok_drifted_missing_and_unavailable() {
     assert_eq!(report.problems(), 0);
     assert_eq!(report.bindings.len(), 1);
     assert_eq!(report.bindings[0].state, BindingState::Ok);
-    assert_eq!(report.bindings[0].link, link);
+    assert_eq!(report.bindings[0].path, link);
     let volume = &report.volumes[0];
     assert_eq!(volume.name, "Builds");
     let layout = volume.layout.as_ref().unwrap();

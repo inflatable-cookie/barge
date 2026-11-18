@@ -42,6 +42,8 @@ Every success document has `schema` and `data`. The fields of `data` are:
 | `barge.bind-plan/1` | `plan` | bind plan |
 | `barge.binding/1` | `action`, `binding` | bind apply, adopt, undo |
 | `barge.doctor/1` | `ok`, `volumes`, `bindings` | doctor |
+| `barge.init/1` | `project`, `path`, `action`, `scratch`, `volume`, `volume_state` | init |
+| `barge.init-check/1` | `project`, `path`, `state`, `scratch`, `volume`, `volume_state`, `diff` | init --check |
 | `barge.machine/1` | `machine` | machine add |
 | `barge.machine-list/1` | `machines` | machine list |
 | `barge.machine-removed/1` | `removed` | machine remove |

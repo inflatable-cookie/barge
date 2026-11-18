@@ -17,9 +17,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use barge::{
-    Absent, ApplyOptions, AreaSpec, Availability, Barge, Binding, BindingState, Class,
-    DoctorReport, Durability, Error, ErrorKind, Placement, Result, RootInfo, VolumeRegistration,
-    VolumeState, VolumeStatus,
+    Absent, ApplyOptions, AreaSpec, Availability, Barge, Binding, BindingState, BlockState, Class,
+    DoctorReport, Durability, Error, ErrorKind, InitAction, InitCheck, InitReport, Placement,
+    Result, RootInfo, VolumeRegistration, VolumeState, VolumeStatus,
 };
 use barge_machine::{
     request_power, AssumeYes, Confirmation, DaemonClient, DatagramSender, Machine, PowerActionKind,
@@ -37,6 +37,8 @@ mod bind;
 use bind::*;
 mod doctor;
 use doctor::*;
+mod init;
+use init::*;
 mod volume;
 use volume::*;
 mod area;
@@ -86,6 +88,7 @@ fn run(arguments: &[String], json: bool) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         "doctor" => doctor(rest, json),
+        "init" => init(rest, json),
         other => {
             dispatch(other, rest, json)?;
             Ok(ExitCode::SUCCESS)
@@ -146,6 +149,9 @@ usage: barge [--json] <command>
   bind adopt --consumer C --class K --link PATH
   bind undo <consumer>                    restore what was there before
   doctor                                  volumes, layout and binding drift
+  init [--project P] [--path DIR] [--check]
+                                          write the AGENTS.md scratch block;
+                                          --check reports it and writes nothing
   prune --volume V [--dry-run]            evict idle roots to meet policy
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
