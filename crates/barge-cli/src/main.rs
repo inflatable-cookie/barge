@@ -152,6 +152,7 @@ usage: barge [--json] <command>
   machine add --name N --hostname H --mac MAC [--tailscale-name N]
     [--broadcast IPv4] [--port PORT] [--daemon-port PORT]
   machine list | remove <name> | wake <name>
+  machine pair <name> | unpair <name>
   machine status <name>                   what barged on that machine reports
   machine sleep <name> [--delay SECONDS]  start the countdown at once
   machine restart <name> [--delay S] [--yes]

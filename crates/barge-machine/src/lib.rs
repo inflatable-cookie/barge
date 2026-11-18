@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+pub mod auth;
 pub mod daemon;
 
 pub use daemon::{request_power, AssumeYes, Confirmation, DaemonClient};
@@ -507,6 +508,48 @@ impl Registry {
             path: state_dir.join("machines.json"),
             state_dir,
         })
+    }
+
+    /// Store a LAN key separately from the public registry.
+    pub fn pair(&self, name: &str, key: &str) -> Result<()> {
+        self.get(name)?;
+        if auth::decode(key.trim(), 32).is_none() {
+            return Err(Error::usage(
+                "key must be 64 lowercase hexadecimal characters",
+            ));
+        }
+        let path = self
+            .state_dir
+            .join("machine-keys")
+            .join(format!("{name}.key"));
+        auth::write_key(&path, key.trim())
+            .map_err(|e| io_error("cannot write machine key", &path, &e))
+    }
+
+    /// Remove a stored LAN key.
+    pub fn unpair(&self, name: &str) -> Result<()> {
+        self.get(name)?;
+        let path = self
+            .state_dir
+            .join("machine-keys")
+            .join(format!("{name}.key"));
+        fs::remove_file(&path).map_err(|e| io_error("cannot remove machine key", &path, &e))
+    }
+
+    /// Read a machine's LAN key, if paired.
+    pub fn key(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.get(name)?;
+        let path = self
+            .state_dir
+            .join("machine-keys")
+            .join(format!("{name}.key"));
+        match fs::read_to_string(&path) {
+            Ok(value) => auth::decode(value.trim(), 32)
+                .map(Some)
+                .ok_or_else(|| Error::new(ErrorKind::UnknownState, "invalid machine key")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_error("cannot read machine key", &path, &e)),
+        }
     }
 
     /// Every registered machine, in name order.

@@ -5,7 +5,8 @@ pub(super) fn machine(arguments: &[String], json: bool) -> Result<()> {
         .first()
         .ok_or_else(|| Error::usage("machine needs add, list, remove or wake"))?;
     if ![
-        "add", "list", "remove", "wake", "status", "sleep", "restart", "shutdown", "cancel",
+        "add", "list", "remove", "wake", "pair", "unpair", "status", "sleep", "restart",
+        "shutdown", "cancel",
     ]
     .contains(&command.as_str())
     {
@@ -133,20 +134,36 @@ pub(super) fn machine_with(
             }
             Ok(())
         }
+        "pair" => {
+            let options = Options::parse(rest, &[], &[])?;
+            let name = options.single("machine pair", "name")?;
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key).map_err(|e| Error::new(ErrorKind::Io, format!("cannot read key: {e}")))?;
+            registry.pair(&name, &key).map_err(machine_error)?;
+            if json { document("barge.machine-paired/1", vec![("machine", json!(name))])?; } else { println!("paired {name}"); }
+            Ok(())
+        }
+        "unpair" => {
+            let options = Options::parse(rest, &[], &[])?;
+            let name = options.single("machine unpair", "name")?;
+            registry.unpair(&name).map_err(machine_error)?;
+            if json { document("barge.machine-unpaired/1", vec![("machine", json!(name))])?; } else { println!("unpaired {name}"); }
+            Ok(())
+        }
         "status" => {
             let options = Options::parse(rest, &[], &[])?;
             let name = options.single("machine status", "name")?;
             let machine = registry.get(&name).map_err(machine_error)?;
-            let client = DaemonClient::for_machine(&machine);
+            let (client, mode) = machine_client(registry, &machine)?;
             let state = client.state().map_err(machine_error)?;
             if json {
                 document(
                     "barge.machine-status/1",
-                    vec![("machine", json!(machine.name())), ("state", json!(state))],
+                    vec![("machine", json!(machine.name())), ("state", json!(state)), ("mode", json!(mode))],
                 )?;
             } else {
                 println!(
-                    "{}: {}, observed at {}",
+                    "{}: {}, observed at {} ({mode})",
                     machine.name(),
                     power_name(state.power),
                     state.observed_at_unix_ms
@@ -186,7 +203,7 @@ pub(super) fn machine_with(
             let options = Options::parse(rest, &[], &[])?;
             let name = options.single("machine cancel", "name")?;
             let machine = registry.get(&name).map_err(machine_error)?;
-            let result = DaemonClient::for_machine(&machine)
+            let result = machine_client(registry, &machine)?.0
                 .cancel()
                 .map_err(machine_error)?;
             if json {
@@ -210,6 +227,14 @@ pub(super) fn machine_with(
     }
 }
 
+fn machine_client(registry: &Registry, machine: &Machine) -> Result<(DaemonClient, &'static str)> {
+    if let Some(key) = registry.key(machine.name()).map_err(machine_error)? {
+        Ok((DaemonClient::for_lan(machine, key), "lan"))
+    } else {
+        Ok((DaemonClient::for_machine(machine), "tailscale"))
+    }
+}
+
 /// `machine sleep|restart|shutdown <name> [--delay SECONDS] [--yes]`.
 ///
 /// Sleep starts its countdown at once; restart and shutdown ask first unless
@@ -230,7 +255,7 @@ pub(super) fn machine_power(
         None => DEFAULT_POWER_DELAY_S,
     };
     let machine = registry.get(&name).map_err(machine_error)?;
-    let client = DaemonClient::for_machine(&machine);
+    let (client, _) = machine_client(registry, &machine)?;
     let result = if options.flag("yes") {
         request_power(&client, machine.name(), action, delay, &AssumeYes)
     } else {

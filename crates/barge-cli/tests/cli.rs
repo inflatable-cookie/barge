@@ -88,7 +88,7 @@ fn parse_document(output: &Output) -> Value {
         "barge.machine-list/1" => &["machines"],
         "barge.machine-removed/1" => &["removed"],
         "barge.machine-wake/1" => &["machine", "destination", "bytes_sent"],
-        "barge.machine-status/1" => &["machine", "state"],
+        "barge.machine-status/1" => &["machine", "mode", "state"],
         "barge.machine-power/1" => &["machine", "action", "deadline_unix_ms"],
         "barge.machine-cancel/1" => &["machine", "cancelled"],
         _ => panic!("unexpected schema {schema}"),
@@ -912,4 +912,54 @@ fn usage_and_passive_commands_do_not_create_state() {
     assert_eq!(stderr(&value), "barge: project \"--json\" must be 1-64 characters of lowercase letters, digits, '-', '_' or '.'\n");
     let misplaced = run(&["status", "--json"]);
     assert_eq!(stderr(&misplaced), "barge: unknown option --json\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn machine_pair_reads_stdin_and_unpair_removes_owner_only_key() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    let temp = barge::testing::TempDir::new("cli-pair").unwrap();
+    let state = temp.path();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_barge"))
+            .env("BARGE_STATE_DIR", state)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&[
+        "machine",
+        "add",
+        "--name",
+        "pc",
+        "--hostname",
+        "pc.local",
+        "--mac",
+        "00:11:22:33:44:ff"
+    ])
+    .status
+    .success());
+    assert!(!run(&["machine", "pair", "pc", "1234"]).status.success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_barge"))
+        .env("BARGE_STATE_DIR", state)
+        .args(["machine", "pair", "pc"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{}\n", "ab".repeat(32)).as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    let path = state.join("machine-keys/pc.key");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(run(&["machine", "unpair", "pc"]).status.success());
+    assert!(!path.exists());
 }

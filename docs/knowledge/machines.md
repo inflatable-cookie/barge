@@ -15,9 +15,7 @@ Remote menu-bar app ([vision](vision.md#direction)).
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
   power actions. On Bazzite it runs as a systemd user unit and asks logind over
   D-Bus for sleep, restart and shutdown, with a polkit rule granting only those
-  actions. It never runs a shell command it was sent. It binds one configured
-  address — the machine's Tailscale address — and answers only nodes on the
-  allowlist in its config. [Install guide](../install-barged.md).
+  actions. It never runs a shell command it was sent. It binds one configured address and accepts either allowlisted Tailscale nodes or authenticated LAN clients. [Install guide](../install-barged.md).
 - **Barge UI:** a fresh Tauri app (Tom, 2026-11-18). Machine control comes
   first. Storage, worktrees and resources join later in the same app.
 
@@ -59,15 +57,18 @@ exit 2 — and is refused where the machine is built.
 
 ## Protocol and trust
 
-- HTTP with JSON over the tailnet. `barged` binds only the single address in
-  its config — the machine's Tailscale address — so the network decides who can
-  reach it. It refuses a wildcard bind.
-- Authorisation: Tailscale identifies the caller's node. `barged` asks
-  tailscaled's local API (`whois`) for the peer's node and accepts only nodes on
-  an allowlist written at pairing — by stable node ID or MagicDNS name — so no
-  PIN flow is needed. A paired client stores nothing secret beyond its tailnet
-  identity. An unidentifiable caller and a node off the allowlist are both
-  refused with `403`, before an endpoint runs.
+- Tailscale mode (the default for existing configs) binds the configured tailnet
+  address and authorizes callers through Tailscale `whois` and an allowlist.
+  Tailscale encrypts traffic and is recommended across networks.
+- LAN mode uses a shared 256-bit key installed once on each client. Requests
+  carry an HMAC of the method, path, timestamp, nonce and body digest; the
+  daemon checks a 60-second clock window and rejects repeated nonces. Re-pairing
+  the daemon replaces the key and invalidates old clients. The key is stored
+  separately from `machines.json`, owner-only.
+- LAN HTTP authenticates requests but does not encrypt them. Someone on the LAN
+  can see that a power action happened, but cannot forge or replay it. Keep
+  clocks synchronized. Bind a specific LAN address; wildcard binding requires
+  `allow_wildcard` and produces a warning.
 - Endpoints: `GET /v1/state`, `POST /v1/power` (`{action, delay_s}`),
   `POST /v1/power/cancel`. Every response carries a `schema` field, under the
   same contract as the CLI's JSON; a non-2xx response is a
