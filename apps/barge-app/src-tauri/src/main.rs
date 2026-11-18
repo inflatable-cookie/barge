@@ -1,6 +1,27 @@
 mod storage;
+mod preferences;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_autostart::ManagerExt;
+
+#[tauri::command]
+fn preferences_get(store: tauri::State<'_, preferences::Store>) -> Result<preferences::Preferences, String> {
+    store.get()
+}
+
+#[tauri::command]
+fn preferences_set(app: tauri::AppHandle, store: tauri::State<'_, preferences::Store>, preferences: preferences::Preferences) -> Result<(), String> {
+    let old = store.get()?;
+    if old.launch_at_login != preferences.launch_at_login {
+        let manager = app.autolaunch();
+        if preferences.launch_at_login { manager.enable() } else { manager.disable() }.map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = store.set(preferences) {
+        if old.launch_at_login { let _ = app.autolaunch().enable(); } else { let _ = app.autolaunch().disable(); }
+        return Err(error);
+    }
+    Ok(())
+}
 
 #[tauri::command]
 fn storage_volumes() -> Result<Vec<storage::VolumeSummary>, String> {
@@ -37,7 +58,11 @@ fn quit_app(app: tauri::AppHandle) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::Builder::new().build())
         .setup(|app| {
+            let root = app.path().app_config_dir()?;
+            let store = preferences::Store::open(&root).map_err(std::io::Error::other)?;
+            app.manage(store);
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let popover = WebviewWindowBuilder::new(app, "popover", WebviewUrl::App("index.html#popover".into()))
@@ -86,7 +111,7 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             let _ = (window, event);
         })
-        .invoke_handler(tauri::generate_handler![storage_volumes, open_main_window, quit_app])
+        .invoke_handler(tauri::generate_handler![storage_volumes, open_main_window, quit_app, preferences_get, preferences_set])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| eprintln!("Barge failed: {error}"));
 }

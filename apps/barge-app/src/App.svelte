@@ -38,6 +38,10 @@
     void refresh();
     return () => media.removeEventListener("change", changed);
   });
+  $effect(() => {
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, preferences.refresh_interval * 1000);
+    return () => window.clearInterval(timer);
+  });
 </script>
 
 {#if popover}
@@ -52,7 +56,7 @@
   </main>
 {:else}
   <div class="shell">
-    <aside><div class="brand">Barge</div><SidebarNav {groups} bind:value ariaLabel="Barge navigation" /></aside>
+    <aside><div class="brand">Barge</div><SidebarNav {groups} bind:value={view} ariaLabel="Barge navigation" /></aside>
     <main class="content">
       {#if error}<p role="alert">{error}</p>{/if}
       {#if view === "machines"}
