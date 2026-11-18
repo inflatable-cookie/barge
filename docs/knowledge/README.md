@@ -5,7 +5,6 @@
 Contracts:
 
 - [Consumption](contracts/consumption.md) owns the exact-revision dependency path and the CLI JSON contract consumers check.
-- `rust-quality-*.json` and `language-quality-activation.json` own the RustQuality profile and deviations.
 
 There are no other contracts. A fact belongs to the file that owns it; link to
 it rather than restating it.
