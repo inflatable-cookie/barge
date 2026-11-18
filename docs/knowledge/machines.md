@@ -1,7 +1,7 @@
 # Machines
 
-Status: design outline, 2026-11-18, for Tom's sign-off. Nothing here is built
-yet.
+Status: design outline approved by Tom, 2026-11-18. Not built yet; see the
+build order.
 
 Barge manages the machines it distributes resources across. The first is the
 Bazzite PC: wake it, see its state, and sleep, restart or shut it down. This

@@ -1,6 +1,6 @@
 # Resources and bindings
 
-Status: design proposal, 2026-11-18, revised with Tom's answers the same day. Nothing here is built
+Status: design approved by Tom, 2026-11-18. Not built yet; see the build order. Nothing here is built
 yet. The lean storage core in [architecture](architecture.md) is the mechanism
 this design builds on and does not change.
 

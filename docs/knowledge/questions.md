@@ -63,5 +63,5 @@ Answer: in both places, with one authority. The account layout is authoritative 
 
 ## Q-015 — How do agents get their scratch and worktree locations?
 
-Status: proposed 2026-11-18, for Tom's sign-off
-Answer: without coupling. Each tool keeps its own location setting, which Barge sets and checks. Processes inherit locations from the tool that starts them through the standard `TMPDIR`. Interactive agents read a generated `AGENTS.md` block. Nucleus and Effigy change nothing and never depend on Barge (Tom asked for a clean solution, 2026-11-18); see [resources](resources.md#reaching-tools-and-agents-without-coupling).
+Status: answered 2026-11-18
+Answer: without coupling. Each tool keeps its own location setting, which Barge sets and checks. Processes inherit locations from the tool that starts them through the standard `TMPDIR`. Interactive agents read a generated `AGENTS.md` block. Nucleus and Effigy change nothing and never depend on Barge (Tom approved, 2026-11-18); see [resources](resources.md#reaching-tools-and-agents-without-coupling).
