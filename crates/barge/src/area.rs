@@ -665,13 +665,15 @@ impl Area {
             };
         }
         let size = tree_bytes(&info.path);
-        if persist && !size.approximate {
-            let _ = hold::record_activity(
-                &activity,
-                &info.id,
-                info.last_used_unix_ms,
-                Some(size.bytes),
-            );
+        if persist {
+            // A complete measurement is cached; an incomplete one clears any
+            // earlier cached size rather than leaving a stale number behind.
+            let recorded = if size.approximate {
+                hold::RecordedSize::Unknown
+            } else {
+                hold::RecordedSize::Exact(size.bytes)
+            };
+            let _ = hold::record_activity(&activity, &info.id, info.last_used_unix_ms, recorded);
         }
         size
     }
@@ -1084,7 +1086,7 @@ impl Area {
         let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         if fs::create_dir_all(&activity).is_ok() {
             // Advisory only: a failure makes the root look older, never unsafe.
-            let _ = hold::record_activity(&activity, id, unix_ms, None);
+            let _ = hold::record_activity(&activity, id, unix_ms, hold::RecordedSize::Unchanged);
         }
     }
 }
@@ -1757,6 +1759,54 @@ mod eviction_identity_tests {
             "a lower bound stays approximate"
         );
         assert_eq!(hold::read_activity_bytes(&activity, &root.id), None);
+    }
+
+    #[test]
+    fn an_incomplete_release_forgets_an_earlier_cached_size() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, barge) = fixture_with_space(10, 1);
+        let area = barge
+            .area(AreaSpec::new("test", "roots", "disk").soft_cap_bytes(Some(1)))
+            .unwrap();
+        let root = area.create_root("slot").unwrap();
+        fs::write(root.path.join("small.bin"), vec![b'x'; 8]).unwrap();
+        let activity = directory_of(&root).join(BARGE_DIR).join(ACTIVITY_DIR);
+
+        // A complete release caches the size it measured.
+        drop(area.hold(&root.id, Mode::Exclusive).unwrap());
+        let cached =
+            hold::read_activity_bytes(&activity, &root.id).expect("a complete size is cached");
+        assert!(cached >= 8, "cached: {cached}");
+
+        // More data arrives and this release cannot see all of it, so the old
+        // number is forgotten instead of being read back as exact.
+        let hidden = root.path.join("hidden");
+        fs::create_dir(&hidden).unwrap();
+        fs::write(hidden.join("unread.bin"), vec![b'x'; 64]).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = ModeGuard(hidden);
+        drop(area.hold(&root.id, Mode::Exclusive).unwrap());
+
+        assert_eq!(hold::read_activity_bytes(&activity, &root.id), None);
+        let info = area
+            .list()
+            .unwrap()
+            .get(&root.id)
+            .cloned()
+            .expect("the root is listed");
+        assert!(info.bytes >= 8, "the readable part is measured");
+        assert!(info.bytes_approximate, "the stale size is not reused");
+
+        let report = barge.prune("disk", true).unwrap();
+        let planned = report
+            .evicted
+            .iter()
+            .find(|evicted| evicted.id == root.id)
+            .expect("the soft cap plans this root");
+        assert!(
+            planned.bytes_approximate,
+            "prune measures instead of reusing an old number"
+        );
     }
 
     /// Restores a folder's mode so the fixture can still be removed.

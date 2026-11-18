@@ -307,12 +307,20 @@ fn device_of(directory: &File) -> std::io::Result<u64> {
     Ok(directory.metadata()?.dev())
 }
 
-/// The names in an open folder. A read error mid-stream is not distinguished
-/// from the end of the stream: `errno` access is platform-specific, and a missed
-/// entry leaves the folder non-empty, so a removal fails loudly instead of
-/// claiming a folder it did not empty, and a measurement that missed an entry is
-/// still a lower bound.
+/// The names in an open folder.
+///
+/// A null `readdir` is end-of-stream only when the thread's `errno` is clear;
+/// anything else is a failed enumeration and is returned as an error, so a
+/// removal fails loudly and a measurement marks the size approximate rather
+/// than reporting a partial sum as exact.
 fn read_names(directory: &File) -> std::io::Result<Vec<OsString>> {
+    #[cfg(test)]
+    if READ_HOOK
+        .with(|hooks| hooks.borrow_mut().pop_front())
+        .unwrap_or(false)
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
     // `fdopendir` takes ownership of the descriptor it is given, so hand it a
     // duplicate and keep the caller's.
     // SAFETY: `dup` takes a descriptor this process holds and returns a new one
@@ -332,11 +340,19 @@ fn read_names(directory: &File) -> std::io::Result<Vec<OsString>> {
     }
     let mut names = Vec::new();
     loop {
+        clear_errno();
         // SAFETY: `readdir` reads from a stream `fdopendir` returned and gives
         // either null or a pointer to an entry the stream owns until the next call.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
-            break;
+            let failure = errno();
+            // SAFETY: the stream came from `fdopendir` and is closed once here;
+            // it closes the duplicate descriptor with it.
+            unsafe { libc::closedir(stream) };
+            return match failure {
+                0 => Ok(names),
+                code => Err(std::io::Error::from_raw_os_error(code)),
+            };
         }
         // SAFETY: the entry pointer is non-null and its name is NUL-terminated.
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
@@ -346,10 +362,43 @@ fn read_names(directory: &File) -> std::io::Result<Vec<OsString>> {
         }
         names.push(OsStr::from_bytes(bytes).to_os_string());
     }
-    // SAFETY: the stream came from `fdopendir`, is closed once here, and closes
-    // the duplicate descriptor with it.
-    unsafe { libc::closedir(stream) };
-    Ok(names)
+}
+
+/// Clear this thread's `errno`, so a `readdir` that returns null says whether it
+/// failed. Platforms without a named cell keep the previous behaviour: a failed
+/// enumeration is then caught by the removal that finds a folder still non-empty
+/// and by nothing else.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn clear_errno() {
+    // SAFETY: `errno_cell` returns a pointer to this thread's errno cell.
+    unsafe { *errno_cell() = 0 };
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn clear_errno() {}
+
+/// This thread's `errno`, or zero on a platform that does not name it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn errno() -> libc::c_int {
+    // SAFETY: `errno_cell` returns a pointer to this thread's errno cell.
+    unsafe { *errno_cell() }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn errno() -> libc::c_int {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn errno_cell() -> *mut libc::c_int {
+    // SAFETY: `__error` returns this thread's errno cell.
+    unsafe { libc::__error() }
+}
+
+#[cfg(target_os = "linux")]
+fn errno_cell() -> *mut libc::c_int {
+    // SAFETY: `__errno_location` returns this thread's errno cell.
+    unsafe { libc::__errno_location() }
 }
 
 /// Open one folder, without following a symlink at it.
@@ -407,6 +456,19 @@ fn unlink_at(directory: &File, name: &OsStr, flags: libc::c_int) -> std::io::Res
 
 fn c_name(name: &OsStr) -> std::io::Result<CString> {
     CString::new(name.as_bytes()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A seam for the enumeration failures a temporary folder cannot produce:
+    /// each entry says whether that enumeration fails.
+    static READ_HOOK: std::cell::RefCell<std::collections::VecDeque<bool>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+fn push_read_failure(fail: bool) {
+    READ_HOOK.with(|hooks| hooks.borrow_mut().push_back(fail));
 }
 
 #[cfg(test)]
@@ -493,6 +555,42 @@ mod tests {
         );
         assert!(!held.join("owned.bin").exists(), "the opened tree was");
         assert!(held.is_dir(), "the folder that moved is left empty");
+    }
+
+    #[test]
+    fn a_failed_enumeration_is_not_an_end_of_stream() {
+        let temp = crate::testing::TempDir::new("tree-list").unwrap();
+        let root = temp.path().join("slot-0123456789abcdef");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
+        std::fs::write(root.join("readable.bin"), vec![b'x'; 6]).unwrap();
+        std::fs::write(root.join("nested/other.bin"), vec![b'x'; 32]).unwrap();
+        let marker_bytes = std::fs::symlink_metadata(root.join(crate::root::MARKER_NAME))
+            .unwrap()
+            .len();
+
+        // The root lists, its child folder does not: the sum is a lower bound.
+        push_read_failure(false);
+        push_read_failure(true);
+        let measured = measure_tree(&root);
+        assert_eq!(
+            measured.bytes,
+            6 + marker_bytes,
+            "what was listed is counted"
+        );
+        assert!(
+            measured.approximate,
+            "a failed enumeration is never called exact"
+        );
+
+        // The same failure makes a removal fail loudly instead of claiming a
+        // folder it did not empty.
+        push_read_failure(false);
+        push_read_failure(true);
+        let tree = Tree::open(&root).unwrap();
+        let error = tree.remove().unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
+        assert!(root.join("nested/other.bin").exists());
     }
 
     #[test]

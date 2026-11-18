@@ -173,10 +173,11 @@ compatibility, freshness or what a root contains.
   area's own LRU idle roots are evicted. Root sizes are recorded when holds are
   released; roots without a recorded size are measured once on the next
   soft-cap check. The total is approximate between releases. A size a walk could
-  not take exactly, because an entry was unreadable or the tree is deeper than
-  deletion reaches, is reported as approximate rather than as exact, and only a
-  complete measurement is recorded: a lower bound is never later read back as an
-  exact size.
+  not take exactly, because an entry was unreadable, a folder could not be
+  enumerated or the tree is deeper than deletion reaches, is reported as
+  approximate rather than as exact. Only a complete measurement is recorded, and
+  an incomplete release forgets any size recorded earlier, so a lower bound is
+  never later read back as an exact size.
 - An eviction that fails for a reason the filesystem gives — a rename or a
   delete that cannot be done — fails the prune with that error. Only a policy
   refusal is reported as a kept root. A trash copy a delete left behind is

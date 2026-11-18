@@ -152,12 +152,12 @@ impl Drop for Hold {
         self.file.take();
         let now = self.clock.now_unix_ms();
         let size = tree_bytes(&self.root_path);
-        // Only a complete measurement is cached: a lower bound recorded as an
-        // exact size would be reported as exact by every later reader.
+        // Only a complete measurement is cached, and an incomplete one clears any
+        // earlier cached size: a stale number must never read back as exact.
         let recorded = if size.approximate {
-            None
+            RecordedSize::Unknown
         } else {
-            Some(size.bytes)
+            RecordedSize::Exact(size.bytes)
         };
         let _ = record_activity(&self.activity_dir, &self.root_id, now, recorded);
     }
@@ -204,6 +204,18 @@ pub(crate) fn is_locked(path: &Path) -> Result<bool> {
     Ok(!flock(&file, Mode::Exclusive, false)?)
 }
 
+/// What a call records about a root's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedSize {
+    /// The caller measured nothing: keep whatever complete size is stored.
+    Unchanged,
+    /// A measurement that saw the whole tree.
+    Exact(u64),
+    /// A measurement that did not: forget any stored size, because a later
+    /// reader would otherwise report an old number as an exact one.
+    Unknown,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActivityRecord {
@@ -217,16 +229,20 @@ struct ActivityRecord {
 }
 
 /// Record a root's last use. The record is advisory: a failure is not a reason
-/// to fail the hold, it only makes the root look older to prune. A `root_bytes`
-/// of `None` keeps whatever complete size was recorded before, so an incomplete
-/// measurement never replaces one.
+/// to fail the hold, it only makes the root look older to prune.
 pub(crate) fn record_activity(
     activity_dir: &Path,
     root_id: &str,
     unix_ms: u64,
-    root_bytes: Option<u64>,
+    size: RecordedSize,
 ) -> Result<()> {
-    let root_bytes = root_bytes.or_else(|| read_activity_record(activity_dir, root_id)?.root_bytes);
+    let root_bytes = match size {
+        RecordedSize::Unchanged => {
+            read_activity_record(activity_dir, root_id).and_then(|record| record.root_bytes)
+        }
+        RecordedSize::Exact(bytes) => Some(bytes),
+        RecordedSize::Unknown => None,
+    };
     let record = ActivityRecord {
         schema: ACTIVITY_SCHEMA.to_string(),
         root_id: root_id.to_string(),
