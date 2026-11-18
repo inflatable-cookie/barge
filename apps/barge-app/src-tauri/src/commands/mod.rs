@@ -3,6 +3,7 @@
 //! Commands are registered by qualified path in `main.rs`, as Longhorn's guide
 //! requires: the bare name does not bring `#[tauri::command]`'s generated
 //! wrapper into scope, the path does.
+pub mod local;
 pub mod machines;
 pub mod preferences;
 pub mod storage;

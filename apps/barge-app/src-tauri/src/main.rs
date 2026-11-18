@@ -108,7 +108,13 @@ fn run() -> tauri::Result<()> {
             let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
+            commands::local::local_machine_info,
+            commands::local::open_moonlight,
             commands::machines::machines_list,
+            commands::machines::machines_add,
+            commands::machines::machines_pair,
+            commands::machines::machines_remove,
+            commands::machines::machines_action,
             commands::storage::storage_volumes,
             commands::window::open_main_window,
             commands::window::quit_app,

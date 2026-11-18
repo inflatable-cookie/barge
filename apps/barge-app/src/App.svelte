@@ -162,10 +162,6 @@
               onValueChange={(value) => void save({ ...preferences, theme: value as Theme })} /></div>
         </div>
       {/if}
-      <footer class="note">
-        Barge lives in the menu bar at the top of the screen. macOS can hide its item when the menu bar is full,
-        which is why the window opens on launch.
-      </footer>
     </main>
   </div>
 {/if}

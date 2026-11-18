@@ -87,7 +87,7 @@ describe("window navigation", () => {
     await settingsView();
     expect(screen.getByRole("switch", { name: "Launch at login" })).not.toBeChecked();
     expect(screen.getByRole("switch", { name: "Show window at launch" })).toBeChecked();
-    expect(screen.getByText(/menu bar at the top of the screen/)).toBeInTheDocument();
+    expect(screen.queryByText(/Barge lives in the menu bar/)).not.toBeInTheDocument();
   });
 
   it("shows a registered but absent volume without calling it empty", async () => {

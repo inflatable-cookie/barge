@@ -38,8 +38,6 @@ Its visual system is replaced by Poodle.
     launch" setting (on by default);
   - launching the app again while it runs reopens the window (macOS
     `RunEvent::Reopen`);
-  - the window says where the menu-bar item lives and that macOS may hide it
-    when the menu bar is full.
 - **Window on demand:** also opened from the popover. The app shows a Dock icon
   only while the window is open (`ActivationPolicy::Accessory` otherwise).
 - **Launch at login** is a setting, off by default.

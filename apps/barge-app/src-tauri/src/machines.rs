@@ -25,7 +25,12 @@ pub struct Observations {
 }
 
 impl Observations {
-    pub fn update(&mut self, machine: &Machine, result: Result<State, String>) -> MachineView {
+    pub fn update(
+        &mut self,
+        machine: &Machine,
+        lan: bool,
+        result: Result<State, String>,
+    ) -> MachineView {
         let (reachable, error) = match result {
             Ok(state) => {
                 self.last.insert(machine.name().to_owned(), state);
@@ -37,8 +42,13 @@ impl Observations {
             name: machine.name().to_owned(),
             hostname: machine.hostname().to_owned(),
             mac: machine.mac().to_owned(),
-            mode: if machine.tailscale_name().is_some() { "tailscale" } else { "lan" },
-            address: machine.daemon_host().to_owned(),
+            mode: if lan { "lan" } else { "tailscale" },
+            address: if lan {
+                machine.hostname()
+            } else {
+                machine.daemon_host()
+            }
+            .to_owned(),
             reachable,
             observation: self.last.get(machine.name()).cloned(),
             error,
@@ -46,19 +56,16 @@ impl Observations {
     }
 
     pub fn retain(&mut self, machines: &[Machine]) {
-        self.last.retain(|name, _| machines.iter().any(|machine| machine.name() == name));
+        self.last
+            .retain(|name, _| machines.iter().any(|machine| machine.name() == name));
     }
 }
 
 /// Use the CLI's LAN key and the same address selection as the CLI.
 pub fn client(registry: &Registry, machine: &Machine) -> barge_machine::Result<DaemonClient> {
-    if machine.tailscale_name().is_some() {
-        Ok(DaemonClient::for_machine(machine))
-    } else {
-        let key = registry.key(machine.name())?.ok_or_else(|| {
-            barge_machine::Error::refused(format!("{} is not paired", machine.name()))
-        })?;
-        Ok(DaemonClient::for_lan(machine, key))
+    match registry.key(machine.name())? {
+        Some(key) => Ok(DaemonClient::for_lan(machine, key)),
+        None => Ok(DaemonClient::for_machine(machine)),
     }
 }
 
@@ -75,12 +82,19 @@ mod tests {
             deadline_unix_ms: 456,
         }));
         let mut observations = Observations::default();
-        assert!(observations.update(&machine, Ok(state.clone())).reachable);
-        let failed = observations.update(&machine, Err("connection timed out".into()));
+        assert!(
+            observations
+                .update(&machine, true, Ok(state.clone()))
+                .reachable
+        );
+        let failed = observations.update(&machine, true, Err("connection timed out".into()));
         assert!(!failed.reachable);
         assert_eq!(failed.observation, Some(state));
         assert_eq!(failed.error.as_deref(), Some("connection timed out"));
         observations.retain(&[]);
-        assert!(observations.update(&machine, Err("offline".into())).observation.is_none());
+        assert!(observations
+            .update(&machine, true, Err("offline".into()))
+            .observation
+            .is_none());
     }
 }
