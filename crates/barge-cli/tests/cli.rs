@@ -287,3 +287,12 @@ fn an_area_reports_where_its_roots_go() {
     assert!(Path::new(location).starts_with(&fixture.mount));
     assert_eq!(area["absent"]["path"], fallback.to_str().unwrap());
 }
+
+#[test]
+fn env_rejects_json_output() {
+    let fixture = Fixture::new();
+    let output = fixture.json(&["env"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("does not support --json"));
+}
