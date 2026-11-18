@@ -17,5 +17,11 @@ ureq = { version = "=3.4.2", default-features = false }
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"
 
+# Tests use the storage library's `testing::TempDir`, so a fixture removes itself
+# even when a test panics. The dependency is test-only, so `crates/barge`'s own
+# dependency tree is unchanged.
+[dev-dependencies]
+barge = { path = "../barge" }
+
 [lints]
 workspace = true

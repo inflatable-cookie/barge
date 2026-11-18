@@ -166,10 +166,10 @@ fn machine_with(
             let mac = options.required("mac")?;
             let mut machine = Machine::new(name, hostname, &mac).map_err(machine_error)?;
             if let Some(name) = options.get("tailscale-name") {
-                machine = machine.tailscale_name(Some(name));
+                machine = machine.with_tailscale_name(Some(name));
             }
             if let Some(address) = options.get("broadcast") {
-                machine = machine.broadcast(
+                machine = machine.with_broadcast(
                     address
                         .parse()
                         .map_err(|_| Error::usage("--broadcast must be an IPv4 address"))?,
@@ -179,25 +179,23 @@ fn machine_with(
                 let port = port
                     .parse::<u16>()
                     .map_err(|_| Error::usage("--port must be between 1 and 65535"))?;
-                if port == 0 {
-                    return Err(Error::usage("--port must be between 1 and 65535"));
-                }
-                machine = machine.port(port);
+                machine = machine.with_port(port).map_err(machine_error)?;
             }
             if let Some(port) = options.get("daemon-port") {
                 let port = port
                     .parse::<u16>()
                     .map_err(|_| Error::usage("--daemon-port must be between 1 and 65535"))?;
-                if port == 0 {
-                    return Err(Error::usage("--daemon-port must be between 1 and 65535"));
-                }
-                machine = machine.daemon_port(port);
+                machine = machine.with_daemon_port(port).map_err(machine_error)?;
             }
             registry.add(machine.clone()).map_err(machine_error)?;
             if json {
                 document("barge.machine/1", vec![("machine", json!(machine))])?;
             } else {
-                println!("registered machine {} ({})", machine.name, machine.hostname);
+                println!(
+                    "registered machine {} ({})",
+                    machine.name(),
+                    machine.hostname()
+                );
             }
             Ok(())
         }
@@ -211,7 +209,12 @@ fn machine_with(
                 println!("no machines registered");
             } else {
                 for machine in machines {
-                    println!("{}: {} ({})", machine.name, machine.hostname, machine.mac);
+                    println!(
+                        "{}: {} ({})",
+                        machine.name(),
+                        machine.hostname(),
+                        machine.mac()
+                    );
                 }
             }
             Ok(())
@@ -223,7 +226,7 @@ fn machine_with(
             if json {
                 document("barge.machine/1", vec![("removed", json!(removed))])?;
             } else {
-                println!("removed machine {}", removed.name);
+                println!("removed machine {}", removed.name());
             }
             Ok(())
         }
@@ -236,7 +239,7 @@ fn machine_with(
                 document(
                     "barge.machine-wake/1",
                     vec![
-                        ("machine", json!(machine.name)),
+                        ("machine", json!(machine.name())),
                         ("destination", json!(destination.to_string())),
                         ("bytes_sent", json!(102)),
                     ],
@@ -244,7 +247,8 @@ fn machine_with(
             } else {
                 println!(
                     "sent Wake-on-LAN packet for {} to {}",
-                    machine.name, destination
+                    machine.name(),
+                    destination
                 );
             }
             Ok(())
@@ -258,12 +262,12 @@ fn machine_with(
             if json {
                 document(
                     "barge.machine-status/1",
-                    vec![("machine", json!(machine.name)), ("state", json!(state))],
+                    vec![("machine", json!(machine.name())), ("state", json!(state))],
                 )?;
             } else {
                 println!(
                     "{}: {}, observed at {}",
-                    machine.name,
+                    machine.name(),
                     power_name(state.power),
                     state.observed_at_unix_ms
                 );
@@ -309,14 +313,14 @@ fn machine_with(
                 document(
                     "barge.machine-cancel/1",
                     vec![
-                        ("machine", json!(machine.name)),
+                        ("machine", json!(machine.name())),
                         ("cancelled", json!(result.cancelled)),
                     ],
                 )?;
             } else if result.cancelled {
-                println!("cancelled the pending action on {}", machine.name);
+                println!("cancelled the pending action on {}", machine.name());
             } else {
-                println!("nothing was pending on {}", machine.name);
+                println!("nothing was pending on {}", machine.name());
             }
             Ok(())
         }
@@ -348,16 +352,16 @@ fn machine_power(
     let machine = registry.get(&name).map_err(machine_error)?;
     let client = DaemonClient::for_machine(&machine);
     let result = if options.flag("yes") {
-        request_power(&client, &machine.name, action, delay, &AssumeYes)
+        request_power(&client, machine.name(), action, delay, &AssumeYes)
     } else {
-        request_power(&client, &machine.name, action, delay, &Prompt)
+        request_power(&client, machine.name(), action, delay, &Prompt)
     }
     .map_err(machine_error)?;
     if json {
         document(
             "barge.machine-power/1",
             vec![
-                ("machine", json!(machine.name)),
+                ("machine", json!(machine.name())),
                 ("action", json!(result.action.as_str())),
                 ("deadline_unix_ms", json!(result.deadline_unix_ms)),
             ],
@@ -366,10 +370,10 @@ fn machine_power(
         println!(
             "{} of {} will fire at {} (in {}s); cancel with `barge machine cancel {}`",
             result.action.as_str(),
-            machine.name,
+            machine.name(),
             result.deadline_unix_ms,
             delay,
-            machine.name
+            machine.name()
         );
     }
     Ok(())

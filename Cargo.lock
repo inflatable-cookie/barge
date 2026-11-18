@@ -173,6 +173,7 @@ dependencies = [
 name = "barge-machine"
 version = "0.1.0"
 dependencies = [
+ "barge",
  "libc",
  "serde",
  "serde_json",
