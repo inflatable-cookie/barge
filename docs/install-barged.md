@@ -68,7 +68,7 @@ this account access with `sudo tailscale set --operator="$USER"`. A user-run
 socket can be configured instead. Wildcard addresses are refused unless
 `"allow_wildcard": true` is set; doing so logs a warning.
 
-## 5. Install the systemd user unit
+## 4. Install the systemd user unit
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -86,7 +86,7 @@ sudo loginctl enable-linger "$USER"
 
 Logs: `journalctl --user -u barged -f`.
 
-## 6. Grant exactly the three power actions
+## 5. Grant exactly the three power actions
 
 logind asks polkit before it sleeps, restarts or powers off. The daemon calls
 those three methods with `interactive=false`, so it needs a rule that answers
@@ -102,7 +102,7 @@ The rule grants `org.freedesktop.login1.suspend`, `…reboot` and `…power-off`
 that account and leaves every other action alone. Nothing else is granted, and
 the daemon never runs a shell command.
 
-## 7. Register the machine on the Mac
+## 6. Register the machine on the Mac
 
 ```sh
 barge machine add --name pc --hostname pc.local \

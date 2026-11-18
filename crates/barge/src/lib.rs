@@ -11,10 +11,6 @@
 //! `docs/knowledge/architecture.md` is the design this crate implements.
 
 #![deny(unsafe_code)]
-#![cfg_attr(
-    not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
 
 pub mod area;
 pub mod area_spec;
@@ -24,6 +20,7 @@ pub mod doctor;
 pub mod error;
 pub mod hold;
 pub mod layout;
+pub mod move_plan;
 pub mod os;
 pub mod pin;
 pub mod root;
@@ -51,6 +48,7 @@ pub use doctor::{
 pub use error::{Error, ErrorKind, Result};
 pub use hold::{Hold, Mode};
 pub use layout::{Class, Layout, Placement, ResourcePath, SurveyItem};
+pub use move_plan::{MoveArea, MoveBinding, MoveIdentity, MoveLayout, MovePlan, MoveReport};
 pub use os::{FakeOs, Os};
 pub use root::{Listing, Root, RootInfo, Straggler};
 pub use scratch::Scratch;

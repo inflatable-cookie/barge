@@ -7,14 +7,11 @@ publish.workspace = true
 description = "Barge's storage library: volumes, areas, owned roots, holds, pins, pruning and scratch"
 
 [dependencies]
-serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+serde.workspace = true
+serde_json.workspace = true
 
-# The one platform dependency. Every use of it sits behind the `os` layer (volume
-# identity and free space) and the hold's `flock`; no other module names a
-# syscall or errno.
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.190"
+libc.workspace = true
 
 [lints]
 workspace = true

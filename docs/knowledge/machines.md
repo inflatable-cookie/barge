@@ -1,6 +1,6 @@
 # Machines
 
-Status: design outline approved by Tom, 2026-11-18. Build steps 1 and 2 are
+Status: design outline approved by Tom, 2026-11-18. Build steps 1, 2 and LAN authentication are
 complete; later steps remain unbuilt.
 
 Barge manages the machines it distributes resources across. The first is the
@@ -10,7 +10,7 @@ Remote menu-bar app ([vision](vision.md#direction)).
 
 ## Parts
 
-- **`barge` CLI on the Mac:** `barge machine list|status|wake|sleep|restart|shutdown|cancel`.
+- **`barge` CLI on the Mac:** `barge machine add|list|remove|wake|pair|unpair|status|sleep|restart|shutdown|cancel`.
   Wake-on-LAN is a client operation and needs nothing running on the PC.
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
   power actions. On Bazzite it runs as a systemd user unit and asks logind over
@@ -64,7 +64,8 @@ exit 2 — and is refused where the machine is built.
   carry an HMAC of the method, path, timestamp, nonce and body digest; the
   daemon checks a 60-second clock window and rejects repeated nonces. Re-pairing
   the daemon replaces the key and invalidates old clients. The key is stored
-  separately from `machines.json`, owner-only.
+  separately from `machines.json`, owner-only. Removing a machine removes its
+  stored key before the name can be reused.
 - LAN HTTP authenticates requests but does not encrypt them. Someone on the LAN
   can see that a power action happened, but cannot forge or replay it. Keep
   clocks synchronized. Bind a specific LAN address; wildcard binding requires
@@ -104,8 +105,11 @@ the build brief.
 
 - `crates/barge-machine`: machine registry, Wake-on-LAN, protocol types and
   the client, shared by the CLI and UI.
-- `crates/barged`: the daemon (Linux first).
-- `apps/barge-ui`: the Tauri app.
+- `crates/barged`: the daemon (Linux first), with its unit, polkit rule and
+  example config in `packaging/barged/`.
+- `crates/barge-cli`: the `barge` binary, which carries the machine verbs
+  beside the storage ones.
+- `apps/barge-ui`: the Tauri app, planned and not yet built.
 
 ## Build order
 
@@ -116,10 +120,11 @@ the build brief.
    `barge-machine`, `barge machine status|sleep|restart|shutdown|cancel`, the
    systemd unit and polkit rule in `packaging/barged/`, and the
    [install guide](../install-barged.md) for Bazzite.
-3. UI design pass: information architecture and visual system, for Tom's
+3. **Built:** LAN pairing and authenticated requests, with no Tailscale required.
+4. UI design pass: information architecture and visual system, for Tom's
    review.
-4. The Tauri app: Machines plus the menu-bar entry.
-5. Retire MoonDeck Buddy on the PC. This changes host software, so it needs
+5. The Tauri app: Machines plus the menu-bar entry.
+6. Retire MoonDeck Buddy on the PC. This changes host software, so it needs
    Tom's go-ahead. The Steam Deck needs a `barged` client first, or loses
    remote control until it has one.
 

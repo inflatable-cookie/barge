@@ -8,10 +8,6 @@
 //! file, so a registry write and a storage write never interleave, and the two
 //! copies have to be changed together.
 #![deny(missing_docs)]
-#![cfg_attr(
-    not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -512,6 +508,7 @@ impl Registry {
 
     /// Store a LAN key separately from the public registry.
     pub fn pair(&self, name: &str, key: &str) -> Result<()> {
+        let _lock = StateLock::acquire(&self.state_dir)?;
         self.get(name)?;
         if auth::decode(key.trim(), 32).is_none() {
             return Err(Error::usage(
@@ -528,6 +525,7 @@ impl Registry {
 
     /// Remove a stored LAN key.
     pub fn unpair(&self, name: &str) -> Result<()> {
+        let _lock = StateLock::acquire(&self.state_dir)?;
         self.get(name)?;
         let path = self
             .state_dir
@@ -587,6 +585,15 @@ impl Registry {
             .iter()
             .position(|entry| entry.name == name)
             .ok_or_else(|| Error::not_found(format!("machine {name:?} is not registered")))?;
+        let key_path = self
+            .state_dir
+            .join("machine-keys")
+            .join(format!("{name}.key"));
+        match fs::remove_file(&key_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("cannot remove machine key", &key_path, &error)),
+        }
         let removed = machines.remove(index);
         self.write(&machines)?;
         Ok(removed)
@@ -957,6 +964,17 @@ mod tests {
         let sent = sender.0.lock().unwrap();
         assert_eq!(sent[0].0, packet);
         assert_eq!(sent[0].1, SocketAddr::from(([192, 168, 1, 255], 9)));
+    }
+
+    #[test]
+    fn removing_a_machine_removes_its_key_before_the_name_can_be_reused() {
+        let (_temp, registry) = registry();
+        let machine = Machine::new("pc", "pc.local", "00:11:22:33:44:ff").unwrap();
+        registry.add(machine.clone()).unwrap();
+        registry.pair("pc", &"ab".repeat(32)).unwrap();
+        registry.remove("pc").unwrap();
+        registry.add(machine).unwrap();
+        assert_eq!(registry.key("pc").unwrap(), None);
     }
 
     #[test]

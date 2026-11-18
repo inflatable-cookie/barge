@@ -827,7 +827,7 @@ struct BindingsDocument {
     bindings: Vec<BindingRecord>,
 }
 
-fn read(core: &Core) -> Result<Vec<BindingRecord>> {
+pub(crate) fn read(core: &Core) -> Result<Vec<BindingRecord>> {
     let path = core.state.root().join(BINDINGS_NAME);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -858,7 +858,7 @@ fn read(core: &Core) -> Result<Vec<BindingRecord>> {
     Ok(document.bindings)
 }
 
-fn write(core: &Core, records: &[BindingRecord]) -> Result<()> {
+pub(crate) fn write(core: &Core, records: &[BindingRecord]) -> Result<()> {
     let mut consumers = BTreeSet::new();
     for record in records {
         validate_record(record)?;

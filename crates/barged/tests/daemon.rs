@@ -4,6 +4,11 @@
 //! logind. The caller's identity and the power backend are fakes; the client is
 //! the one `barge` ships, so the pair is exercised together.
 
+// An integration test target is its own crate, and its fixture helpers are not
+// inside a `#[test]` function, where `clippy.toml` grants the exception. Tests
+// may unwrap, expect and panic; the shipped crates may not.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};

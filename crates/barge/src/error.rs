@@ -4,8 +4,9 @@
 use std::fmt;
 use std::path::Path;
 
-/// What kind of failure this is. The CLI maps it to an exit code: `Refused`
-/// changes nothing and exits 1, `Usage` exits 2, everything else exits 3.
+/// What kind of failure this is. The CLI maps it to an exit code: `Refused` and
+/// `NotFound` change nothing and exit 1, `Usage` exits 2, everything else exits
+/// 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// The caller's request is malformed or incomplete.

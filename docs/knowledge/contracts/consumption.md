@@ -18,7 +18,11 @@ check both and handle unknown versions rather than assuming a compatible
 shape. [Architecture](../architecture.md#cli) owns the CLI's verbs and exit
 codes.
 
-Every success document has `schema` and `data`. The fields of `data` are:
+Move plans are `barge.move-plan/1` documents, printed directly by `barge move
+--plan` and supplied unchanged to `barge move --apply --plan`. Successful JSON
+apply output is a `barge.move/1` envelope containing the plan and doctor report.
+
+Except for standalone move plans, every success document has `schema` and `data`. The fields of `data` are:
 
 | Schema | Fields | Commands |
 | --- | --- | --- |
@@ -41,12 +45,15 @@ Every success document has `schema` and `data`. The fields of `data` are:
 | `barge.binding-list/1` | `bindings` | bind list |
 | `barge.bind-plan/1` | `plan` | bind plan |
 | `barge.binding/1` | `action`, `binding` | bind apply, adopt, undo |
+| `barge.move/1` | `report` | move apply |
 | `barge.doctor/1` | `ok`, `volumes`, `bindings` | doctor |
 | `barge.machine/1` | `machine` | machine add |
 | `barge.machine-list/1` | `machines` | machine list |
 | `barge.machine-removed/1` | `removed` | machine remove |
 | `barge.machine-wake/1` | `machine`, `destination`, `bytes_sent` | machine wake |
-| `barge.machine-status/1` | `machine`, `state` | machine status |
+| `barge.machine-paired/1` | `machine` | machine pair |
+| `barge.machine-unpaired/1` | `machine` | machine unpair |
+| `barge.machine-status/1` | `machine`, `mode`, `state` | machine status |
 | `barge.machine-power/1` | `machine`, `action`, `deadline_unix_ms` | machine sleep, restart, shutdown |
 | `barge.machine-cancel/1` | `machine`, `cancelled` | machine cancel |
 
