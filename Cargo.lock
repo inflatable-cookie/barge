@@ -248,6 +248,7 @@ name = "barge-app"
 version = "0.1.0"
 dependencies = [
  "barge",
+ "barge-machine",
  "longhorn-config",
  "longhorn-core",
  "longhorn-settings",

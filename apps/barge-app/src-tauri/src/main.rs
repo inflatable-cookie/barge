@@ -4,6 +4,7 @@
 //! preferences store and Longhorn's settings and notification surfaces.
 
 mod commands;
+mod machines;
 mod popover;
 mod preferences;
 mod settings;
@@ -44,6 +45,7 @@ fn run() -> tauri::Result<()> {
                 .map(|preferences| preferences.show_window_at_launch)
                 .unwrap_or(true);
             app.manage(store);
+            app.manage(commands::machines::MachineState::default());
             app.manage(longhorn_tauri_settings::TauriSettingsState::new(
                 std::sync::Arc::new(settings),
             ));
@@ -106,6 +108,7 @@ fn run() -> tauri::Result<()> {
             let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
+            commands::machines::machines_list,
             commands::storage::storage_volumes,
             commands::window::open_main_window,
             commands::window::quit_app,
