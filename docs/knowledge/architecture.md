@@ -25,7 +25,9 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   pins.
 - **Eviction decides atomically.** Eviction takes the root's exclusive lock
   without waiting, then rechecks the pin under the area lock, which pinning
-  also takes, before it renames. An earlier "idle and unpinned" reading never
+  also takes, and revalidates the root marker’s area, ID, label and folder
+  under both locks immediately before it renames. Marker writes take the area
+  lock too. An earlier "idle and unpinned" reading never
   authorises an eviction by itself.
 - **Deletion stays inside what it owns.** Deleting never follows a symlink and
   never descends into another filesystem (a nested mount). A trash entry is

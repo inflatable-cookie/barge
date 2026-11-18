@@ -24,29 +24,47 @@ pub struct Deletion {
 /// Delete a tree Barge owns. `area` is the `<namespace>/<area>` the marker must
 /// name; anything else is refused and nothing is removed.
 pub(crate) fn remove_owned_tree(path: &Path, area: &str) -> Result<Deletion> {
-    remove_owned_tree_with(path, area, &device_of)
+    remove_owned_tree_checked(path, area, None, &device_of)
+}
+
+pub(crate) fn remove_owned_tree_for_id(path: &Path, area: &str, id: &str) -> Result<Deletion> {
+    remove_owned_tree_checked(path, area, Some(id), &device_of)
 }
 
 /// The testable core of [`remove_owned_tree`]: `device` answers which filesystem
 /// an entry is on, so a test can claim a nested folder is another mount.
+#[cfg(test)]
 pub(crate) fn remove_owned_tree_with(
     path: &Path,
     area: &str,
     device: &dyn Fn(&fs::Metadata) -> u64,
 ) -> Result<Deletion> {
+    remove_owned_tree_checked(path, area, None, device)
+}
+
+fn remove_owned_tree_checked(
+    path: &Path,
+    area: &str,
+    id: Option<&str>,
+    device: &dyn Fn(&fs::Metadata) -> u64,
+) -> Result<Deletion> {
     let metadata =
         fs::symlink_metadata(path).map_err(|source| Error::io("cannot inspect", path, &source))?;
     if !metadata.is_dir() {
+        if id.is_some() {
+            return Err(Error::refused("evicted root is not a directory"));
+        }
         // A sticky symlink or a file where a root folder should be: remove the
         // entry itself, never what it points at.
         fs::remove_file(path).map_err(|source| Error::io("cannot remove", path, &source))?;
         return Ok(Deletion::default());
     }
     match read_marker(path) {
-        MarkerRead::Valid(marker) if marker.area == area => {}
+        MarkerRead::Valid(marker) if marker.area == area && id.is_none_or(|id| marker.id == id) => {
+        }
         MarkerRead::Valid(marker) => {
             return Err(Error::refused(format!(
-                "refusing to delete {}: its marker belongs to area {}",
+                "refusing to delete {}: its marker does not match area {} or the expected root ID",
                 path.display(),
                 marker.area
             )))
@@ -205,6 +223,28 @@ mod tests {
         );
         assert!(deletion.skipped.contains(&nested));
         assert!(deletion.skipped.contains(&root));
+    }
+
+    #[test]
+    fn eviction_delete_refuses_a_different_root_id() {
+        let temp = crate::testing::TempDir::new("trash-id").unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        crate::root::write_marker(
+            &root,
+            &crate::root::RootMarker {
+                schema: crate::root::ROOT_SCHEMA.to_string(),
+                area: "test/area".to_string(),
+                id: "replacement".to_string(),
+                label: "slot".to_string(),
+                created_unix_ms: 1,
+                expires_unix_ms: None,
+                folder: None,
+            },
+        )
+        .unwrap();
+        assert!(remove_owned_tree_for_id(&root, "test/area", "original").is_err());
+        assert!(root.exists());
     }
 
     #[test]
