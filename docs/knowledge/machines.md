@@ -1,7 +1,7 @@
 # Machines
 
-Status: design outline approved by Tom, 2026-11-18. Not built yet; see the
-build order.
+Status: design outline approved by Tom, 2026-11-18. Build step 1 is complete;
+later steps remain unbuilt.
 
 Barge manages the machines it distributes resources across. The first is the
 Bazzite PC: wake it, see its state, and sleep, restart or shut it down. This
@@ -75,7 +75,8 @@ the build brief.
 
 ## Build order
 
-1. Machine registry, Wake-on-LAN and protocol types; `barge machine wake`.
+1. **Built:** machine registry, Wake-on-LAN and protocol types in
+   `barge-machine`; `barge machine add|list|remove|wake`.
 2. `barged`: state and power with countdown and cancel; systemd unit and
    polkit rule; an install guide for Bazzite.
 3. UI design pass: information architecture and visual system, for Tom's

@@ -15,6 +15,7 @@ use barge::{
     Absent, AreaSpec, Availability, Barge, Durability, Error, ErrorKind, Result, RootInfo,
     VolumeRegistration, VolumeState, VolumeStatus,
 };
+use barge_machine::{DatagramSender, Machine, Registry, UdpSender};
 use serde_json::{json, Value};
 
 fn main() -> ExitCode {
@@ -53,6 +54,7 @@ fn run(arguments: &[String], json: bool) -> Result<()> {
         "root" => root(rest, json),
         "prune" => prune(rest, json),
         "scratch" => scratch(rest, json),
+        "machine" => machine(rest, json),
         other => Err(Error::usage(format!(
             "unknown command {other:?}\n\n{}",
             usage_text()
@@ -83,10 +85,139 @@ usage: barge [--json] <command>
   prune --volume V [--dry-run]            evict idle roots to meet policy
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
+  machine add --name N --hostname H --mac MAC [--tailscale-name N]
+    [--broadcast IPv4] [--port PORT]
+  machine list | remove <name> | wake <name>
 
 SIZES: integer bytes, or KiB, MiB, GiB, TiB.
 "
     .to_string()
+}
+
+fn machine(arguments: &[String], json: bool) -> Result<()> {
+    let registry = Registry::discover().map_err(machine_error)?;
+    machine_with(arguments, json, &registry, &UdpSender)
+}
+
+fn machine_with(
+    arguments: &[String],
+    json: bool,
+    registry: &Registry,
+    sender: &impl DatagramSender,
+) -> Result<()> {
+    let Some(command) = arguments.first().map(String::as_str) else {
+        return Err(Error::usage("machine needs add, list, remove or wake"));
+    };
+    let rest = &arguments[1..];
+    match command {
+        "add" => {
+            let options = Options::parse(
+                rest,
+                &[
+                    "name",
+                    "hostname",
+                    "tailscale-name",
+                    "mac",
+                    "broadcast",
+                    "port",
+                ],
+                &[],
+            )?;
+            expect_no_positionals(&options)?;
+            let name = options.required("name")?;
+            let hostname = options.required("hostname")?;
+            let mac = options.required("mac")?;
+            let mut machine = Machine::new(name, hostname, &mac).map_err(machine_error)?;
+            if let Some(name) = options.get("tailscale-name") {
+                machine = machine.tailscale_name(Some(name));
+            }
+            if let Some(address) = options.get("broadcast") {
+                machine = machine.broadcast(
+                    address
+                        .parse()
+                        .map_err(|_| Error::usage("--broadcast must be an IPv4 address"))?,
+                );
+            }
+            if let Some(port) = options.get("port") {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| Error::usage("--port must be between 1 and 65535"))?;
+                if port == 0 {
+                    return Err(Error::usage("--port must be between 1 and 65535"));
+                }
+                machine = machine.port(port);
+            }
+            registry.add(machine.clone()).map_err(machine_error)?;
+            if json {
+                document("barge.machine/1", vec![("machine", json!(machine))])?;
+            } else {
+                println!("registered machine {} ({})", machine.name, machine.hostname);
+            }
+            Ok(())
+        }
+        "list" => {
+            let options = Options::parse(rest, &[], &[])?;
+            expect_no_positionals(&options)?;
+            let machines = registry.list().map_err(machine_error)?;
+            if json {
+                document("barge.machines/1", vec![("machines", json!(machines))])?;
+            } else if machines.is_empty() {
+                println!("no machines registered");
+            } else {
+                for machine in machines {
+                    println!("{}: {} ({})", machine.name, machine.hostname, machine.mac);
+                }
+            }
+            Ok(())
+        }
+        "remove" => {
+            let options = Options::parse(rest, &[], &[])?;
+            let name = options.single("machine remove", "name")?;
+            let removed = registry.remove(&name).map_err(machine_error)?;
+            if json {
+                document("barge.machine/1", vec![("removed", json!(removed))])?;
+            } else {
+                println!("removed machine {}", removed.name);
+            }
+            Ok(())
+        }
+        "wake" => {
+            let options = Options::parse(rest, &[], &[])?;
+            let name = options.single("machine wake", "name")?;
+            let machine = registry.get(&name).map_err(machine_error)?;
+            let destination = barge_machine::wake(&machine, sender).map_err(machine_error)?;
+            if json {
+                document(
+                    "barge.machine-wake/1",
+                    vec![
+                        ("machine", json!(machine.name)),
+                        ("destination", json!(destination.to_string())),
+                        ("bytes_sent", json!(102)),
+                    ],
+                )?;
+            } else {
+                println!(
+                    "sent Wake-on-LAN packet for {} to {}",
+                    machine.name, destination
+                );
+            }
+            Ok(())
+        }
+        other => Err(Error::usage(format!(
+            "unknown machine command {other:?}; use add, list, remove or wake"
+        ))),
+    }
+}
+
+fn machine_error(error: barge_machine::Error) -> Error {
+    let kind = match error.kind() {
+        barge_machine::ErrorKind::Usage => ErrorKind::Usage,
+        barge_machine::ErrorKind::Refused => ErrorKind::Refused,
+        barge_machine::ErrorKind::NotFound => ErrorKind::NotFound,
+        barge_machine::ErrorKind::Io => ErrorKind::Io,
+        barge_machine::ErrorKind::UnknownState => ErrorKind::UnknownState,
+    };
+    Error::new(kind, error.message())
 }
 
 fn status(arguments: &[String], json: bool) -> Result<()> {
@@ -859,6 +990,73 @@ impl Options {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakeSender(Mutex<Vec<(Vec<u8>, SocketAddr)>>);
+
+    impl DatagramSender for FakeSender {
+        fn send_to(&self, bytes: &[u8], destination: SocketAddr) -> io::Result<usize> {
+            self.0.lock().unwrap().push((bytes.to_vec(), destination));
+            Ok(bytes.len())
+        }
+    }
+
+    #[test]
+    fn machine_cli_add_list_and_wake_use_the_fake_sender() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("barge-cli-machine-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let registry = Registry::open(&path).unwrap();
+        let sender = FakeSender::default();
+        let add = [
+            "add",
+            "--name",
+            "pc",
+            "--hostname",
+            "pc.local",
+            "--mac",
+            "00:11:22:33:44:ff",
+            "--broadcast",
+            "192.168.1.255",
+        ];
+        machine_with(
+            &add.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            true,
+            &registry,
+            &sender,
+        )
+        .unwrap();
+        let list = ["list"];
+        machine_with(
+            &list.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            true,
+            &registry,
+            &sender,
+        )
+        .unwrap();
+        let wake = ["wake", "pc"];
+        machine_with(
+            &wake.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            true,
+            &registry,
+            &sender,
+        )
+        .unwrap();
+        let sent = sender.0.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0.len(), 102);
+        assert_eq!(sent[0].1, "192.168.1.255:9".parse().unwrap());
+        assert_eq!(registry.list().unwrap().len(), 1);
+        drop(sent);
+        let _ = std::fs::remove_dir_all(path);
+    }
 
     #[test]
     fn sizes_parse_and_refuse() {
