@@ -226,3 +226,40 @@ fn item_outside_its_destination_volume_is_refused() {
         .plan_item_move(&other.join("item"), Class::Vms, "item")
         .is_err());
 }
+
+#[test]
+fn creates_missing_class_folder_for_item_move() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    f.register();
+    f.barge
+        .set_layout(
+            Class::Vms,
+            Placement {
+                volume: "Builds".into(),
+                path: "vms".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+    fs::create_dir(f.mount.join("guest")).unwrap();
+    let plan = f
+        .barge
+        .plan_item_move(&f.mount.join("guest"), Class::Vms, "")
+        .unwrap();
+    assert_eq!(
+        plan.create_directory.as_deref(),
+        Some(f.mount.join("vms").as_path())
+    );
+    assert!(!f.mount.join("vms").exists());
+    f.barge.apply_move(&plan, false).unwrap();
+    assert!(f.mount.join("vms/guest").exists());
+    assert_eq!(
+        fs::metadata(f.mount.join("vms"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}

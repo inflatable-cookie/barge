@@ -400,7 +400,7 @@ impl Bindings {
         records.push(record.clone());
         if let Err(error) = write(&self.core, &records) {
             if let Err(problem) = roll_back(&binding.link, &prior) {
-                return Err(Error::refused(format!(
+                return Err(Error::unknown_state(format!(
                     "{}; the prior state could not be restored: {problem}",
                     error.message()
                 )));
@@ -646,13 +646,15 @@ fn check_plan(binding: &Binding, plan: &LinkPlan, destination: &Path) -> Result<
 /// A failed undo names what went wrong and whether the applied link is back.
 fn failed_undo(error: Error, reapplied: Result<()>) -> Error {
     let mut message = error.message().to_string();
+    let mut kind = error.kind();
     if let Err(problem) = reapplied {
+        kind = ErrorKind::UnknownState;
         message.push_str(&format!(
             "; the applied link could not be restored: {}",
             problem.message()
         ));
     }
-    Error::new(error.kind(), message)
+    Error::new(kind, message)
 }
 
 /// What was at `link` before it is replaced, with the name a preserved entry is
@@ -1010,4 +1012,17 @@ pub(crate) fn validate_record(record: &BindingRecord) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod rollback_kind_tests {
+    use super::*;
+    #[test]
+    fn failed_reapply_reports_unknown_state() {
+        let error = failed_undo(
+            Error::refused("write refused"),
+            Err(Error::refused("restore refused")),
+        );
+        assert_eq!(error.kind(), ErrorKind::UnknownState);
+    }
 }

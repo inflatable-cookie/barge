@@ -216,7 +216,10 @@ fn measure_opened(path: &Path, device: DeviceFn<'_>) -> TreeSize {
     let mut measured = TreeSize::default();
     let directory = match open_directory(path) {
         Ok(directory) => directory,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return measured,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            measured.approximate = true;
+            return measured;
+        }
         Err(_) => {
             // Not a folder: a plain file is counted, anything else is unknown.
             match std::fs::symlink_metadata(path) {
@@ -263,7 +266,6 @@ fn measure_contents(
         let child = path.join(&name);
         let metadata = match stat_at(directory, &name) {
             Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
                 measured.approximate = true;
                 continue;
@@ -282,7 +284,6 @@ fn measure_contents(
         }
         let nested = match open_at(Some(directory), &name) {
             Ok(nested) => nested,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
                 measured.approximate = true;
                 continue;
