@@ -1,23 +1,42 @@
-mod storage;
 mod preferences;
+mod settings;
+mod storage;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::ManagerExt;
 
 #[tauri::command]
-fn preferences_get(store: tauri::State<'_, preferences::Store>) -> Result<preferences::Preferences, String> {
+fn preferences_get(
+    store: tauri::State<'_, preferences::Store>,
+) -> Result<preferences::Preferences, String> {
     store.get()
 }
 
 #[tauri::command]
-fn preferences_set(app: tauri::AppHandle, store: tauri::State<'_, preferences::Store>, preferences: preferences::Preferences) -> Result<(), String> {
+fn preferences_set(
+    app: tauri::AppHandle,
+    store: tauri::State<'_, preferences::Store>,
+    preferences: preferences::Preferences,
+) -> Result<(), String> {
     let old = store.get()?;
-    if old.launch_at_login != preferences.launch_at_login {
+    let changed_login = old.launch_at_login != preferences.launch_at_login;
+    if changed_login {
         let manager = app.autolaunch();
-        if preferences.launch_at_login { manager.enable() } else { manager.disable() }.map_err(|error| error.to_string())?;
+        if preferences.launch_at_login {
+            manager.enable()
+        } else {
+            manager.disable()
+        }
+        .map_err(|error| error.to_string())?;
     }
     if let Err(error) = store.set(preferences) {
-        if old.launch_at_login { let _ = app.autolaunch().enable(); } else { let _ = app.autolaunch().disable(); }
+        if changed_login {
+            if old.launch_at_login {
+                let _ = app.autolaunch().enable();
+            } else {
+                let _ = app.autolaunch().disable();
+            }
+        }
         return Err(error);
     }
     Ok(())
@@ -60,19 +79,30 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .setup(|app| {
-            let root = app.path().app_config_dir()?;
+            let root = std::env::var_os("BARGE_APP_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or(app.path().app_config_dir()?);
             let store = preferences::Store::open(&root).map_err(std::io::Error::other)?;
             app.manage(store);
+            let settings_store = preferences::Store::open(&root).map_err(std::io::Error::other)?;
+            let service = longhorn_tauri_settings::SettingsHandlerAssembly::new(settings_store);
+            app.manage(longhorn_tauri_settings::TauriSettingsState::new(
+                std::sync::Arc::new(service),
+            ));
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            let popover = WebviewWindowBuilder::new(app, "popover", WebviewUrl::App("index.html#popover".into()))
-                .title("Barge")
-                .inner_size(320.0, 300.0)
-                .decorations(false)
-                .resizable(false)
-                .visible(false)
-                .skip_taskbar(true)
-                .build()?;
+            let popover = WebviewWindowBuilder::new(
+                app,
+                "popover",
+                WebviewUrl::App("index.html#popover".into()),
+            )
+            .title("Barge")
+            .inner_size(320.0, 300.0)
+            .decorations(false)
+            .resizable(false)
+            .visible(false)
+            .skip_taskbar(true)
+            .build()?;
             let blur_window = popover.clone();
             popover.on_window_event(move |event| {
                 if matches!(event, tauri::WindowEvent::Focused(false)) {
@@ -92,9 +122,18 @@ fn main() {
                 .icon_as_template(true)
                 .tooltip("Barge")
                 .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click { position, button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        position,
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
                         if let Some(window) = tray.app_handle().get_webview_window("popover") {
-                            let _ = window.set_position(tauri::PhysicalPosition::new(position.x as i32 - 160, position.y as i32));
+                            let _ = window.set_position(tauri::PhysicalPosition::new(
+                                position.x as i32 - 160,
+                                position.y as i32,
+                            ));
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
@@ -106,12 +145,22 @@ fn main() {
         .on_window_event(|window, event| {
             #[cfg(target_os = "macos")]
             if window.label() == "main" && matches!(event, tauri::WindowEvent::Destroyed) {
-                let _ = window.app_handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
+                let _ = window
+                    .app_handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Accessory);
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (window, event);
         })
-        .invoke_handler(tauri::generate_handler![storage_volumes, open_main_window, quit_app, preferences_get, preferences_set])
+        .invoke_handler(tauri::generate_handler![
+            storage_volumes,
+            open_main_window,
+            quit_app,
+            preferences_get,
+            preferences_set,
+            longhorn_tauri_settings::longhorn_settings_registry,
+            longhorn_tauri_settings::longhorn_settings_load
+        ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| eprintln!("Barge failed: {error}"));
 }
