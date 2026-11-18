@@ -16,7 +16,7 @@ Answer: each resource class is placed on one registered volume, and different cl
 ## Q-003 — How does Barge change another tool's configuration?
 
 Status: answered 2026-10-26
-Answer: links first; a tool's own setting is written only during an explicit adopt, reported and undoable (Tom); see [architecture](architecture.md#later).
+Answer: links first; a tool's own setting is written only during an explicit adopt, reported and undoable (Tom); see [resources](resources.md#bindings) and its [adapters](resources.md#adapters).
 
 ## Q-004 — How does Oxide's existing state migrate?
 

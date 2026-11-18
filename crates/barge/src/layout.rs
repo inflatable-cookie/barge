@@ -11,6 +11,9 @@ use crate::{Absent, Barge, Core, Durability, Error, Result, VolumeState};
 const SCHEMA: &str = "barge.layout/1";
 
 /// The resource classes Barge can place.
+///
+/// Run evidence is not a class (Tom, 2026-11-18): a tool's run evidence is
+/// placed as scratch, `scratch/<tool>/…`, with the tool's own expiry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Class {
@@ -18,18 +21,16 @@ pub enum Class {
     Worktrees,
     Builds,
     Caches,
-    Evidence,
     Vms,
     Archives,
 }
 
 impl Class {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Scratch,
         Self::Worktrees,
         Self::Builds,
         Self::Caches,
-        Self::Evidence,
         Self::Vms,
         Self::Archives,
     ];
@@ -40,7 +41,6 @@ impl Class {
             Self::Worktrees => "worktrees",
             Self::Builds => "builds",
             Self::Caches => "caches",
-            Self::Evidence => "evidence",
             Self::Vms => "vms",
             Self::Archives => "archives",
         }
@@ -60,7 +60,13 @@ impl std::str::FromStr for Class {
         Self::ALL
             .into_iter()
             .find(|class| class.name() == value)
-            .ok_or_else(|| Error::usage(format!("unknown resource class {value:?}")))
+            .ok_or_else(|| match value {
+                // Retired 2026-11-18: run evidence is scratch, `scratch/<tool>/…`.
+                "evidence" => Error::usage(
+                    "resource class \"evidence\" was retired; run evidence is placed as scratch",
+                ),
+                other => Error::usage(format!("unknown resource class {other:?}")),
+            })
     }
 }
 
@@ -187,6 +193,29 @@ impl Barge {
             Some(record) => record != expected,
             None => !expected.classes.is_empty(),
         })
+    }
+
+    /// Present volumes whose layout record differs from the account copy.
+    pub fn layout_disagreements(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for volume in self.volumes()? {
+            if matches!(volume.state()?, crate::VolumeState::Present)
+                && self.layout_disagrees(volume.name())?
+            {
+                names.push(volume.name().to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Whether a volume offers a layout that this account has not imported.
+    pub fn has_unimported_volume_layout(&self, name: &str) -> Result<bool> {
+        Ok(self.volume_layout(name)?.is_some()
+            && self
+                .layout()?
+                .classes
+                .values()
+                .all(|placement| placement.volume != name))
     }
 
     /// Import an offered record only when this account has no placements for it.
@@ -431,6 +460,30 @@ mod tests {
         assert_eq!(
             read(&path).unwrap_err().kind(),
             crate::ErrorKind::UnknownState
+        );
+    }
+
+    #[test]
+    fn a_stored_evidence_class_is_refused_by_name() {
+        // Run evidence is scratch since 2026-11-18, so a stored layout that still
+        // names the retired class is refused and names it, never misread.
+        let tmp = crate::testing::TempDir::new("retired-class").unwrap();
+        let path = tmp.child("layout.json");
+        std::fs::write(&path, br#"{"schema":"barge.layout/1","classes":{"evidence":{"volume":"Builds","path":"evidence"}}}"#).unwrap();
+        let error = read(&path).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::UnknownState);
+        assert!(error.message().contains("evidence"), "{error}");
+    }
+
+    #[test]
+    fn the_retired_class_name_says_where_evidence_lives_now() {
+        let error = "evidence".parse::<Class>().unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Usage);
+        assert!(error.message().contains("scratch"), "{error}");
+        assert_eq!(
+            "scratch".parse::<Class>().unwrap(),
+            Class::Scratch,
+            "the live class names still parse"
         );
     }
 

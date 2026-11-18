@@ -8,10 +8,6 @@
 //! file, so a registry write and a storage write never interleave, and the two
 //! copies have to be changed together.
 #![deny(missing_docs)]
-#![cfg_attr(
-    not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -728,7 +724,7 @@ impl DatagramSender for UdpSender {
 }
 
 /// Send the magic packet for `machine` and report the address it went to.
-pub fn wake(machine: &Machine, sender: &impl DatagramSender) -> Result<SocketAddr> {
+pub fn wake(machine: &Machine, sender: &impl DatagramSender) -> Result<(SocketAddr, usize)> {
     let destination = SocketAddr::from((machine.broadcast, machine.port));
     let sent = sender
         .send_to(&magic_packet(parse_mac(&machine.mac)?), destination)
@@ -744,7 +740,7 @@ pub fn wake(machine: &Machine, sender: &impl DatagramSender) -> Result<SocketAdd
             format!("sent {sent} of 102 Wake-on-LAN bytes to {destination}"),
         ));
     }
-    Ok(destination)
+    Ok((destination, sent))
 }
 
 /// Write `bytes` to `path` through a temporary file in the same directory and an
@@ -909,7 +905,7 @@ mod tests {
         let sender = FakeSender::default();
         assert_eq!(
             wake(&machine, &sender).unwrap(),
-            SocketAddr::from(([192, 168, 1, 255], 9))
+            (SocketAddr::from(([192, 168, 1, 255], 9)), 102)
         );
         let sent = sender.0.lock().unwrap();
         assert_eq!(sent[0].0, packet);

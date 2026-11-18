@@ -2,6 +2,11 @@
 //! the verbs the brief lists. Every fixture is a temporary directory; the
 //! registered mount is a folder inside it, so nothing touches a real drive.
 
+// An integration test target is its own crate, and its fixture helpers are not
+// inside a `#[test]` function, where `clippy.toml` grants the exception. Tests
+// may unwrap, expect and panic; the shipped crates may not.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -12,6 +17,10 @@ use std::time::Duration;
 
 use barge::testing::TempDir;
 use serde_json::Value;
+
+/// The identity the test-only seam hook reports for every fixture mount
+/// (`BARGE_TEST_VOLUME_UUID`), so no test depends on the host's own volume.
+const TEST_UUID: &str = "11111111-2222-3333-4444-555555555555";
 
 struct Fixture {
     temp: TempDir,
@@ -27,10 +36,19 @@ impl Fixture {
         Self { temp, state, mount }
     }
 
-    fn run(&self, arguments: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_barge"))
+    /// The environment every run gets: the fixture's own state directory and the
+    /// fixed volume identity.
+    fn barge(&self, arguments: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_barge"));
+        command
             .args(arguments)
             .env("BARGE_STATE_DIR", &self.state)
+            .env("BARGE_TEST_VOLUME_UUID", TEST_UUID);
+        command
+    }
+
+    fn run(&self, arguments: &[&str]) -> Output {
+        self.barge(arguments)
             .output()
             .expect("run the barge binary")
     }
@@ -55,13 +73,56 @@ fn stderr(output: &Output) -> String {
 }
 
 fn parse_document(output: &Output) -> Value {
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
             "stdout is not JSON ({error}): {}{}",
             stdout(output),
             stderr(output)
         )
-    })
+    });
+    let schema = document["schema"].as_str().unwrap();
+    let fields: &[&str] = match schema {
+        "barge.status/1" => &["volumes"],
+        "barge.volume-registered/1" => &["volume", "state"],
+        "barge.volume-list/1" => &["volumes"],
+        "barge.volume/1" => &["volume", "state", "free_bytes"],
+        "barge.area-declared/1" => &["area"],
+        "barge.areas/1" => &["areas"],
+        "barge.roots/1" => &["area", "bytes_included", "roots", "stragglers"],
+        "barge.root-action/1" => &["area", "id", "action"],
+        "barge.root-evicted/1" => &["action", "eviction"],
+        "barge.prune/1" => &["prune"],
+        "barge.scratch/1" => &["area", "root"],
+        "barge.sweep/1" => &["sweep"],
+        "barge.layout-show/1" => &["layout", "disagreements"],
+        "barge.layout-updated/1" => &["layout"],
+        "barge.path/1" => &["path"],
+        "barge.survey/1" => &["volume", "items"],
+        "barge.binding-list/1" => &["bindings"],
+        "barge.bind-plan/1" => &["plan"],
+        "barge.binding/1" => &["action", "binding"],
+        "barge.doctor/1" => &["ok", "volumes", "bindings"],
+        "barge.machine/1" => &["machine"],
+        "barge.machine-list/1" => &["machines"],
+        "barge.machine-removed/1" => &["removed"],
+        "barge.machine-wake/1" => &["machine", "destination", "bytes_sent"],
+        "barge.machine-status/1" => &["machine", "state"],
+        "barge.machine-power/1" => &["machine", "action", "deadline_unix_ms"],
+        "barge.machine-cancel/1" => &["machine", "cancelled"],
+        _ => panic!("unexpected schema {schema}"),
+    };
+    let mut actual: Vec<_> = document["data"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    actual.sort_unstable();
+    let mut expected = fields.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected, "{schema}");
+    assert_eq!(document.as_object().unwrap().len(), 2);
+    document
 }
 
 fn register(fixture: &Fixture) -> Output {
@@ -89,8 +150,7 @@ fn the_cli_registers_reports_and_manages_roots() {
     assert_eq!(document["schema"], "barge.volume/1");
     assert_eq!(document["data"]["state"]["state"], "present");
     assert_eq!(
-        document["data"]["volume"]["uuid"].as_str().unwrap().len(),
-        36,
+        document["data"]["volume"]["uuid"], TEST_UUID,
         "the volume identity is read at the mount"
     );
 
@@ -112,12 +172,14 @@ fn the_cli_registers_reports_and_manages_roots() {
     ]);
     assert!(declared.status.success(), "{}", stderr(&declared));
     let document = parse_document(&declared);
-    assert_eq!(document["schema"], "barge.area/1");
+    assert_eq!(document["schema"], "barge.area-declared/1");
     assert_eq!(document["data"]["area"]["absent"]["kind"], "fallback");
 
     let areas = fixture.json(&["area", "list", "--volume", "Builds"]);
     assert!(areas.status.success(), "{}", stderr(&areas));
-    assert_eq!(parse_document(&areas)["data"]["areas"][0]["name"], "pool");
+    let document = parse_document(&areas);
+    assert_eq!(document["schema"], "barge.areas/1");
+    assert_eq!(document["data"]["areas"][0]["name"], "pool");
 
     let created = fixture.json(&[
         "scratch",
@@ -158,7 +220,7 @@ fn the_cli_registers_reports_and_manages_roots() {
     assert_eq!(document["data"]["bytes_included"], true);
     assert!(document["data"]["roots"][0]["bytes"].as_u64().unwrap() > 0);
 
-    let pinned = fixture.run(&[
+    let pinned = fixture.json(&[
         "root",
         "pin",
         "scratch/tests",
@@ -171,11 +233,15 @@ fn the_cli_registers_reports_and_manages_roots() {
     assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
     assert!(stderr(&refused).contains("pinned"), "{}", stderr(&refused));
 
-    let unpinned = fixture.run(&["root", "unpin", "scratch/tests", &id]);
+    assert_eq!(parse_document(&pinned)["schema"], "barge.root-action/1");
+    let unpinned = fixture.json(&["root", "unpin", "scratch/tests", &id]);
     assert!(unpinned.status.success(), "{}", stderr(&unpinned));
+    assert_eq!(parse_document(&unpinned)["schema"], "barge.root-action/1");
     let evicted = fixture.json(&["root", "evict", "scratch/tests", &id]);
     assert!(evicted.status.success(), "{}", stderr(&evicted));
-    assert_eq!(parse_document(&evicted)["data"]["action"], "evicted");
+    let document = parse_document(&evicted);
+    assert_eq!(document["schema"], "barge.root-evicted/1");
+    assert_eq!(document["data"]["action"], "evicted");
     assert!(!path.exists());
 
     let pruned = fixture.json(&["prune", "--volume", "Builds", "--dry-run"]);
@@ -212,12 +278,7 @@ fn the_cli_maps_refusals_and_usage_to_their_exit_codes() {
         "00000000-0000-0000-0000-000000000000",
     ]);
     assert_eq!(duplicate.status.code(), Some(1), "{}", stderr(&duplicate));
-    assert!(
-        stderr(&duplicate).contains("not the declared")
-            || stderr(&duplicate).contains("already registered"),
-        "{}",
-        stderr(&duplicate)
-    );
+    assert_eq!(stderr(&duplicate), format!("barge: volume at {} is {TEST_UUID}, not the declared 00000000-0000-0000-0000-000000000000\n", fixture.mount()));
 
     let missing = fixture.json(&["volume", "status", "Missing"]);
     assert_eq!(missing.status.code(), Some(1));
@@ -383,9 +444,8 @@ fn register_machine(fixture: &Fixture, daemon_port: u16) {
 }
 
 fn run_with_stdin(fixture: &Fixture, arguments: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_barge"))
-        .args(arguments)
-        .env("BARGE_STATE_DIR", &fixture.state)
+    let mut child = fixture
+        .barge(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -471,7 +531,8 @@ fn machine_sleep_sends_at_once_and_status_reports_what_the_daemon_said() {
     ]);
     register_machine(&fixture, port);
 
-    let sleep = fixture.run(&["machine", "sleep", "pc"]);
+    let sleep = fixture.json(&["machine", "sleep", "pc"]);
+    assert_eq!(parse_document(&sleep)["schema"], "barge.machine-power/1");
     assert_eq!(sleep.status.code(), Some(0), "{}", stderr(&sleep));
     assert!(
         requests.lock().unwrap()[0].contains(r#""action":"sleep","delay_s":15"#),
@@ -596,9 +657,10 @@ fn a_machine_the_registry_cannot_validate_is_an_internal_error() {
 fn bindings_record_drift_and_doctor_report_it() {
     let fixture = Fixture::new();
     assert!(register(&fixture).status.success());
-    let set = fixture.run(&[
+    let set = fixture.json(&[
         "layout", "set", "caches", "--volume", "Builds", "--path", "caches",
     ]);
+    assert_eq!(parse_document(&set)["schema"], "barge.layout-updated/1");
     assert!(set.status.success(), "{}", stderr(&set));
     let destination = fixture.mount.join("caches/cargo/registry");
     std::fs::create_dir_all(&destination).unwrap();
@@ -675,7 +737,7 @@ fn bindings_record_drift_and_doctor_report_it() {
     let list = fixture.json(&["bind", "list"]);
     assert!(list.status.success(), "{}", stderr(&list));
     let document = parse_document(&list);
-    assert_eq!(document["schema"], "barge.bindings/1");
+    assert_eq!(document["schema"], "barge.binding-list/1");
     assert_eq!(
         document["data"]["bindings"][0]["consumer"],
         "cargo-registry"
@@ -719,6 +781,150 @@ fn bindings_record_drift_and_doctor_report_it() {
     assert_eq!(parse_document(&undone)["data"]["action"], "undone");
     assert!(std::fs::symlink_metadata(&link).is_err());
 
+    std::os::unix::fs::symlink(&destination, &link).unwrap();
+    let adopted = fixture.json(&[
+        "bind",
+        "adopt",
+        "--consumer",
+        "cargo-registry",
+        "--class",
+        "caches",
+        "--link",
+        link_text,
+        "--to",
+        destination_text,
+    ]);
+    assert!(adopted.status.success(), "{}", stderr(&adopted));
+    let adopted = parse_document(&adopted);
+    assert_eq!(adopted["schema"], "barge.binding/1");
+    assert_eq!(adopted["data"]["action"], "adopted");
+
     let doctor = fixture.json(&["doctor"]);
     assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
+}
+
+#[test]
+fn remaining_json_contracts_and_read_only_commands() {
+    let fixture = Fixture::new();
+    let registration = fixture.json(&[
+        "volume",
+        "register",
+        "--name",
+        "Builds",
+        "--mount",
+        fixture.mount(),
+    ]);
+    assert!(registration.status.success(), "{}", stderr(&registration));
+    assert_eq!(
+        parse_document(&registration)["schema"],
+        "barge.volume-registered/1"
+    );
+    let list = fixture.json(&["volume", "list"]);
+    assert_eq!(parse_document(&list)["schema"], "barge.volume-list/1");
+    let set = fixture.json(&[
+        "layout", "set", "caches", "--volume", "Builds", "--path", "caches",
+    ]);
+    assert!(set.status.success(), "{}", stderr(&set));
+    assert_eq!(parse_document(&set)["schema"], "barge.layout-updated/1");
+    let show = fixture.json(&["layout", "show"]);
+    assert_eq!(parse_document(&show)["schema"], "barge.layout-show/1");
+    let path = fixture.json(&["path", "caches"]);
+    assert!(path.status.success(), "{}", stderr(&path));
+    assert_eq!(parse_document(&path)["schema"], "barge.path/1");
+    let survey = fixture.json(&["survey", "Builds", "--no-bytes"]);
+    assert!(survey.status.success(), "{}", stderr(&survey));
+    assert_eq!(parse_document(&survey)["schema"], "barge.survey/1");
+    let scratch = fixture.run(&[
+        "layout", "set", "scratch", "--volume", "Builds", "--path", "scratch",
+    ]);
+    assert!(scratch.status.success(), "{}", stderr(&scratch));
+    let env = fixture.run(&["env", "--shell", "bash"]);
+    assert_eq!(env.status.code(), Some(0), "{}", stderr(&env));
+    assert!(stdout(&env).contains("BARGE_SCRATCH="));
+
+    let add = fixture.json(&[
+        "machine",
+        "add",
+        "--name",
+        "pc",
+        "--hostname",
+        "localhost",
+        "--mac",
+        "00:11:22:33:44:ff",
+        "--broadcast",
+        "127.0.0.1",
+    ]);
+    assert!(add.status.success(), "{}", stderr(&add));
+    assert_eq!(parse_document(&add)["schema"], "barge.machine/1");
+    assert_eq!(
+        parse_document(&fixture.json(&["machine", "list"]))["schema"],
+        "barge.machine-list/1"
+    );
+    let wake = fixture.json(&["machine", "wake", "pc"]);
+    assert!(wake.status.success(), "{}", stderr(&wake));
+    let wake = parse_document(&wake);
+    assert_eq!(wake["schema"], "barge.machine-wake/1");
+    assert_eq!(wake["data"]["bytes_sent"], 102);
+    assert_eq!(
+        parse_document(&fixture.json(&["machine", "remove", "pc"]))["schema"],
+        "barge.machine-removed/1"
+    );
+}
+
+#[test]
+fn usage_and_passive_commands_do_not_create_state() {
+    let fixture = Fixture::new();
+    let missing = fixture.temp.child("missing-state");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_barge"))
+            .args(args)
+            .env("BARGE_STATE_DIR", &missing)
+            .env("BARGE_TEST_VOLUME_UUID", TEST_UUID)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec!["volume", "bogus"],
+        vec!["root", "bogus"],
+        vec!["scratch", "bogus"],
+        vec!["machine", "bogus"],
+        vec!["layout", "bogus"],
+        vec!["area", "bogus"],
+        vec!["bind", "bogus"],
+    ] {
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+        assert!(!missing.exists(), "{args:?} created state");
+    }
+    for args in [
+        vec!["status"],
+        vec!["volume", "list"],
+        vec!["volume", "status", "missing"],
+        vec!["root", "list", "missing/area"],
+        vec!["layout", "show"],
+        vec!["path", "caches"],
+        vec!["env"],
+        vec!["survey", "missing"],
+        vec!["doctor"],
+    ] {
+        let _ = run(&args);
+        assert!(!missing.exists(), "{args:?} created state");
+    }
+    let help = run(&["help"]);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(stdout(&help).contains("usage: barge"));
+    let unknown = run(&["status", "--wat"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    assert_eq!(stderr(&unknown), "barge: unknown option --wat\n");
+    let extra = run(&["volume", "status", "one", "two"]);
+    assert_eq!(extra.status.code(), Some(2));
+    assert_eq!(
+        stderr(&extra),
+        "barge: volume status takes one <volume name>\n"
+    );
+    let value = run(&["path", "caches", "--project", "--json"]);
+    assert_eq!(value.status.code(), Some(2));
+    assert_eq!(stderr(&value), "barge: project \"--json\" must be 1-64 characters of lowercase letters, digits, '-', '_' or '.'\n");
+    let misplaced = run(&["status", "--json"]);
+    assert_eq!(stderr(&misplaced), "barge: unknown option --json\n");
 }

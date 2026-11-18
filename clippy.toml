@@ -1,0 +1,7 @@
+# Test code may unwrap, expect and panic; the shipped crates may not. The
+# workspace's `[workspace.lints.clippy]` denies those three lints everywhere,
+# and these options are clippy's test exception: they apply only inside test
+# functions and test targets.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

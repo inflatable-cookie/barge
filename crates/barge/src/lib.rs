@@ -11,10 +11,6 @@
 //! `docs/knowledge/architecture.md` is the design this crate implements.
 
 #![deny(unsafe_code)]
-#![cfg_attr(
-    not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
-)]
 
 pub mod area;
 pub mod area_spec;
@@ -222,6 +218,29 @@ impl Barge {
             areas.push(self.area_from_record(record)?);
         }
         Ok(areas)
+    }
+
+    /// Find a declared area by its namespace/name key.
+    pub fn find_area(&self, key: &str) -> Result<Area> {
+        let key = area::AreaKey::parse(key)?;
+        self.areas()?
+            .into_iter()
+            .find(|area| area.key() == key)
+            .ok_or_else(|| {
+                Error::not_found(format!(
+                    "area {} is not declared; declare it with `barge area declare`",
+                    key.label()
+                ))
+            })
+    }
+
+    /// Status of declared areas, optionally limited to a volume.
+    pub fn area_statuses(&self, volume: Option<&str>) -> Result<Vec<AreaStatus>> {
+        self.areas()?
+            .into_iter()
+            .filter(|area| volume.is_none_or(|name| area.record().volume == name))
+            .map(|area| area.status())
+            .collect()
     }
 
     /// Free space, reserve and floor for a volume.

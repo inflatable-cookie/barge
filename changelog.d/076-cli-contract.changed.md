@@ -1,0 +1,1 @@
+Split the CLI into command modules and clarify its JSON contract. Renamed CLI schemas: `barge.machine-removed/1`, `barge.machine-list/1`, `barge.root-action/1`, `barge.root-evicted/1`, `barge.volume-registered/1`, `barge.volume-list/1`, `barge.layout-updated/1`, `barge.binding-list/1`, and `barge.area-declared/1`.

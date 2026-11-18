@@ -82,6 +82,7 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 ## Layout on a volume
 
 ```
+<mount>/.barge/layout.json      the classes this volume holds (resources.md)
 <mount>/<root_dir>/
   <namespace>/<area>/          one declared area
     <label>-<id>/              a Barge-created root, with .barge-root.json
@@ -96,8 +97,11 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 
 Account state lives in `~/Library/Application Support/barge/` on macOS
 (`$XDG_STATE_HOME/barge/` on Linux; `BARGE_STATE_DIR` overrides both):
-`volumes.json`, `areas/<namespace>.<area>.json`, `layout.json` and
-`bindings.json`. Writes take the state lock and publish by atomic rename.
+`volumes.json`, `areas/<namespace>.<area>.json`, `layout.json`, `bindings.json`
+and `machines.json` ([machines](machines.md#registry-state)). Writes take the
+one `lock` file there and publish by atomic rename. The account layout is the
+authority for class placement; each volume also carries `<mount>/.barge/layout.json`,
+which lists the classes that volume holds ([resources](resources.md#layout)).
 
 Today's Stash layout (`scratch/`, `caches/`, `oxide-pool/`, `oxide-outputs/`
 at the drive root) is expressed as `root_dir = ""` with Oxide's two areas
@@ -138,7 +142,7 @@ bindings.undo("cargo-registry")?;                 // restore the prior state
 
 let area = barge.area(
     AreaSpec::new("oxide", "pool", "Builds")
-        .absent(Absent::Fallback(path))           // or Absent::Fail (the default)
+        .absent(Absent::Fallback { path })      // or Absent::Fail (the default)
         .soft_cap_bytes(Some(200 << 30))
         .counts_toward_reserve(true),
 )?;
@@ -225,14 +229,27 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 
 ## CLI
 
-`barge` wraps the library: `volume register|list|status`, `area list`,
-`root list [--bytes]|pin|unpin|evict`, `prune [--dry-run]`, `scratch new|sweep`,
-`status`, `layout show|set`, `path`, `env`, `survey`,
-`bind list|plan|apply|adopt|undo`, `move --plan|--apply`, `doctor`. `--json` prints one
-document with a top-level `schema` field
+`barge` wraps the library. Every current verb:
+
+- `volume register [--import-layout] | volume list | volume status <name>`;
+- `area declare | area list [--volume v]`;
+- `root list [--bytes] | root pin | root unpin | root evict`;
+- `prune --volume v [--dry-run]`;
+- `scratch new | scratch sweep`;
+- `status`;
+- `layout show | layout set`;
+- `path <class> [--project p]`; `env [--shell zsh|bash|fish]`;
+- `survey <volume> [--no-bytes]`;
+- `bind list | plan | apply | adopt | undo`;
+- `move --plan | --apply`;
+- `doctor`;
+- `machine add | list | remove | wake | status | sleep | restart | shutdown | cancel`
+  ([machines](machines.md)).
+
+`--json` prints one document with a top-level `schema` field
 (`barge.<kind>/<n>`); consumers check it and refuse unknown versions. `env`
-refuses `--json` because its output is shell code. Exit
-codes: 0 success, 1 refused (nothing changed), 2 usage error, 3 internal error.
+refuses `--json` because its output is shell code. Exit codes: 0 success, 1
+refused or not found (nothing changed), 2 usage error, 3 internal error.
 `doctor` exits 1 when its read-only report is not ok.
 
 ## Platforms
