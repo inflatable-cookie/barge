@@ -86,7 +86,7 @@ Account state lives in `~/Library/Application Support/barge/` on macOS
 `volumes.json` and `areas/<namespace>.<area>.json`. Writes take the state lock
 and publish by atomic rename.
 
-Today's Builds layout (`scratch/`, `caches/`, `oxide-pool/`, `oxide-outputs/`
+Today's Stash layout (`scratch/`, `caches/`, `oxide-pool/`, `oxide-outputs/`
 at the drive root) is expressed as `root_dir = ""` with Oxide's two areas
 overridden to their existing folder names, so adoption moves nothing.
 
@@ -208,7 +208,7 @@ identity. Required cases:
 
 There are no native proof ladders or capture harnesses. Before Oxide adopts a
 new Barge revision, run `barge volume status` and a `prune --dry-run` against
-the real Builds drive by hand.
+the real Stash drive by hand.
 
 ## Boundary with Oxide
 
@@ -221,8 +221,10 @@ path keeps the hold descriptor inherited.
 
 ## Later
 
-- **Cache and kept placements:** an owned link at a tool's existing path,
-  recorded and undoable; a tool's own setting written only on an explicit
-  adopt (Q-003). Kept placements live outside every area and are never pruned.
-- **VM mounts** such as Colima profiles (Q-009).
-- **Resources beyond local storage**: see [vision](vision.md#direction).
+Designed separately, not yet built:
+
+- **Resource classes, layout, bindings, cache and kept placements, doctor and
+  moves:** [resources](resources.md).
+- **Worktree pools:** areas of git worktrees leased through holds; see
+  [vision](vision.md#direction).
+- **Machine control:** [machines](machines.md).
