@@ -1,0 +1,1 @@
+Add `barge init [--project P] [--path DIR] [--check]`, which writes the managed scratch workflow block into a repository's `AGENTS.md` from the layout, replaces only the text between its markers, reports a stale block read-only with a diff, and records the block as a `workflow` binding so `barge doctor` reports it as ok, stale or missing. `bind undo` refuses a workflow binding.

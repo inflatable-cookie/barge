@@ -206,7 +206,12 @@ impl Barge {
         }
         let mut bindings = Vec::new();
         for record in self.bindings().list()? {
-            let link = record.link_path();
+            // A workflow binding is not a link, and a move does not regenerate
+            // its block: doctor reports the block stale until `barge init` runs.
+            let BindingTarget::Link { path } = &record.target else {
+                continue;
+            };
+            let link = path.as_path();
             let link_parent = link
                 .parent()
                 .ok_or_else(|| Error::usage("link has no parent"))?;
@@ -466,10 +471,10 @@ impl Barge {
             }
             for binding in changed.iter().rev() {
                 if let Observed::Link { destination } = &binding.before {
-                    if let Err(e) = replace_link(binding.record.link_path(), destination) {
+                    if let Err(e) = replace_link(&binding.record.owned_path(), destination) {
                         failures.push(format!(
                             "link {} could not be restored: {e}",
-                            binding.record.link_path().display()
+                            binding.record.owned_path().display()
                         ));
                     }
                 }

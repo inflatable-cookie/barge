@@ -199,7 +199,7 @@ fn moves_a_binding_link_inside_the_source() {
             .get("nested")
             .unwrap()
             .unwrap()
-            .link_path(),
+            .owned_path(),
         f.mount.join("machines/link")
     );
 }

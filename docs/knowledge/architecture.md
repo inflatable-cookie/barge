@@ -128,6 +128,8 @@ let layout = barge.layout()?;                     // account resource placements
 let scratch = barge.resource_path(Class::Scratch, Some("project"))?;
 let survey = barge.survey("Builds", true)?;       // read-only inventory
 let report = barge.doctor()?;                     // read-only drift report
+let block = barge.workflow("project")?;           // the managed AGENTS.md block
+let init = barge.init(repo, None)?;               // insert or replace it, and record it
 let vol = barge.volume("Builds")?;
 vol.state()?;                                     // Present | Absent | Mismatch
 
@@ -241,6 +243,9 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 - `path <class> [--project p]`; `env [--shell zsh|bash|fish]`;
 - `survey <volume> [--no-bytes]`;
 - `bind list | plan | apply | adopt | undo`;
+- `init [--project p] [--path dir] [--check]`, which writes or reports the
+  managed `AGENTS.md` workflow block from the layout
+  ([resources](resources.md#reaching-tools-and-agents-without-coupling));
 - `move --plan | --apply`;
 - `doctor`;
 - `machine add | list | remove | wake | status | sleep | restart | shutdown | cancel`
@@ -250,7 +255,8 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 (`barge.<kind>/<n>`); consumers check it and refuse unknown versions. `env`
 refuses `--json` because its output is shell code. Exit codes: 0 success, 1
 refused or not found (nothing changed), 2 usage error, 3 internal error.
-`doctor` exits 1 when its read-only report is not ok.
+`doctor` exits 1 when its read-only report is not ok; `init --check` exits 1 when
+the block is stale or missing.
 
 ## Platforms
 
@@ -278,8 +284,11 @@ identity. Required cases:
 - plan, apply, adopt and undo of a link on temporary paths, including a target
   that changed after the plan, a preserved directory, and deletion that never
   follows a symlink;
-- doctor reports ok, drifted, missing and unavailable, and writes nothing on a
-  read-only account.
+- doctor reports ok, drifted, stale, missing and unavailable, and writes nothing
+  on a read-only account;
+- `init` inserts, replaces and leaves a workflow block alone, keeps the bytes
+  around it, refuses unbalanced markers, and renders while the volume is away;
+  `--check` and doctor write nothing.
 
 There are no native proof ladders or capture harnesses. Before Oxide adopts a
 new Barge revision, run `barge volume status` and a `prune --dry-run` against
@@ -298,8 +307,9 @@ path keeps the hold descriptor inherited.
 
 Designed separately, not yet built:
 
-- **Setting and workflow bindings, cache and kept placements:**
-  [resources](resources.md). Link bindings and `doctor` are built.
+- **Setting bindings, cache and kept placements:**
+  [resources](resources.md). Link and workflow bindings, `init` and `doctor`
+  are built.
 - **Worktree pools:** areas of git worktrees leased through holds; see
   [vision](vision.md#direction).
 - **Machine control:** [machines](machines.md).

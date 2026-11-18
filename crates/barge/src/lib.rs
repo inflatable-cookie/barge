@@ -30,6 +30,7 @@ pub mod state;
 pub mod testing;
 mod trash;
 pub mod volume;
+pub mod workflow;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,6 +60,7 @@ pub use space::{
 pub use volume::{
     Availability, Durability, Volume, VolumeRegistration, VolumeSpec, VolumeState, VolumeStatus,
 };
+pub use workflow::{BlockState, InitAction, InitCheck, InitReport, WorkflowBlock};
 
 /// The shared interior of [`Barge`], [`area::Area`] and [`scratch::Scratch`].
 #[derive(Debug, Clone)]
