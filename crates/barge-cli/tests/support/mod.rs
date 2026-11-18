@@ -197,6 +197,8 @@ pub fn register_machine(fixture: &Fixture, daemon_port: u16) {
         "00:11:22:33:44:ff",
         "--daemon-port",
         &daemon_port.to_string(),
+        "--broadcast",
+        "127.0.0.1",
     ]);
     assert!(output.status.success(), "{}", stderr(&output));
 }

@@ -209,10 +209,7 @@ impl Registry {
                 "key must be 64 lowercase hexadecimal characters",
             ));
         }
-        let path = self
-            .state_dir
-            .join("machine-keys")
-            .join(format!("{name}.key"));
+        let path = self.key_path(name);
         auth::write_key(&path, key.trim())
             .map_err(|e| io_error("cannot write machine key", &path, &e))
     }
@@ -221,20 +218,20 @@ impl Registry {
     pub fn unpair(&self, name: &str) -> Result<()> {
         let _lock = StateLock::acquire(&self.state_dir)?;
         self.get(name)?;
-        let path = self
-            .state_dir
-            .join("machine-keys")
-            .join(format!("{name}.key"));
-        fs::remove_file(&path).map_err(|e| io_error("cannot remove machine key", &path, &e))
+        let path = self.key_path(name);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(Error::not_found(format!("machine {name:?} is not paired")))
+            }
+            Err(e) => Err(io_error("cannot remove machine key", &path, &e)),
+        }
     }
 
     /// Read a machine's LAN key, if paired.
     pub fn key(&self, name: &str) -> Result<Option<Vec<u8>>> {
         self.get(name)?;
-        let path = self
-            .state_dir
-            .join("machine-keys")
-            .join(format!("{name}.key"));
+        let path = self.key_path(name);
         match fs::read_to_string(&path) {
             Ok(value) => auth::decode(value.trim(), 32)
                 .map(Some)
@@ -279,10 +276,7 @@ impl Registry {
             .iter()
             .position(|entry| entry.name == name)
             .ok_or_else(|| Error::not_found(format!("machine {name:?} is not registered")))?;
-        let key_path = self
-            .state_dir
-            .join("machine-keys")
-            .join(format!("{name}.key"));
+        let key_path = self.key_path(name);
         match fs::remove_file(&key_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -299,6 +293,12 @@ impl Registry {
             .into_iter()
             .find(|entry| entry.name == name)
             .ok_or_else(|| Error::not_found(format!("machine {name:?} is not registered")))
+    }
+
+    fn key_path(&self, name: &str) -> PathBuf {
+        self.state_dir
+            .join("machine-keys")
+            .join(format!("{name}.key"))
     }
 
     fn read(&self) -> Result<Vec<Machine>> {
@@ -400,6 +400,24 @@ fn valid_name(name: &str) -> bool {
 mod discovery_tests {
     use super::*;
     use barge::testing::TempDir;
+
+    #[test]
+    fn unpaired_machine_and_bad_key_are_reported() {
+        let temp = TempDir::new("machine-pair").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+        registry
+            .add(Machine::new("pc", "localhost", "00:11:22:33:44:ff").unwrap())
+            .unwrap();
+        assert_eq!(
+            registry.unpair("pc").unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            registry.pair("pc", "bad").unwrap_err().kind(),
+            ErrorKind::Usage
+        );
+        assert!(registry.key("pc").unwrap().is_none());
+    }
 
     #[test]
     fn storage_and_machine_discovery_share_state_and_lock() {

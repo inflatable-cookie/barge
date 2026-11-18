@@ -15,6 +15,7 @@ barge-machine = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 httparse = "1"
+libc.workspace = true
 
 # logind over D-Bus, Linux only (see the workspace manifest).
 [target.'cfg(target_os = "linux")'.dependencies]

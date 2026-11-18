@@ -85,7 +85,7 @@ below read `_name`, `_key` and `_state`.
 ## Error documents
 
 A failing command writes `{"schema": "barge.error/1", "error": {"kind": "...",
-"message": "..."}}` to **stderr**, in both modes, and nothing to stdout. `kind`
+"message": "..."}}` to **stderr** in `--json` mode, and nothing to stdout. Human mode prints a plain error to stderr. `kind`
 is one of `refused`, `not_found`, `usage`, `io`, `unknown_state`. Exit codes:
 0 success, 1 refused or not found (nothing changed), 2 usage error, 3 internal
 error. `--json` precedes the command and selects the document form. `env` emits
@@ -136,3 +136,5 @@ shell assignments and refuses `--json`.
 | `machine` | `name: string`, `hostname: string`, `tailscale_name: string?`, `mac: string`, `broadcast: string`, `port: int`, `daemon_port: int` |
 | `machine-state` | `schema: string`, `power: string`, `observed_at_unix_ms: int`, `pending?: pending` |
 | `pending` | `action: string`, `deadline_unix_ms: int` |
+
+`doctor` and `init --check` can exit 1 while emitting their success document when they detect drift.

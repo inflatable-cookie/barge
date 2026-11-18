@@ -370,15 +370,8 @@ fn an_absent_daemon_is_unreachable_and_never_read_as_asleep() {
 fn lan_pairing_and_authenticated_requests() {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let dir = std::env::temp_dir().join(format!(
-        "barged-lan-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&dir).unwrap();
+    let temp = barge::testing::TempDir::new("barged-lan").unwrap();
+    let dir = temp.path();
     let key_path = dir.join("lan.key");
     let config_path = dir.join("config.json");
     std::fs::write(
@@ -458,6 +451,17 @@ fn lan_pairing_and_authenticated_requests() {
     assert!(raw(&valid).contains(" 200 "));
     assert!(raw(&valid).contains(" 401 "));
     assert!(raw(&request(
+        now + 61,
+        "33332233445566778899aabbccddeeff",
+        body,
+        body
+    ))
+    .contains(" 401 "));
+    assert!(raw(&request(now, "bad-nonce", body, body)).contains(" 401 "));
+    let signed = request(now, "44442233445566778899aabbccddeeff", body, body);
+    assert!(raw(&signed.replacen("/v1/power/cancel", "/v1/power", 1)).contains(" 401 "));
+    assert!(raw(&signed.replacen("POST", "GET", 1)).contains(" 401 "));
+    assert!(raw(&request(
         now - 61,
         "11112233445566778899aabbccddeeff",
         body,
@@ -485,7 +489,6 @@ fn lan_pairing_and_authenticated_requests() {
         .is_ok());
     running.store(false, Ordering::SeqCst);
     thread.join().unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -500,11 +503,16 @@ fn oversized_body_is_rejected() {
 #[test]
 fn stalled_body_times_out_and_the_next_client_is_served() {
     let harness = Harness::new();
+    // A completed request confirms the serving thread is running before the
+    // stalled connection and its successor are queued in that order.
+    assert_eq!(harness.state().power, PowerState::Awake);
     let mut slow = TcpStream::connect(harness.address).unwrap();
-    slow.write_all(b"POST /v1/power HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n{")
+    slow.write_all(b"POST /v1/power HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
     let start = std::time::Instant::now();
     assert_eq!(harness.state().power, PowerState::Awake);
-    assert!(start.elapsed() < std::time::Duration::from_secs(8));
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    let mut response = String::new();
+    slow.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
 }

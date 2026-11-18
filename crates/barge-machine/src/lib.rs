@@ -13,6 +13,9 @@ pub use protocol::{
     PowerState, State,
 };
 pub use registry::{Machine, Registry};
+#[cfg(not(unix))]
+compile_error!("barge-machine requires Unix");
+
 use std::net::Ipv4Addr;
 pub use wol::{magic_packet, parse_mac, wake, DatagramSender, UdpSender};
 

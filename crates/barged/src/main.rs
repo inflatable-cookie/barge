@@ -6,12 +6,18 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use barged::{Config, Daemon, PowerController, Result, SystemClock};
 
 /// Where a system install puts the config; `--config` overrides it.
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+extern "C" fn stop_on_signal(_: libc::c_int) {
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
 const DEFAULT_CONFIG: &str = "/etc/barged/config.json";
 
 fn main() -> ExitCode {
@@ -40,12 +46,12 @@ fn run(arguments: &[String]) -> Result<()> {
                 config_path = PathBuf::from(path);
             }
             "--help" | "-h" => {
-                println!("usage: barged [--config PATH]\n\ndefault: {DEFAULT_CONFIG}");
+                println!("usage: barged [pair] [--config PATH]\n\ndefault: {DEFAULT_CONFIG}");
                 return Ok(());
             }
             other => {
                 return Err(barged::Error::new(format!(
-                    "unknown argument {other:?}; usage: barged [--config PATH]"
+                    "unknown argument {other:?}; usage: barged [pair] [--config PATH]"
                 )))
             }
         }
@@ -89,13 +95,28 @@ fn run(arguments: &[String]) -> Result<()> {
     let countdown = controller.start().map_err(|error| {
         barged::Error::new(format!("cannot start the countdown thread: {error}"))
     })?;
-    eprintln!(
-        "barged: listening on {} for {} allowlisted node(s)",
-        daemon.listen(),
-        config.allowed_nodes.len()
-    );
-    let running = AtomicBool::new(true);
-    let outcome = daemon.serve(server, &running);
+    if config.mode == barged::AuthMode::Lan {
+        eprintln!("barged: listening on {} in LAN mode", daemon.listen());
+    } else {
+        eprintln!(
+            "barged: listening on {} for {} allowlisted node(s)",
+            daemon.listen(),
+            config.allowed_nodes.len()
+        );
+    }
+    // SAFETY: the handler only stores to a lock-free atomic flag.
+    if unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            stop_on_signal as *const () as libc::sighandler_t,
+        )
+    } == libc::SIG_ERR
+    {
+        controller.stop();
+        let _ = countdown.join();
+        return Err(barged::Error::new("cannot install SIGTERM handler"));
+    }
+    let outcome = daemon.serve(server, &RUNNING);
     controller.stop();
     if countdown.join().is_err() {
         eprintln!("barged: the countdown thread panicked");
