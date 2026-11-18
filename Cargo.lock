@@ -16,6 +16,16 @@ name = "barge-cli"
 version = "0.1.0"
 dependencies = [
  "barge",
+ "barge-machine",
+ "serde_json",
+]
+
+[[package]]
+name = "barge-machine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
  "serde_json",
 ]
 
