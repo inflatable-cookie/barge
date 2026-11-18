@@ -36,7 +36,7 @@ fn machine_dispatch(
     sender: &impl DatagramSender,
 ) -> Result<()> {
     let Some(command) = arguments.first().map(String::as_str) else {
-        return Err(Error::usage("machine needs add, list, remove or wake"));
+        return Err(Error::usage("machine needs add, list, remove, wake, pair, unpair, status, sleep, restart, shutdown or cancel"));
     };
     let rest = &arguments[1..];
     match command {
@@ -200,21 +200,18 @@ fn machine_dispatch(
         }
         "sleep" => machine_power(
             PowerActionKind::Sleep,
-            "sleep",
             rest,
             json,
             discover,
         ),
         "restart" => machine_power(
             PowerActionKind::Restart,
-            "restart",
             rest,
             json,
             discover,
         ),
         "shutdown" => machine_power(
             PowerActionKind::Shutdown,
-            "shutdown",
             rest,
             json,
             discover,
@@ -243,7 +240,7 @@ fn machine_dispatch(
             Ok(())
         }
         other => Err(Error::usage(format!(
-            "unknown machine command {other:?}; use add, list, remove, wake, status, sleep, restart, shutdown or cancel"
+            "unknown machine command {other:?}; use add, list, remove, wake, pair, unpair, status, sleep, restart, shutdown or cancel"
         ))),
     }
 }
@@ -262,13 +259,12 @@ fn machine_client(registry: &Registry, machine: &Machine) -> Result<(DaemonClien
 /// `--yes` was given (docs/knowledge/machines.md, "Behaviour").
 pub(crate) fn machine_power(
     action: PowerActionKind,
-    command: &str,
     arguments: &[String],
     json: bool,
     discover: &impl Fn() -> Result<Registry>,
 ) -> Result<()> {
     let options = Options::parse(arguments, &["delay"], &["yes"])?;
-    let name = options.single(&format!("machine {command}"), "name")?;
+    let name = options.single(&format!("machine {}", action.as_str()), "name")?;
     let delay = match options.get("delay") {
         Some(value) => value
             .parse::<u32>()

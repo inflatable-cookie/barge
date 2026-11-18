@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use barge_machine::{
     Cancel, CancelResult, DaemonError, PowerRequest, PowerResult, PowerState, State, CANCEL_SCHEMA,
@@ -24,7 +24,7 @@ use crate::{Allowlist, Clock, Config, Error, PeerLookup, PeerNode, PowerControll
 const MAX_BODY: u64 = 16 * 1024;
 /// How long a blocked accept waits before the stop flag is checked again.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HEADERS: usize = 16 * 1024;
 
 /// One daemon: state, power and the allowlist that gates both.
@@ -129,7 +129,10 @@ impl Daemon {
                 .as_ref()
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .and_then(|s| barge_machine::auth::decode(s.trim(), 32))
-                .ok_or_else(|| (401, failure("not_authorized", "authentication failed")))?;
+                .ok_or_else(|| {
+                    eprintln!("barged: cannot read or decode LAN key");
+                    (500, failure("internal", "cannot read or decode LAN key"))
+                })?;
             self.authorize_lan(request, &key, body.as_bytes())?;
             PeerNode::new("lan", "LAN client")
         } else {
@@ -310,6 +313,7 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Refusal>
             failure("bad_request", "invalid or incomplete HTTP request"),
         )
     };
+    let deadline = Instant::now() + READ_TIMEOUT;
     let mut bytes = Vec::new();
     let mut chunk = [0; 4096];
     let header_end = loop {
@@ -319,6 +323,13 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Refusal>
         if bytes.len() >= MAX_HEADERS {
             return Err(bad());
         }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(bad)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| bad())?;
         let n = stream.read(&mut chunk).map_err(|_| bad())?;
         if n == 0 {
             return Err(bad());
@@ -374,6 +385,13 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Refusal>
         ));
     }
     while bytes.len() - header_end < length {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(bad)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| bad())?;
         let n = stream.read(&mut chunk).map_err(|_| bad())?;
         if n == 0 {
             return Err(bad());
@@ -461,6 +479,53 @@ mod tests {
                 action.as_str()
             )))
         }
+    }
+
+    #[test]
+    fn slow_drip_cannot_prevent_cancel() {
+        let config = Config::parse(br#"{"listen":"127.0.0.1:0","allowed_nodes":["mac"]}"#).unwrap();
+        let controller = PowerController::new(Arc::new(NoPower), Arc::new(crate::SystemClock));
+        controller
+            .request(barge_machine::PowerActionKind::Shutdown, 60)
+            .unwrap();
+        let daemon = Arc::new(Daemon::new(
+            &config,
+            controller,
+            Arc::new(FixedLookup(Some(PeerNode::new("id", "mac")))),
+            Arc::new(crate::SystemClock),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (accepted, ready) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, peer) = listener.accept().unwrap();
+            accepted.send(()).unwrap();
+            daemon.handle(stream, peer);
+            let (stream, peer) = listener.accept().unwrap();
+            daemon.handle(stream, peer);
+        });
+        let mut slow = TcpStream::connect(address).unwrap();
+        slow.write_all(b"POST /v1/power HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+            .unwrap();
+        ready.recv().unwrap();
+        let drip = std::thread::spawn(move || {
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(500));
+                if slow.write_all(b" ").is_err() {
+                    break;
+                }
+            }
+        });
+        let start = Instant::now();
+        assert!(
+            barge_machine::DaemonClient::at(format!("http://{address}"))
+                .cancel()
+                .unwrap()
+                .cancelled
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drip.join().unwrap();
+        server.join().unwrap();
     }
 
     #[test]

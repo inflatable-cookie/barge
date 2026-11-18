@@ -170,6 +170,7 @@ impl PowerController {
         } else {
             None
         }?;
+        drop(pending);
         if let Err(error) = self.backend.perform(requested.action) {
             eprintln!("barged: {} failed: {error}", requested.action.as_str());
         }
@@ -307,6 +308,7 @@ mod tests {
         assert!(!controller.shared.stopped.load(Ordering::SeqCst));
         drop(guard);
         thread.join().unwrap();
+        assert!(controller.shared.stopped.load(Ordering::SeqCst));
         controller.wait_for_change();
         assert_eq!(controller.fire_due(), None);
         assert!(backend.called().is_empty());
@@ -353,6 +355,41 @@ mod tests {
         let performer: Arc<dyn PowerBackend> = backend.clone();
         let time: Arc<dyn Clock> = clock.clone();
         (PowerController::new(performer, time), backend, clock)
+    }
+
+    #[test]
+    fn backend_does_not_hold_pending_lock() {
+        struct Blocking(
+            std::sync::mpsc::Sender<()>,
+            Mutex<std::sync::mpsc::Receiver<()>>,
+        );
+        impl PowerBackend for Blocking {
+            fn perform(&self, _: PowerActionKind) -> Result<()> {
+                self.0.send(()).unwrap();
+                self.1.lock().unwrap().recv().unwrap();
+                Ok(())
+            }
+        }
+        let (entered, wait) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let controller = PowerController::new(
+            Arc::new(Blocking(entered, Mutex::new(resume))),
+            Arc::new(SystemClock),
+        );
+        controller.request(PowerActionKind::Shutdown, 0).unwrap();
+        let worker = controller.clone();
+        let thread = std::thread::spawn(move || worker.fire_due());
+        wait.recv().unwrap();
+        let check = controller.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            done.send((check.pending(), check.cancel())).unwrap();
+        });
+        let observed = result.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        probe.join().unwrap();
+        assert_eq!(observed.unwrap(), (None, false));
     }
 
     #[test]

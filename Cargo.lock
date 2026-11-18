@@ -292,6 +292,7 @@ dependencies = [
  "barge",
  "barge-machine",
  "httparse",
+ "libc",
  "serde",
  "serde_json",
  "zbus",

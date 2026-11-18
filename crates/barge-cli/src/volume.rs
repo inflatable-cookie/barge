@@ -72,7 +72,9 @@ pub(crate) fn volume(arguments: &[String], json: bool) -> Result<()> {
             let volume = barge.register_volume(registration)?;
             let state = volume.state()?;
             if options.flag("import-layout") {
-                barge.import_volume_layout(&name)?;
+                if let Err(error) = barge.import_volume_layout(&name) {
+                    eprintln!("barge: volume {name} registered, but layout import failed: {error}");
+                }
             } else if barge.has_unimported_volume_layout(&name)? {
                 eprintln!("barge: volume {name} has a layout record; register with --import-layout to import it");
             }

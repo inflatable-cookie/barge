@@ -108,3 +108,48 @@ pub fn write_key(path: &Path, key: &str) -> io::Result<()> {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn signatures_bind_all_fields_and_reject_bad_hex() {
+        let key = [7; 32];
+        let signature = sign(&key, "POST", "/path", "123", "nonce", b"body").unwrap();
+        assert!(verify(
+            &key, "POST", "/path", "123", "nonce", b"body", &signature
+        ));
+        for i in 0..32 {
+            let mut changed = decode(&signature, 32).unwrap();
+            changed[i] ^= 1;
+            assert!(!verify(
+                &key,
+                "POST",
+                "/path",
+                "123",
+                "nonce",
+                b"body",
+                &hex(&changed)
+            ));
+        }
+        assert!(!verify(
+            &key, "GET", "/path", "123", "nonce", b"body", &signature
+        ));
+        assert!(decode("AB", 1).is_none());
+        assert!(decode("abc", 2).is_none());
+    }
+
+    #[test]
+    fn key_is_owner_only() {
+        let temp = barge::testing::TempDir::new("machine-key").unwrap();
+        let path = temp.child("key");
+        write_key(&path, "secret").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "secret");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}

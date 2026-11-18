@@ -59,11 +59,7 @@ impl DaemonClient {
     /// A client for the address a registered machine records.
     pub fn for_machine(machine: &Machine) -> Self {
         let host = machine.daemon_host();
-        let host = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]")
-        } else {
-            host.to_string()
-        };
+        let host = bracket_host(host);
         Self::at(format!("http://{host}:{}", machine.daemon_port()))
     }
 
@@ -76,11 +72,7 @@ impl DaemonClient {
     /// Connect to the machine's LAN hostname using its key.
     pub fn for_lan(machine: &Machine, key: Vec<u8>) -> Self {
         let host = machine.hostname();
-        let host = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]")
-        } else {
-            host.to_string()
-        };
+        let host = bracket_host(host);
         Self::at(format!("http://{host}:{}", machine.daemon_port())).with_key(key)
     }
 
@@ -237,8 +229,7 @@ impl DaemonClient {
             detail
         };
         let kind = match status {
-            400 => ErrorKind::Refused,
-            401 | 403 | 409 => ErrorKind::Refused,
+            400 | 401 | 403 | 405 | 409 | 413 => ErrorKind::Refused,
             404 => ErrorKind::NotFound,
             _ => ErrorKind::Io,
         };
@@ -253,6 +244,14 @@ impl DaemonClient {
             ErrorKind::Unreachable,
             format!("barged at {} is unreachable: {error}", self.base),
         )
+    }
+}
+
+fn bracket_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
     }
 }
 
@@ -388,6 +387,23 @@ mod tests {
         );
         let requests = seen.lock().unwrap();
         assert!(requests[0].starts_with("GET /v1/state "), "{}", requests[0]);
+    }
+
+    #[test]
+    fn lan_client_sends_authentication_headers() {
+        let (base, seen) = stub(200, state_document());
+        DaemonClient::at(base)
+            .with_key(vec![7; 32])
+            .state()
+            .unwrap();
+        let request = seen.lock().unwrap()[0].to_lowercase();
+        for header in [
+            crate::auth::TIMESTAMP,
+            crate::auth::NONCE,
+            crate::auth::SIGNATURE,
+        ] {
+            assert!(request.contains(&format!("{header}: ")), "{request}");
+        }
     }
 
     #[test]
