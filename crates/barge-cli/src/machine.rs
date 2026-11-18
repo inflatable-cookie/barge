@@ -1,25 +1,28 @@
 use super::*;
 
 pub(super) fn machine(arguments: &[String], json: bool) -> Result<()> {
-    let command = arguments
-        .first()
-        .ok_or_else(|| Error::usage("machine needs add, list, remove or wake"))?;
-    if ![
-        "add", "list", "remove", "wake", "pair", "unpair", "status", "sleep", "restart",
-        "shutdown", "cancel",
-    ]
-    .contains(&command.as_str())
-    {
-        return Err(Error::usage(format!("unknown machine command {command:?}; use add, list, remove, wake, status, sleep, restart, shutdown or cancel")));
-    }
-    let registry = Registry::discover().map_err(machine_error)?;
-    machine_with(arguments, json, &registry, &UdpSender)
+    machine_dispatch(
+        arguments,
+        json,
+        &|| Registry::discover().map_err(machine_error),
+        &UdpSender,
+    )
 }
 
+#[cfg(test)]
 pub(super) fn machine_with(
     arguments: &[String],
     json: bool,
     registry: &Registry,
+    sender: &impl DatagramSender,
+) -> Result<()> {
+    machine_dispatch(arguments, json, &|| Ok(registry.clone()), sender)
+}
+
+fn machine_dispatch(
+    arguments: &[String],
+    json: bool,
+    discover: &impl Fn() -> Result<Registry>,
     sender: &impl DatagramSender,
 ) -> Result<()> {
     let Some(command) = arguments.first().map(String::as_str) else {
@@ -68,6 +71,7 @@ pub(super) fn machine_with(
                     .map_err(|_| Error::usage("--daemon-port must be between 1 and 65535"))?;
                 machine = machine.with_daemon_port(port).map_err(machine_error)?;
             }
+            let registry = discover()?;
             registry.add(machine.clone()).map_err(machine_error)?;
             if json {
                 document("barge.machine/1", vec![("machine", json!(machine))])?;
@@ -83,6 +87,7 @@ pub(super) fn machine_with(
         "list" => {
             let options = Options::parse(rest, &[], &[])?;
             expect_no_positionals(&options)?;
+            let registry = discover()?;
             let machines = registry.list().map_err(machine_error)?;
             if json {
                 document("barge.machine-list/1", vec![("machines", json!(machines))])?;
@@ -103,6 +108,7 @@ pub(super) fn machine_with(
         "remove" => {
             let options = Options::parse(rest, &[], &[])?;
             let name = options.single("machine remove", "name")?;
+            let registry = discover()?;
             let removed = registry.remove(&name).map_err(machine_error)?;
             if json {
                 document("barge.machine-removed/1", vec![("removed", json!(removed))])?;
@@ -114,6 +120,7 @@ pub(super) fn machine_with(
         "wake" => {
             let options = Options::parse(rest, &[], &[])?;
             let name = options.single("machine wake", "name")?;
+            let registry = discover()?;
             let machine = registry.get(&name).map_err(machine_error)?;
             let (destination, bytes_sent) = barge_machine::wake(&machine, sender).map_err(machine_error)?;
             if json {
@@ -139,6 +146,7 @@ pub(super) fn machine_with(
             let name = options.single("machine pair", "name")?;
             let mut key = String::new();
             std::io::stdin().read_line(&mut key).map_err(|e| Error::new(ErrorKind::Io, format!("cannot read key: {e}")))?;
+            let registry = discover()?;
             registry.pair(&name, &key).map_err(machine_error)?;
             if json { document("barge.machine-paired/1", vec![("machine", json!(name))])?; } else { println!("paired {name}"); }
             Ok(())
@@ -146,6 +154,7 @@ pub(super) fn machine_with(
         "unpair" => {
             let options = Options::parse(rest, &[], &[])?;
             let name = options.single("machine unpair", "name")?;
+            let registry = discover()?;
             registry.unpair(&name).map_err(machine_error)?;
             if json { document("barge.machine-unpaired/1", vec![("machine", json!(name))])?; } else { println!("unpaired {name}"); }
             Ok(())
@@ -153,8 +162,9 @@ pub(super) fn machine_with(
         "status" => {
             let options = Options::parse(rest, &[], &[])?;
             let name = options.single("machine status", "name")?;
+            let registry = discover()?;
             let machine = registry.get(&name).map_err(machine_error)?;
-            let (client, mode) = machine_client(registry, &machine)?;
+            let (client, mode) = machine_client(&registry, &machine)?;
             let state = client.state().map_err(machine_error)?;
             if json {
                 document(
@@ -183,27 +193,28 @@ pub(super) fn machine_with(
             "sleep",
             rest,
             json,
-            registry,
+            discover,
         ),
         "restart" => machine_power(
             PowerActionKind::Restart,
             "restart",
             rest,
             json,
-            registry,
+            discover,
         ),
         "shutdown" => machine_power(
             PowerActionKind::Shutdown,
             "shutdown",
             rest,
             json,
-            registry,
+            discover,
         ),
         "cancel" => {
             let options = Options::parse(rest, &[], &[])?;
             let name = options.single("machine cancel", "name")?;
+            let registry = discover()?;
             let machine = registry.get(&name).map_err(machine_error)?;
-            let result = machine_client(registry, &machine)?.0
+            let result = machine_client(&registry, &machine)?.0
                 .cancel()
                 .map_err(machine_error)?;
             if json {
@@ -244,7 +255,7 @@ pub(super) fn machine_power(
     command: &str,
     arguments: &[String],
     json: bool,
-    registry: &Registry,
+    discover: &impl Fn() -> Result<Registry>,
 ) -> Result<()> {
     let options = Options::parse(arguments, &["delay"], &["yes"])?;
     let name = options.single(&format!("machine {command}"), "name")?;
@@ -262,8 +273,9 @@ pub(super) fn machine_power(
             "--json requires --yes for restart or shutdown",
         ));
     }
+    let registry = discover()?;
     let machine = registry.get(&name).map_err(machine_error)?;
-    let (client, _) = machine_client(registry, &machine)?;
+    let (client, _) = machine_client(&registry, &machine)?;
     let result = if options.flag("yes") {
         request_power(&client, machine.name(), action, delay, &AssumeYes)
     } else {

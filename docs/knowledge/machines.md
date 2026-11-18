@@ -133,3 +133,7 @@ the build brief.
 Tom used MoonDeck Buddy on the Steam Deck only for remote control of the PC
 (2026-11-18), so `barged` replaces it entirely. No game-launch features carry
 over. The Steam Deck becomes a client of `barged` once a client exists for it.
+
+The registry can be read without creating account state; writers create the
+shared state directory and take the same account lock as storage. JSON restart
+and shutdown requests require `--yes` rather than prompting.

@@ -1,4 +1,5 @@
-// Grant barged exactly three logind actions, and nothing else.
+// Grant the account three logind actions, and nothing else.
+// Polkit identifies the user, so every process of that user receives them.
 //
 // Install to /etc/polkit-1/rules.d/50-barged-power.rules (root) and replace
 // USER with the account the barged user unit runs as (docs/install-barged.md).
@@ -11,7 +12,8 @@
 // If the machine has a second active session, logind checks the
 // "-multiple-sessions" variant of each action (org.freedesktop.login1.suspend
 // -multiple-sessions, …). Add those three ids here in that case; do not widen
-// the rule to other actions.
+// the rule to other actions. An inhibitor may require the corresponding
+// "-ignore-inhibit" variants; grant these only if needed.
 polkit.addRule(function (action, subject) {
     var allowed = [
         "org.freedesktop.login1.suspend",

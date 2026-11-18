@@ -922,6 +922,7 @@ fn usage_and_passive_commands_do_not_create_state() {
     }
     for args in [
         vec!["status"],
+        vec!["machine", "status", "missing"],
         vec!["volume", "list"],
         vec!["volume", "status", "missing"],
         vec!["root", "list", "missing/area"],

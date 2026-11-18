@@ -8,7 +8,8 @@
 [Unit]
 Description=Barge machine daemon (barged)
 Documentation=file:%h/.config/barged/config.json
-After=network-online.target tailscaled.service
+After=network-online.target
+# System tailscaled is outside this user unit; Restart=on-failure retries startup.
 Wants=network-online.target
 
 [Service]

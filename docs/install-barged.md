@@ -30,6 +30,10 @@ podman run --rm -v "$PWD:/src:ro" -v "$HOME/.local/bin:/out:Z" \
   'cp -a /src /tmp/barge && cd /tmp/barge && CARGO_TARGET_DIR=/tmp/build cargo build --release --locked -p barged && install -m 0755 /tmp/build/release/barged /out/barged'
 ```
 
+The explicit container build uses `/tmp/build/release/barged` inside the
+container. An `oxide build --release` on the host uses Oxide-managed build
+storage, so do not assume a `target/release/barged` path for that build.
+
 The daemon uses logind over D-Bus on Linux. Its macOS build reports state but
 has no power backend.
 
@@ -84,6 +88,8 @@ desktop, so let the user's services run without a session:
 sudo loginctl enable-linger "$USER"
 ```
 
+The user unit cannot order itself after the system `tailscaled.service`. If
+the address is not ready at startup, `Restart=on-failure` retries the daemon.
 Logs: `journalctl --user -u barged -f`.
 
 ## 5. Grant exactly the three power actions
@@ -99,8 +105,8 @@ sudo sed -i "s/USER/$USER/" /etc/polkit-1/rules.d/50-barged-power.rules
 ```
 
 The rule grants `org.freedesktop.login1.suspend`, `…reboot` and `…power-off` to
-that account and leaves every other action alone. Nothing else is granted, and
-the daemon never runs a shell command.
+every process running as that account, not just `barged`, and leaves every
+other action alone. The daemon never runs a shell command.
 
 ## 6. Register the machine on the Mac
 
@@ -132,7 +138,9 @@ curl http://pc.tail1234.ts.net:9777/v1/state
   which. Re-check `tailscale status --json` and `tailscale set --operator`.
 - **`sleep` accepted but nothing happens.** polkit denied the logind call; the
   journal shows `logind refused Suspend`. Check the rule's account name and
-  whether a second active session needs the `-multiple-sessions` variant.
+  whether a second active session needs the `-multiple-sessions` variant, or an
+  inhibitor requires the `-ignore-inhibit` variant. Grant those variants only
+  if needed; they also apply to every process of the account.
 - **`barge machine status pc` says unreachable.** The Mac cannot reach the
   daemon. It is never reported as asleep: asleep has to be observed, and an
   absent daemon has not been.

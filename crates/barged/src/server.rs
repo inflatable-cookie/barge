@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Read;
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +17,6 @@ use barge_machine::{
     Cancel, CancelResult, DaemonError, PowerRequest, PowerResult, PowerState, State, CANCEL_SCHEMA,
     POWER_REQUEST_SCHEMA,
 };
-use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::{Allowlist, Clock, Config, Error, PeerLookup, PeerNode, PowerController, RequestError};
 
@@ -25,7 +24,8 @@ use crate::{Allowlist, Clock, Config, Error, PeerLookup, PeerNode, PowerControll
 const MAX_BODY: u64 = 16 * 1024;
 /// How long a blocked accept waits before the stop flag is checked again.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
-const CONTENT_TYPE: &str = "application/json";
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_HEADERS: usize = 16 * 1024;
 
 /// One daemon: state, power and the allowlist that gates both.
 pub struct Daemon {
@@ -78,55 +78,51 @@ impl Daemon {
 
     /// Bind the configured address. A wildcard bind is refused by the config,
     /// so the socket is reachable only where it was named.
-    pub fn bind(&self) -> crate::Result<Server> {
-        Server::http(self.listen)
-            .map_err(|error| Error::new(format!("cannot bind {}: {error}", self.listen)))
+    pub fn bind(&self) -> crate::Result<TcpListener> {
+        let listener = TcpListener::bind(self.listen)
+            .map_err(|error| Error::new(format!("cannot bind {}: {error}", self.listen)))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| Error::new(format!("cannot configure listener: {error}")))?;
+        Ok(listener)
     }
 
-    /// Serve until `running` clears. The poll interval keeps the loop stoppable
-    /// without a signal handler, which is what the tests use.
-    pub fn serve(&self, server: Server, running: &AtomicBool) -> crate::Result<()> {
+    /// Serve until `running` clears.
+    pub fn serve(&self, listener: TcpListener, running: &AtomicBool) -> crate::Result<()> {
         while running.load(Ordering::SeqCst) {
-            match server.recv_timeout(ACCEPT_POLL) {
-                Ok(Some(request)) => self.handle(request),
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(Error::new(format!("cannot accept a request: {error}")));
+            match listener.accept() {
+                Ok((stream, peer)) => self.handle(stream, peer),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ACCEPT_POLL)
                 }
+                Err(error) => return Err(Error::new(format!("cannot accept a request: {error}"))),
             }
         }
         Ok(())
     }
 
-    fn handle(&self, mut request: Request) {
-        let peer = request.remote_addr().copied();
-        let (status, body) = match self.route(&mut request, peer) {
-            Ok(answer) => answer,
-            Err(refusal) => refusal,
-        };
-        let response = Response::from_string(body).with_status_code(StatusCode(status));
-        let response = match Header::from_bytes("content-type", CONTENT_TYPE) {
-            Ok(header) => response.with_header(header),
-            Err(()) => response,
-        };
-        if let Err(error) = request.respond(response) {
+    fn handle(&self, mut stream: TcpStream, peer: SocketAddr) {
+        let result = stream
+            .set_nonblocking(false)
+            .and_then(|()| stream.set_read_timeout(Some(READ_TIMEOUT)))
+            .and_then(|()| stream.set_write_timeout(Some(READ_TIMEOUT)))
+            .map_err(|e| (400, failure("bad_request", e.to_string())))
+            .and_then(|()| read_request(&mut stream))
+            .and_then(|request| self.route(&request, Some(peer)));
+        let (status, body) = result.unwrap_or_else(|refusal| refusal);
+        let response = format!("HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", reason(status), body.len());
+        if let Err(error) = stream.write_all(response.as_bytes()) {
             eprintln!("barged: cannot answer the client: {error}");
         }
     }
 
-    fn route(&self, request: &mut Request, peer: Option<SocketAddr>) -> Answer {
+    fn route(&self, request: &Request, peer: Option<SocketAddr>) -> Answer {
         let tailnet_caller = if self.lan {
             None
         } else {
             Some(self.authorize(peer)?)
         };
-        let body = read_body(request).map_err(|e| {
-            if self.lan {
-                (401, failure("not_authorized", "authentication failed"))
-            } else {
-                e
-            }
-        })?;
+        let body = &request.body;
         let caller = if self.lan {
             let key = self
                 .key_path
@@ -140,13 +136,13 @@ impl Daemon {
             tailnet_caller
                 .ok_or_else(|| (403, failure("not_authorized", "authentication failed")))?
         };
-        let url = request.url().to_string();
+        let url = request.url.to_string();
         let path = url.split(['?', '#']).next().unwrap_or("").to_string();
-        let method = request.method().as_str();
+        let method = request.method.as_str();
         match (method, path.as_str()) {
             ("GET", "/v1/state") => self.state_answer(),
-            ("POST", "/v1/power") => self.power(&body, &caller),
-            ("POST", "/v1/power/cancel") => self.cancel(&body),
+            ("POST", "/v1/power") => self.power(body, &caller),
+            ("POST", "/v1/power/cancel") => self.cancel(body),
             (_, known @ ("/v1/state" | "/v1/power" | "/v1/power/cancel")) => Err((
                 405,
                 failure(
@@ -202,10 +198,10 @@ impl Daemon {
         let refused = || (401, failure("not_authorized", "authentication failed"));
         let header = |name: &'static str| {
             request
-                .headers()
+                .headers
                 .iter()
-                .find(|h| h.field.equiv(name))
-                .map(|h| h.value.as_str())
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
         };
         let timestamp = header(barge_machine::auth::TIMESTAMP).ok_or_else(refused)?;
         let nonce = header(barge_machine::auth::NONCE).ok_or_else(refused)?;
@@ -216,8 +212,8 @@ impl Daemon {
             || barge_machine::auth::decode(nonce, 16).is_none()
             || !barge_machine::auth::verify(
                 key,
-                request.method().as_str(),
-                request.url(),
+                request.method.as_str(),
+                &request.url,
                 timestamp,
                 nonce,
                 body,
@@ -300,22 +296,75 @@ impl Daemon {
     }
 }
 
-fn read_body(request: &mut Request) -> std::result::Result<String, Refusal> {
-    let mut body = String::new();
-    request
-        .as_reader()
-        .take(MAX_BODY + 1)
-        .read_to_string(&mut body)
-        .map_err(|error| {
-            (
-                400,
-                failure(
-                    "bad_request",
-                    format!("cannot read the request body: {error}"),
-                ),
-            )
-        })?;
-    if body.len() as u64 > MAX_BODY {
+struct Request {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Refusal> {
+    let bad = || {
+        (
+            400,
+            failure("bad_request", "invalid or incomplete HTTP request"),
+        )
+    };
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    let header_end = loop {
+        if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            break index + 4;
+        }
+        if bytes.len() >= MAX_HEADERS {
+            return Err(bad());
+        }
+        let n = stream.read(&mut chunk).map_err(|_| bad())?;
+        if n == 0 {
+            return Err(bad());
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    };
+    if header_end > MAX_HEADERS {
+        return Err(bad());
+    }
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Request::new(&mut headers);
+    if !matches!(
+        parsed.parse(&bytes[..header_end]),
+        Ok(httparse::Status::Complete(_))
+    ) {
+        return Err(bad());
+    }
+    let method = parsed.method.ok_or_else(bad)?.to_string();
+    let url = parsed.path.ok_or_else(bad)?.to_string();
+    let headers: Vec<(String, String)> = parsed
+        .headers
+        .iter()
+        .map(|h| {
+            std::str::from_utf8(h.value)
+                .map(|v| (h.name.to_string(), v.to_string()))
+                .map_err(|_| bad())
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    if headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return Err(bad());
+    }
+    let lengths: Vec<_> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .collect();
+    if lengths.len() > 1 {
+        return Err(bad());
+    }
+    let length = match lengths.first() {
+        Some((_, v)) => v.trim().parse::<usize>().map_err(|_| bad())?,
+        None => 0,
+    };
+    if length as u64 > MAX_BODY {
         return Err((
             413,
             failure(
@@ -324,7 +373,37 @@ fn read_body(request: &mut Request) -> std::result::Result<String, Refusal> {
             ),
         ));
     }
-    Ok(body)
+    while bytes.len() - header_end < length {
+        let n = stream.read(&mut chunk).map_err(|_| bad())?;
+        if n == 0 {
+            return Err(bad());
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    let body = std::str::from_utf8(&bytes[header_end..header_end + length])
+        .map_err(|_| bad())?
+        .to_string();
+    Ok(Request {
+        method,
+        url,
+        headers,
+        body,
+    })
+}
+
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        _ => "Internal Server Error",
+    }
 }
 
 fn schema_mismatch(expected: &str, actual: &str) -> Refusal {
