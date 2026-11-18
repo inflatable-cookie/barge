@@ -138,26 +138,15 @@ impl BindingRecord {
     }
 }
 
-/// What is at a link target now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// What is at a link target now. A real entry carries its device and inode, so a
+/// plan can tell the reviewed entry from another one that appears later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Observed {
     Absent,
     Link { destination: PathBuf },
-    Directory,
-    File,
-}
-
-impl Observed {
-    /// A short stable token a plan and an apply can compare across processes.
-    pub fn token(&self) -> String {
-        match self {
-            Self::Absent => "absent".to_string(),
-            Self::Link { destination } => format!("link:{}", destination.display()),
-            Self::Directory => "directory".to_string(),
-            Self::File => "file".to_string(),
-        }
-    }
+    Directory { dev: u64, ino: u64 },
+    File { dev: u64, ino: u64 },
 }
 
 impl fmt::Display for Observed {
@@ -165,8 +154,8 @@ impl fmt::Display for Observed {
         match self {
             Self::Absent => formatter.write_str("absent"),
             Self::Link { destination } => write!(formatter, "a link to {}", destination.display()),
-            Self::Directory => formatter.write_str("a directory"),
-            Self::File => formatter.write_str("a file"),
+            Self::Directory { .. } => formatter.write_str("a directory"),
+            Self::File { .. } => formatter.write_str("a file"),
         }
     }
 }
@@ -250,7 +239,7 @@ impl Binding {
 }
 
 /// The exact before and after of a link binding; applying takes this plan back.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkPlan {
     pub consumer: String,
     pub class: Class,
@@ -304,12 +293,7 @@ impl Bindings {
         let value = binding.value()?;
         self.destination(binding.class, value)?;
         require_parent(&binding.link)?;
-        if self.get(&binding.consumer)?.is_some() {
-            return Err(Error::refused(format!(
-                "consumer {} is already bound; undo it first",
-                binding.consumer
-            )));
-        }
+        self.check_free(&binding.consumer, &binding.link)?;
         let before = observe(&binding.link)?;
         Ok(LinkPlan {
             consumer: binding.consumer.clone(),
@@ -318,12 +302,13 @@ impl Bindings {
             after: Observed::Link {
                 destination: value.to_path_buf(),
             },
-            replace: matches!(before, Observed::Directory | Observed::File),
+            replace: matches!(before, Observed::Directory { .. } | Observed::File { .. }),
             before,
         })
     }
 
-    /// Apply a plan. The target must still be what the plan observed, and a real
+    /// Apply a reviewed plan. The target must still be the entry the plan
+    /// observed, the plan must apply this binding's destination, and a real
     /// directory or file is only replaced when the caller passes it explicitly.
     pub fn apply(
         &self,
@@ -333,25 +318,12 @@ impl Bindings {
     ) -> Result<BindingRecord> {
         self.core.ensure_writable()?;
         binding.validate()?;
-        if plan.consumer != binding.consumer
-            || plan.class != binding.class
-            || plan.link != binding.link
-        {
-            return Err(Error::usage("the plan was made for a different binding"));
-        }
+        check_plan(binding, plan)?;
         let destination = self.destination(binding.class, binding.value()?)?;
         require_parent(&binding.link)?;
         let _lock = self.core.state.lock()?;
         let mut records = read(&self.core)?;
-        if records
-            .iter()
-            .any(|record| record.consumer == binding.consumer)
-        {
-            return Err(Error::refused(format!(
-                "consumer {} is already bound; undo it first",
-                binding.consumer
-            )));
-        }
+        self.check_free_among(&records, &binding.consumer, &binding.link)?;
         let observed = observe(&binding.link)?;
         if observed != plan.before {
             return Err(Error::refused(format!(
@@ -426,15 +398,7 @@ impl Bindings {
         let folder = canonical_dir(&self.class_folder(binding.class)?)?;
         let _lock = self.core.state.lock()?;
         let mut records = read(&self.core)?;
-        if records
-            .iter()
-            .any(|record| record.consumer == binding.consumer)
-        {
-            return Err(Error::refused(format!(
-                "consumer {} is already bound; undo it first",
-                binding.consumer
-            )));
-        }
+        self.check_free_among(&records, &binding.consumer, &binding.link)?;
         let observed = observe(&binding.link)?;
         let Observed::Link { destination } = observed else {
             return Err(Error::refused(format!(
@@ -520,18 +484,43 @@ impl Bindings {
             }
         }
         if let Err(error) = restore_prior(&link, &record.prior) {
-            // Put the applied link back so the record stays true.
-            let _ = remove_link(&link);
-            let _ = symlink(&record.applied.value, &link);
-            return Err(error);
+            return Err(failed_undo(error, reapply_applied(&link, &record)));
         }
         records.remove(index);
         if let Err(error) = write(&self.core, &records) {
-            let _ = remove_link(&link);
-            let _ = symlink(&record.applied.value, &link);
-            return Err(error);
+            return Err(failed_undo(error, reapply_applied(&link, &record)));
         }
         Ok(record)
+    }
+
+    /// Refuse a consumer that is already recorded, and a link another consumer
+    /// already owns; both would make undo ambiguous.
+    fn check_free(&self, consumer: &str, link: &Path) -> Result<()> {
+        self.check_free_among(&read(&self.core)?, consumer, link)
+    }
+
+    fn check_free_among(
+        &self,
+        records: &[BindingRecord],
+        consumer: &str,
+        link: &Path,
+    ) -> Result<()> {
+        if records.iter().any(|record| record.consumer == consumer) {
+            return Err(Error::refused(format!(
+                "consumer {consumer} is already bound; undo it first"
+            )));
+        }
+        if let Some(record) = records
+            .iter()
+            .find(|record| same_target(record.link_path(), link))
+        {
+            return Err(Error::refused(format!(
+                "target {} is already recorded for consumer {}; undo it first",
+                link.display(),
+                record.consumer
+            )));
+        }
+        Ok(())
     }
 
     /// The class folder a binding's value must sit inside, refusing an absent or
@@ -580,6 +569,47 @@ impl Bindings {
     }
 }
 
+/// Check that a plan is the one made for this binding, observes what its replace
+/// flag claims, and applies the destination the binding asks for.
+fn check_plan(binding: &Binding, plan: &LinkPlan) -> Result<()> {
+    if plan.consumer != binding.consumer || plan.class != binding.class || plan.link != binding.link
+    {
+        return Err(Error::usage("the plan was made for a different binding"));
+    }
+    let expected = Observed::Link {
+        destination: binding.value()?.to_path_buf(),
+    };
+    if plan.after != expected {
+        return Err(Error::refused(format!(
+            "the plan applies {}, not the binding's {}",
+            plan.after, expected
+        )));
+    }
+    if plan.replace
+        != matches!(
+            plan.before,
+            Observed::Directory { .. } | Observed::File { .. }
+        )
+    {
+        return Err(Error::usage(
+            "the plan's replace flag does not match what it observed",
+        ));
+    }
+    Ok(())
+}
+
+/// A failed undo names what went wrong and whether the applied link is back.
+fn failed_undo(error: Error, reapplied: Result<()>) -> Error {
+    let mut message = error.message().to_string();
+    if let Err(problem) = reapplied {
+        message.push_str(&format!(
+            "; the applied link could not be restored: {}",
+            problem.message()
+        ));
+    }
+    Error::new(error.kind(), message)
+}
+
 /// What was at `link` before it is replaced, with the name a preserved entry is
 /// renamed to.
 fn prior_for(link: &Path, observed: &Observed) -> Result<Prior> {
@@ -588,11 +618,11 @@ fn prior_for(link: &Path, observed: &Observed) -> Result<Prior> {
         Observed::Link { destination } => Prior::Link {
             destination: destination.clone(),
         },
-        Observed::Directory => Prior::Preserved {
+        Observed::Directory { .. } => Prior::Preserved {
             path: preserved_path(link)?,
             entry: EntryKind::Directory,
         },
-        Observed::File => Prior::Preserved {
+        Observed::File { .. } => Prior::Preserved {
             path: preserved_path(link)?,
             entry: EntryKind::File,
         },
@@ -636,6 +666,60 @@ fn restore_prior(link: &Path, prior: &Prior) -> Result<()> {
 fn roll_back(link: &Path, prior: &Prior) -> Result<()> {
     remove_link(link)?;
     restore_prior(link, prior)
+}
+
+/// Put the applied link back after an undo could not finish, moving a restored
+/// real entry back to where it was preserved. A link or nothing may be removed;
+/// a real entry this record does not name is refused, never deleted.
+fn reapply_applied(link: &Path, record: &BindingRecord) -> Result<()> {
+    match fs::symlink_metadata(link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => remove_link(link)?,
+        Ok(_) => match &record.prior {
+            Prior::Preserved { path, .. } => {
+                if fs::symlink_metadata(path).is_ok() {
+                    return Err(Error::refused(format!(
+                        "both {} and {} hold an entry; refusing to choose",
+                        link.display(),
+                        path.display()
+                    )));
+                }
+                fs::rename(link, path).map_err(|source| {
+                    Error::io("cannot move the restored entry back to", path, &source)
+                })?;
+            }
+            _ => {
+                return Err(Error::refused(format!(
+                    "{} holds a real entry the record does not name; refusing to remove it",
+                    link.display()
+                )))
+            }
+        },
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(Error::io("cannot inspect", link, &source)),
+    }
+    symlink(&record.applied.value, link)
+        .map_err(|source| Error::io("cannot restore the applied link at", link, &source))
+}
+
+/// Whether two link paths name the same target, resolving the folder above them
+/// so `sub/../x` and a symlinked folder still count as one target.
+fn same_target(left: &Path, right: &Path) -> bool {
+    match (target_identity(left), target_identity(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn target_identity(link: &Path) -> Result<PathBuf> {
+    let parent = link
+        .parent()
+        .ok_or_else(|| Error::usage(format!("link path {} has no parent", link.display())))?;
+    let name = link
+        .file_name()
+        .ok_or_else(|| Error::usage(format!("link path {} has no file name", link.display())))?;
+    let parent =
+        fs::canonicalize(parent).map_err(|source| Error::io("cannot resolve", parent, &source))?;
+    Ok(parent.join(name))
 }
 
 fn preserved_path(link: &Path) -> Result<PathBuf> {
@@ -702,15 +786,24 @@ fn canonical_dir(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// What is at `path` now, without following a symlink there.
+/// What is at `path` now, without following a symlink there. A real entry keeps
+/// its device and inode, so a later observation tells whether it is the same one.
 pub(crate) fn observe(path: &Path) -> Result<Observed> {
+    use std::os::unix::fs::MetadataExt;
+
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Ok(Observed::Link {
             destination: fs::read_link(path)
                 .map_err(|source| Error::io("cannot read the link at", path, &source))?,
         }),
-        Ok(metadata) if metadata.is_dir() => Ok(Observed::Directory),
-        Ok(_) => Ok(Observed::File),
+        Ok(metadata) if metadata.is_dir() => Ok(Observed::Directory {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }),
+        Ok(metadata) => Ok(Observed::File {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Observed::Absent),
         Err(source) => Err(Error::io("cannot inspect", path, &source)),
     }

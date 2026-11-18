@@ -116,12 +116,17 @@ it, and what was there before, so undo restores it exactly.
 
 Only the `link` kind is built. Its rules:
 
-- `plan` shows the exact before and after; `apply` takes the binding explicitly
-  and refuses a target that changed after the plan was made;
+- `plan` shows the exact before and after; `apply` takes that plan document back,
+  so the entry it observed (including which real directory or file) and the
+  destination it reviewed are what it enforces, and refuses a target that
+  changed since;
 - `adopt` records a symlink that already points into a class folder without
   changing it;
 - `undo` restores the prior state exactly: nothing, an older link, or a real
-  entry Barge preserved;
+  entry Barge preserved. A failed undo leaves the applied link and its record in
+  place;
+- one target belongs to one consumer: a second consumer is refused, even through
+  an equivalent path;
 - a real directory or file is only replaced when the plan shows it and the
   caller passes the explicit replace. It is renamed beside the link
   (`<name>.barge-prior`) and undo renames it back; moving data is not part of

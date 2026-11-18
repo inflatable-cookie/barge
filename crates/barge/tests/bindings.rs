@@ -56,7 +56,6 @@ fn plan_and_apply_a_new_link() {
     let plan = bindings.plan(&binding).unwrap();
     assert_eq!(plan.before, Observed::Absent);
     assert!(!plan.replace);
-    assert_eq!(plan.before.token(), "absent");
     assert!(matches!(&plan.after, Observed::Link { .. }));
     assert!(!link.exists(), "plan writes nothing");
 
@@ -196,7 +195,10 @@ fn undo_restores_a_preserved_directory() {
     let bindings = fixture.barge.bindings();
     let binding = Binding::link("cargo-registry", Class::Caches, &link).to(&destination);
     let plan = bindings.plan(&binding).unwrap();
-    assert_eq!(plan.before, Observed::Directory);
+    assert!(
+        matches!(plan.before, Observed::Directory { .. }),
+        "the plan observed the directory that is there"
+    );
     assert!(plan.replace, "the plan shows the directory being replaced");
 
     let refused = bindings
@@ -301,6 +303,167 @@ fn apply_refuses_a_value_outside_the_class_folder() {
         "{}",
         refused.message()
     );
+}
+
+#[test]
+fn apply_refuses_a_plan_for_another_destination() {
+    let fixture = Fixture::new();
+    fixture.register();
+    layout(&fixture);
+    let first = class_folder(&fixture, "cargo/registry");
+    let second = class_folder(&fixture, "cargo/git");
+    let link = home(&fixture).join("registry");
+    let bindings = fixture.barge.bindings();
+    let reviewed = Binding::link("cargo-registry", Class::Caches, &link).to(&first);
+    let plan = bindings.plan(&reviewed).unwrap();
+
+    let different = Binding::link("cargo-registry", Class::Caches, &link).to(&second);
+    let refused = bindings
+        .apply(&different, &plan, ApplyOptions::default())
+        .unwrap_err();
+    assert!(
+        refused.message().contains("not the binding's"),
+        "{}",
+        refused.message()
+    );
+    assert!(fs::symlink_metadata(&link).is_err());
+}
+
+#[test]
+fn apply_refuses_a_different_real_entry_than_the_plan() {
+    let fixture = Fixture::new();
+    fixture.register();
+    layout(&fixture);
+    let destination = class_folder(&fixture, "cargo/registry");
+    let link = home(&fixture).join("registry");
+    fs::create_dir(&link).unwrap();
+
+    let bindings = fixture.barge.bindings();
+    let binding = Binding::link("cargo-registry", Class::Caches, &link).to(&destination);
+    let plan = bindings.plan(&binding).unwrap();
+    assert!(matches!(plan.before, Observed::Directory { .. }));
+
+    // A different directory of the same shape sits at the target now.
+    fs::remove_dir_all(&link).unwrap();
+    fs::create_dir(&link).unwrap();
+    let refused = bindings
+        .apply(&binding, &plan, ApplyOptions { replace: true })
+        .unwrap_err();
+    assert!(
+        refused.message().contains("changed since it was planned"),
+        "{}",
+        refused.message()
+    );
+}
+
+#[test]
+fn another_consumer_cannot_own_the_same_target() {
+    let fixture = Fixture::new();
+    fixture.register();
+    layout(&fixture);
+    let destination = class_folder(&fixture, "cargo/registry");
+    let home = home(&fixture);
+    let link = home.join("registry");
+    let bindings = fixture.barge.bindings();
+    let binding = Binding::link("cargo-registry", Class::Caches, &link).to(&destination);
+    let plan = bindings.plan(&binding).unwrap();
+    bindings
+        .apply(&binding, &plan, ApplyOptions::default())
+        .unwrap();
+
+    let other = Binding::link("another", Class::Caches, &link).to(&destination);
+    let refused = bindings.plan(&other).unwrap_err();
+    assert!(
+        refused.message().contains("already recorded for consumer"),
+        "{}",
+        refused.message()
+    );
+
+    // The same target reached through another path is still the same target.
+    fs::create_dir(home.join("sub")).unwrap();
+    let equivalent =
+        Binding::link("another", Class::Caches, home.join("sub/../registry")).to(&destination);
+    let refused = bindings.plan(&equivalent).unwrap_err();
+    assert!(
+        refused.message().contains("already recorded for consumer"),
+        "{}",
+        refused.message()
+    );
+
+    // Adopt refuses a target another consumer already owns.
+    let second = home.join("second");
+    symlink(&destination, &second).unwrap();
+    bindings
+        .adopt(&Binding::link("first", Class::Caches, &second))
+        .unwrap();
+    let refused = bindings
+        .adopt(&Binding::link("second", Class::Caches, &second))
+        .unwrap_err();
+    assert!(
+        refused
+            .message()
+            .contains("already recorded for consumer first"),
+        "{}",
+        refused.message()
+    );
+    let refused = bindings
+        .adopt(&Binding::link(
+            "second",
+            Class::Caches,
+            home.join("sub/../second"),
+        ))
+        .unwrap_err();
+    assert!(
+        refused
+            .message()
+            .contains("already recorded for consumer first"),
+        "{}",
+        refused.message()
+    );
+}
+
+#[test]
+fn undo_keeps_the_applied_link_when_recording_fails() {
+    let fixture = Fixture::new();
+    fixture.register();
+    layout(&fixture);
+    let destination = class_folder(&fixture, "cargo/registry");
+    let link = home(&fixture).join("registry");
+    fs::create_dir(&link).unwrap();
+    fs::write(link.join("keep.txt"), b"data").unwrap();
+
+    let bindings = fixture.barge.bindings();
+    let binding = Binding::link("cargo-registry", Class::Caches, &link).to(&destination);
+    let plan = bindings.plan(&binding).unwrap();
+    bindings
+        .apply(&binding, &plan, ApplyOptions { replace: true })
+        .unwrap();
+    let preserved = link.with_file_name("registry.barge-prior");
+
+    use std::os::unix::fs::PermissionsExt;
+    let state = fixture.barge.state_dir().to_path_buf();
+    let original = fs::metadata(&state).unwrap().permissions();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+    if fs::write(state.join("probe"), b"x").is_ok() {
+        // A privileged account can still write; the failure cannot be staged.
+        let _ = fs::remove_file(state.join("probe"));
+        fs::set_permissions(&state, original).unwrap();
+        return;
+    }
+
+    let refused = bindings.undo("cargo-registry").unwrap_err();
+    assert!(!refused.message().is_empty());
+    // The applied link is back, the preserved entry is where it was preserved,
+    // and the record still describes both.
+    assert_eq!(canonical(&link), canonical(&destination));
+    assert_eq!(fs::read(preserved.join("keep.txt")).unwrap(), b"data");
+    assert_eq!(bindings.list().unwrap().len(), 1);
+
+    fs::set_permissions(&state, original).unwrap();
+    bindings.undo("cargo-registry").unwrap();
+    assert!(link.is_dir());
+    assert_eq!(fs::read(link.join("keep.txt")).unwrap(), b"data");
+    assert!(bindings.list().unwrap().is_empty());
 }
 
 #[test]

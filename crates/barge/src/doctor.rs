@@ -232,7 +232,7 @@ fn binding_report(
     let class_folder = volume.base.join(&placement.path);
     let state = match observe(&link)? {
         Observed::Absent => BindingState::Missing,
-        observed @ (Observed::Directory | Observed::File) => BindingState::Drifted {
+        observed @ (Observed::Directory { .. } | Observed::File { .. }) => BindingState::Drifted {
             observed: Some(link.clone()),
             expected: record.applied.value.clone(),
             reason: format!("the target is {observed}, not a link"),

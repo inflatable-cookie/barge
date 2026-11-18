@@ -105,8 +105,8 @@ usage: barge [--json] <command>
   root evict <namespace>/<area> <id>      rename into trash, then delete
   bind list                               recorded bindings
   bind plan --consumer C --class K --link PATH --to DEST
-  bind apply --consumer C --class K --link PATH --to DEST
-    [--replace] [--expect STATE]          create the link, or preserve and link
+    [--json]                              the exact before and after; print it
+  bind apply --plan FILE|- [--replace]    apply exactly that reviewed plan
   bind adopt --consumer C --class K --link PATH
   bind undo <consumer>                    restore what was there before
   doctor                                  volumes, layout and binding drift
@@ -425,35 +425,24 @@ fn bind(arguments: &[String], json: bool) -> Result<()> {
                 );
                 println!("  before: {}", plan.before);
                 println!("  after: {}", plan.after);
-                println!("  expect: {}", plan.before.token());
                 if plan.replace {
                     println!("  replace: yes (pass --replace to preserve the existing entry)");
                 }
+                println!(
+                    "apply with: barge bind apply --plan <file holding the --json plan document>"
+                );
             }
             Ok(())
         }
         "apply" => {
-            let options = Options::parse(
-                rest,
-                &["consumer", "class", "link", "to", "expect"],
-                &["replace"],
-            )?;
+            // The reviewed plan document is the input: it names the binding, the
+            // entry it observed and the destination it applied, so what was
+            // reviewed is exactly what is enforced.
+            let options = Options::parse(rest, &["plan"], &["replace"])?;
             expect_no_positionals(&options)?;
-            let binding = binding_from_options(&options)?;
-            let barge = Barge::open()?;
-            let bindings = barge.bindings();
-            let plan = bindings.plan(&binding)?;
-            if let Some(expect) = options.get("expect") {
-                if expect != plan.before.token() {
-                    return Err(Error::refused(format!(
-                        "target {} is {}, not the {} that was expected",
-                        plan.link.display(),
-                        plan.before,
-                        expect
-                    )));
-                }
-            }
-            let record = bindings.apply(
+            let plan = read_plan(&options.required("plan")?)?;
+            let binding = binding_for_plan(&plan)?;
+            let record = Barge::open()?.bindings().apply(
                 &binding,
                 &plan,
                 ApplyOptions {
@@ -533,6 +522,51 @@ fn binding_from_options(options: &Options) -> Result<Binding> {
         binding = binding.to(value);
     }
     Ok(binding)
+}
+
+fn binding_for_plan(plan: &barge::LinkPlan) -> Result<Binding> {
+    let destination = match &plan.after {
+        barge::Observed::Link { destination } => destination.clone(),
+        other => {
+            return Err(Error::usage(format!(
+                "the plan's after is {other}, not a link"
+            )))
+        }
+    };
+    Ok(Binding::link(plan.consumer.clone(), plan.class, plan.link.clone()).to(destination))
+}
+
+/// Read the reviewed plan document `bind plan --json` printed, from a file or
+/// `-` for standard input. A document with another schema is refused.
+fn read_plan(path: &str) -> Result<barge::LinkPlan> {
+    let source = if path == "-" {
+        std::io::read_to_string(std::io::stdin().lock()).map_err(|source| {
+            Error::new(
+                ErrorKind::Io,
+                format!("cannot read the plan from stdin: {source}"),
+            )
+        })?
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|source| Error::usage(format!("cannot read plan {path}: {source}")))?
+    };
+    let document: Value = serde_json::from_str(&source)
+        .map_err(|source| Error::usage(format!("{path} is not a JSON document: {source}")))?;
+    let schema = document
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if schema != "barge.bind-plan/1" {
+        return Err(Error::usage(format!(
+            "{path} is {schema:?}, not a barge.bind-plan/1 document"
+        )));
+    }
+    let plan = document
+        .get("data")
+        .and_then(|data| data.get("plan"))
+        .ok_or_else(|| Error::usage(format!("{path} holds no plan")))?;
+    serde_json::from_value(plan.clone())
+        .map_err(|source| Error::usage(format!("{path} does not hold a plan: {source}")))
 }
 
 fn link_destination(plan: &barge::LinkPlan) -> String {

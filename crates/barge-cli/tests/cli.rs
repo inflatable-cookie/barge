@@ -309,8 +309,9 @@ fn bindings_record_drift_and_doctor_report_it() {
     std::fs::create_dir_all(&destination).unwrap();
     let home = fixture.temp.folder("home").unwrap();
     let link = home.join("registry");
-    let link = link.to_str().unwrap();
-    let destination = destination.to_str().unwrap();
+    let link_text = link.to_str().unwrap();
+    let destination_text = destination.to_str().unwrap();
+    let plan_path = home.join("plan.json");
 
     let plan = fixture.json(&[
         "bind",
@@ -320,9 +321,9 @@ fn bindings_record_drift_and_doctor_report_it() {
         "--class",
         "caches",
         "--link",
-        link,
+        link_text,
         "--to",
-        destination,
+        destination_text,
     ]);
     assert!(plan.status.success(), "{}", stderr(&plan));
     let document = parse_document(&plan);
@@ -330,52 +331,51 @@ fn bindings_record_drift_and_doctor_report_it() {
     assert_eq!(document["data"]["plan"]["before"]["state"], "absent");
     assert_eq!(document["data"]["plan"]["after"]["state"], "link");
     assert_eq!(document["data"]["plan"]["replace"], false);
-    assert!(
-        Path::new(link).symlink_metadata().is_err(),
-        "plan writes nothing"
-    );
+    assert!(!link.exists(), "plan writes nothing");
+    // The reviewed plan document is what apply consumes, so carry it.
+    std::fs::write(&plan_path, &plan.stdout).unwrap();
 
-    let wrong = fixture.run(&[
+    // A target that changed after the plan was printed is refused, even though
+    // the token names only its type.
+    std::fs::create_dir(&link).unwrap();
+    let stale = fixture.run(&[
         "bind",
         "apply",
-        "--consumer",
-        "cargo-registry",
-        "--class",
-        "caches",
-        "--link",
-        link,
-        "--to",
-        destination,
-        "--expect",
-        "directory",
+        "--plan",
+        plan_path.to_str().unwrap(),
+        "--replace",
     ]);
-    assert_eq!(wrong.status.code(), Some(1), "{}", stderr(&wrong));
+    assert_eq!(stale.status.code(), Some(1), "{}", stderr(&stale));
     assert!(
-        stderr(&wrong).contains("not the directory that was expected"),
+        stderr(&stale).contains("changed since it was planned"),
         "{}",
-        stderr(&wrong)
+        stderr(&stale)
     );
+    std::fs::remove_dir(&link).unwrap();
 
-    let applied = fixture.json(&[
-        "bind",
-        "apply",
-        "--consumer",
-        "cargo-registry",
-        "--class",
-        "caches",
-        "--link",
-        link,
-        "--to",
-        destination,
-        "--expect",
-        "absent",
-    ]);
+    // A plan document from another schema is refused as a usage error.
+    let foreign = home.join("foreign.json");
+    std::fs::write(&foreign, br#"{"schema":"barge.other/1","data":{}}"#).unwrap();
+    let foreign = fixture.run(&["bind", "apply", "--plan", foreign.to_str().unwrap()]);
+    assert_eq!(foreign.status.code(), Some(2), "{}", stderr(&foreign));
+    assert!(stderr(&foreign).contains("barge.bind-plan/1"));
+
+    let applied = fixture.json(&["bind", "apply", "--plan", plan_path.to_str().unwrap()]);
     assert!(applied.status.success(), "{}", stderr(&applied));
     let document = parse_document(&applied);
     assert_eq!(document["schema"], "barge.binding/1");
     assert_eq!(document["data"]["action"], "applied");
     assert_eq!(document["data"]["binding"]["prior"]["state"], "absent");
     assert_eq!(document["data"]["binding"]["kind"], "link");
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        destination,
+        "apply follows the reviewed plan"
+    );
+
+    // The same plan cannot be applied twice.
+    let again = fixture.run(&["bind", "apply", "--plan", plan_path.to_str().unwrap()]);
+    assert_eq!(again.status.code(), Some(1), "{}", stderr(&again));
 
     let list = fixture.json(&["bind", "list"]);
     assert!(list.status.success(), "{}", stderr(&list));
@@ -395,9 +395,9 @@ fn bindings_record_drift_and_doctor_report_it() {
     assert_eq!(document["data"]["volumes"][0]["layout"]["agrees"], true);
 
     // Point the link somewhere else: a drifted binding exits 1.
-    std::fs::remove_file(link).unwrap();
+    std::fs::remove_file(&link).unwrap();
     let elsewhere = fixture.temp.folder("elsewhere").unwrap();
-    std::os::unix::fs::symlink(&elsewhere, link).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
     let doctor = fixture.json(&["doctor"]);
     assert_eq!(doctor.status.code(), Some(1), "{}", stderr(&doctor));
     let document = parse_document(&doctor);
@@ -417,12 +417,12 @@ fn bindings_record_drift_and_doctor_report_it() {
         stderr(&refused)
     );
 
-    std::fs::remove_file(link).unwrap();
-    std::os::unix::fs::symlink(destination, link).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&destination, &link).unwrap();
     let undone = fixture.json(&["bind", "undo", "cargo-registry"]);
     assert!(undone.status.success(), "{}", stderr(&undone));
     assert_eq!(parse_document(&undone)["data"]["action"], "undone");
-    assert!(Path::new(link).symlink_metadata().is_err());
+    assert!(std::fs::symlink_metadata(&link).is_err());
 
     let doctor = fixture.json(&["doctor"]);
     assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
