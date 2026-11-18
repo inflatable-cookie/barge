@@ -11,7 +11,7 @@ name = "barged"
 path = "src/main.rs"
 
 [dependencies]
-barge-machine = { path = "../barge-machine" }
+barge-machine = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 httparse = "1"
@@ -19,6 +19,11 @@ httparse = "1"
 # logind over D-Bus, Linux only (see the workspace manifest).
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
+
+# Tests use the storage library's `testing::TempDir`, so a fixture removes itself
+# even when a test panics. Test-only, so the daemon's own tree is unchanged.
+[dev-dependencies]
+barge = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

@@ -1,6 +1,16 @@
-use super::*;
+use std::io::Write;
 
-pub(super) fn machine(arguments: &[String], json: bool) -> Result<()> {
+use barge::{Error, ErrorKind, Result};
+use barge_machine::{
+    request_power, AssumeYes, Confirmation, DaemonClient, DatagramSender, Machine, PowerActionKind,
+    PowerState, Registry, UdpSender, DEFAULT_POWER_DELAY_S,
+};
+use serde_json::json;
+
+use crate::args::{expect_no_positionals, Options};
+use crate::output::document;
+
+pub(crate) fn machine(arguments: &[String], json: bool) -> Result<()> {
     machine_dispatch(
         arguments,
         json,
@@ -10,7 +20,7 @@ pub(super) fn machine(arguments: &[String], json: bool) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn machine_with(
+pub(crate) fn machine_with(
     arguments: &[String],
     json: bool,
     registry: &Registry,
@@ -127,7 +137,7 @@ fn machine_dispatch(
                 document(
                     "barge.machine-wake/1",
                     vec![
-                        ("machine", json!(machine.name())),
+                        ("machine_name", json!(machine.name())),
                         ("destination", json!(destination.to_string())),
                         ("bytes_sent", json!(bytes_sent)),
                     ],
@@ -148,7 +158,7 @@ fn machine_dispatch(
             std::io::stdin().read_line(&mut key).map_err(|e| Error::new(ErrorKind::Io, format!("cannot read key: {e}")))?;
             let registry = discover()?;
             registry.pair(&name, &key).map_err(machine_error)?;
-            if json { document("barge.machine-paired/1", vec![("machine", json!(name))])?; } else { println!("paired {name}"); }
+            if json { document("barge.machine-paired/1", vec![("machine_name", json!(name))])?; } else { println!("paired {name}"); }
             Ok(())
         }
         "unpair" => {
@@ -156,7 +166,7 @@ fn machine_dispatch(
             let name = options.single("machine unpair", "name")?;
             let registry = discover()?;
             registry.unpair(&name).map_err(machine_error)?;
-            if json { document("barge.machine-unpaired/1", vec![("machine", json!(name))])?; } else { println!("unpaired {name}"); }
+            if json { document("barge.machine-unpaired/1", vec![("machine_name", json!(name))])?; } else { println!("unpaired {name}"); }
             Ok(())
         }
         "status" => {
@@ -169,7 +179,7 @@ fn machine_dispatch(
             if json {
                 document(
                     "barge.machine-status/1",
-                    vec![("machine", json!(machine.name())), ("state", json!(state)), ("mode", json!(mode))],
+                    vec![("machine_name", json!(machine.name())), ("machine_state", json!(state)), ("mode", json!(mode))],
                 )?;
             } else {
                 println!(
@@ -221,7 +231,7 @@ fn machine_dispatch(
                 document(
                     "barge.machine-cancel/1",
                     vec![
-                        ("machine", json!(machine.name())),
+                        ("machine_name", json!(machine.name())),
                         ("cancelled", json!(result.cancelled)),
                     ],
                 )?;
@@ -250,7 +260,7 @@ fn machine_client(registry: &Registry, machine: &Machine) -> Result<(DaemonClien
 ///
 /// Sleep starts its countdown at once; restart and shutdown ask first unless
 /// `--yes` was given (docs/knowledge/machines.md, "Behaviour").
-pub(super) fn machine_power(
+pub(crate) fn machine_power(
     action: PowerActionKind,
     command: &str,
     arguments: &[String],
@@ -286,7 +296,7 @@ pub(super) fn machine_power(
         document(
             "barge.machine-power/1",
             vec![
-                ("machine", json!(machine.name())),
+                ("machine_name", json!(machine.name())),
                 ("action", json!(result.action.as_str())),
                 ("deadline_unix_ms", json!(result.deadline_unix_ms)),
             ],
@@ -319,7 +329,7 @@ impl Confirmation for Prompt {
     }
 }
 
-pub(super) fn power_name(power: PowerState) -> &'static str {
+pub(crate) fn power_name(power: PowerState) -> &'static str {
     match power {
         PowerState::Awake => "awake",
         PowerState::Asleep => "asleep",
@@ -327,7 +337,7 @@ pub(super) fn power_name(power: PowerState) -> &'static str {
     }
 }
 
-pub(super) fn machine_error(error: barge_machine::Error) -> Error {
+pub(crate) fn machine_error(error: barge_machine::Error) -> Error {
     let kind = match error.kind() {
         barge_machine::ErrorKind::Usage => ErrorKind::Usage,
         barge_machine::ErrorKind::Refused => ErrorKind::Refused,
@@ -339,4 +349,58 @@ pub(super) fn machine_error(error: barge_machine::Error) -> Error {
         barge_machine::ErrorKind::Unreachable => ErrorKind::Io,
     };
     Error::new(kind, error.message())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::machine_with;
+    use barge::testing::TempDir;
+    use barge_machine::{DatagramSender, Registry};
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct FakeSender(Mutex<Vec<(Vec<u8>, SocketAddr)>>);
+
+    impl DatagramSender for FakeSender {
+        fn send_to(&self, bytes: &[u8], destination: SocketAddr) -> io::Result<usize> {
+            self.0.lock().unwrap().push((bytes.to_vec(), destination));
+            Ok(bytes.len())
+        }
+    }
+
+    fn arguments(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    #[test]
+    fn machine_cli_add_list_and_wake_use_the_fake_sender() {
+        // The fixture removes itself, even if an assertion below panics.
+        let temp = TempDir::new("cli-machine").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+        let sender = FakeSender::default();
+        for words in [
+            &[
+                "add",
+                "--name",
+                "pc",
+                "--hostname",
+                "pc.local",
+                "--mac",
+                "00:11:22:33:44:ff",
+                "--broadcast",
+                "192.168.1.255",
+            ][..],
+            &["list"][..],
+            &["wake", "pc"][..],
+        ] {
+            machine_with(&arguments(words), true, &registry, &sender).unwrap();
+        }
+        let sent = sender.0.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0.len(), 102);
+        assert_eq!(sent[0].1, "192.168.1.255:9".parse().unwrap());
+        assert_eq!(registry.list().unwrap().len(), 1);
+    }
 }

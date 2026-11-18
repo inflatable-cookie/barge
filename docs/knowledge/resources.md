@@ -333,29 +333,12 @@ under a class, or unknown. System items are classified without measuring them;
 unreadable or incomplete trees have approximate sizes. It's the input to the Stash layout lane's migration
 plan.
 
-## Library and CLI additions
+## Library and CLI
 
-```rust
-let layout = barge.layout()?;                       // the account's placements
-let path = barge.resource_path(Class::Scratch, Some("oxide"))?;  // absent policy applied
-let block = barge.workflow("project")?;             // the managed AGENTS.md block
-let init = barge.init(repo, None)?;                 // insert or replace it, and record it
-let check = barge.init_check(repo, None)?;          // current, stale or missing
-let report = barge.doctor()?;                       // read-only drift report
-let bindings = barge.bindings();
-let plan = bindings.plan(&binding)?;                // the exact before and after
-bindings.apply(&binding, &plan, ApplyOptions::default())?;   // takes that plan back
-```
-
-CLI, as built:
-- `barge layout show|set`
-- `barge path <class> [--project p]`
-- `barge env [--shell zsh|bash|fish]`
-- `barge bind list|plan|apply|adopt|undo`
-- `barge init [--project p] [--path dir] [--check]`
-- `barge move --plan|--apply`
-- `barge doctor`
-- `barge survey <volume>`
+The library example and the CLI's verb list have one owner:
+[architecture](architecture.md#library-surface) and
+[architecture](architecture.md#cli). This design adds no verb of its own, and
+its sections above say what each built step does.
 
 ## What stays out
 

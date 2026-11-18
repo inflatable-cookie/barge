@@ -1,6 +1,11 @@
-use super::*;
+use barge::{AreaSpec, Barge, Error, Result};
+use serde_json::json;
 
-pub(super) fn area(arguments: &[String], json: bool) -> Result<()> {
+use crate::args::{expect_no_positionals, parse_absent, parse_bool, parse_size, Options};
+use crate::human::area_line;
+use crate::output::document;
+
+pub(crate) fn area(arguments: &[String], json: bool) -> Result<()> {
     let Some(subcommand) = arguments.first().map(String::as_str) else {
         return Err(Error::usage("area needs declare or list"));
     };

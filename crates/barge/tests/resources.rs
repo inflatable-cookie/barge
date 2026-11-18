@@ -135,7 +135,7 @@ fn path_and_survey_are_read_only() {
     );
     let report = read.doctor().unwrap();
     assert!(report
-        .volumes
+        .volume_reports
         .iter()
         .all(|volume| volume.layout.as_ref().is_none_or(|layout| layout
             .unknown

@@ -1,6 +1,13 @@
-use super::*;
+use std::time::Duration;
 
-pub(super) fn scratch(arguments: &[String], json: bool) -> Result<()> {
+use barge::{Barge, Error, Result};
+use serde_json::json;
+
+use crate::args::{expect_no_positionals, Options};
+use crate::human::print_sweep;
+use crate::output::document;
+
+pub(crate) fn scratch(arguments: &[String], json: bool) -> Result<()> {
     let Some(subcommand) = arguments.first().map(String::as_str) else {
         return Err(Error::usage("scratch needs new or sweep"));
     };
@@ -25,7 +32,7 @@ pub(super) fn scratch(arguments: &[String], json: bool) -> Result<()> {
                 document(
                     "barge.scratch/1",
                     vec![
-                        ("area", json!(scratch.area().key().label())),
+                        ("area_key", json!(scratch.area().key().label())),
                         ("root", json!(root)),
                     ],
                 )?;

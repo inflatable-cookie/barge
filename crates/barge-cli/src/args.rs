@@ -1,6 +1,9 @@
-use super::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-pub(super) fn parse_size(text: &str) -> Result<u64> {
+use barge::{Absent, Error, Result};
+
+pub(crate) fn parse_size(text: &str) -> Result<u64> {
     let trimmed = text.trim();
     let split = trimmed
         .find(|character: char| !character.is_ascii_digit())
@@ -31,7 +34,7 @@ pub(super) fn parse_size(text: &str) -> Result<u64> {
         .ok_or_else(|| Error::usage(format!("size {text:?} is too large")))
 }
 
-pub(super) fn parse_bool(field: &str, text: &str) -> Result<bool> {
+pub(crate) fn parse_bool(field: &str, text: &str) -> Result<bool> {
     match text {
         "true" | "yes" => Ok(true),
         "false" | "no" => Ok(false),
@@ -41,7 +44,7 @@ pub(super) fn parse_bool(field: &str, text: &str) -> Result<bool> {
     }
 }
 
-pub(super) fn parse_absent(text: &str) -> Result<Absent> {
+pub(crate) fn parse_absent(text: &str) -> Result<Absent> {
     if text == "fail" {
         return Ok(Absent::Fail);
     }
@@ -59,7 +62,7 @@ pub(super) fn parse_absent(text: &str) -> Result<Absent> {
     ))
 }
 
-pub(super) fn expect_no_positionals(options: &Options) -> Result<()> {
+pub(crate) fn expect_no_positionals(options: &Options) -> Result<()> {
     if let Some(extra) = options.positionals.first() {
         return Err(Error::usage(format!("unexpected argument {extra:?}")));
     }
@@ -68,14 +71,14 @@ pub(super) fn expect_no_positionals(options: &Options) -> Result<()> {
 
 /// One command's parsed options.
 #[derive(Debug, Default)]
-pub(super) struct Options {
-    pub(super) values: HashMap<String, String>,
-    pub(super) flags: Vec<String>,
-    pub(super) positionals: Vec<String>,
+pub(crate) struct Options {
+    pub(crate) values: HashMap<String, String>,
+    pub(crate) flags: Vec<String>,
+    pub(crate) positionals: Vec<String>,
 }
 
 impl Options {
-    pub(super) fn parse(
+    pub(crate) fn parse(
         arguments: &[String],
         value_flags: &[&str],
         flag_flags: &[&str],
@@ -122,20 +125,20 @@ impl Options {
         Ok(options)
     }
 
-    pub(super) fn get(&self, name: &str) -> Option<String> {
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
         self.values.get(name).cloned()
     }
 
-    pub(super) fn required(&self, name: &str) -> Result<String> {
+    pub(crate) fn required(&self, name: &str) -> Result<String> {
         self.get(name)
             .ok_or_else(|| Error::usage(format!("--{name} is required")))
     }
 
-    pub(super) fn flag(&self, name: &str) -> bool {
+    pub(crate) fn flag(&self, name: &str) -> bool {
         self.flags.iter().any(|flag| flag == name)
     }
 
-    pub(super) fn single(&self, command: &str, field: &str) -> Result<String> {
+    pub(crate) fn single(&self, command: &str, field: &str) -> Result<String> {
         match self.positionals.as_slice() {
             [only] => Ok(only.clone()),
             [] => Err(Error::usage(format!("{command} needs <{field}>"))),
@@ -143,12 +146,52 @@ impl Options {
         }
     }
 
-    pub(super) fn two_positionals(&self, command: &str) -> Result<(String, String)> {
+    pub(crate) fn two_positionals(&self, command: &str) -> Result<(String, String)> {
         match self.positionals.as_slice() {
             [area, id] => Ok((area.clone(), id.clone())),
             _ => Err(Error::usage(format!(
                 "root {command} needs <namespace>/<area> <id>"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_absent, parse_size, Options};
+    use barge::Absent;
+    use std::path::PathBuf;
+
+    #[test]
+    fn sizes_parse_and_refuse() {
+        assert_eq!(parse_size("10GiB").unwrap(), 10 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("512").unwrap(), 512);
+        assert_eq!(parse_size("1 MiB").unwrap(), 1024 * 1024);
+        assert!(parse_size("ten").is_err());
+        assert!(parse_size("1PiB").is_err());
+    }
+
+    #[test]
+    fn options_refuse_unknown_flags() {
+        let parsed = Options::parse(
+            &["--volume".to_string(), "Builds".to_string()],
+            &["volume"],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(parsed.get("volume").as_deref(), Some("Builds"));
+        assert!(Options::parse(&["--nope".to_string()], &[], &[]).is_err());
+    }
+
+    #[test]
+    fn absent_policies_parse() {
+        assert_eq!(parse_absent("fail").unwrap(), Absent::Fail);
+        assert_eq!(
+            parse_absent("fallback:/tmp/pool").unwrap(),
+            Absent::Fallback {
+                path: PathBuf::from("/tmp/pool")
+            }
+        );
+        assert!(parse_absent("fallback:relative").is_err());
     }
 }

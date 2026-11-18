@@ -1,6 +1,10 @@
-use super::*;
+use barge::{ApplyOptions, Barge, Binding, Class, Error, ErrorKind, LinkPlan, Observed, Result};
+use serde_json::{json, Value};
 
-pub(super) fn bind(arguments: &[String], json: bool) -> Result<()> {
+use crate::args::{expect_no_positionals, Options};
+use crate::output::document;
+
+pub(crate) fn bind(arguments: &[String], json: bool) -> Result<()> {
     let Some(command) = arguments.first().map(String::as_str) else {
         return Err(Error::usage("bind needs list, plan, apply, adopt or undo"));
     };
@@ -131,7 +135,7 @@ pub(super) fn bind(arguments: &[String], json: bool) -> Result<()> {
     }
 }
 
-pub(super) fn binding_from_options(options: &Options) -> Result<Binding> {
+pub(crate) fn binding_from_options(options: &Options) -> Result<Binding> {
     let consumer = options.required("consumer")?;
     let class = options.required("class")?.parse::<Class>()?;
     let link = options.required("link")?;
@@ -142,9 +146,9 @@ pub(super) fn binding_from_options(options: &Options) -> Result<Binding> {
     Ok(binding)
 }
 
-pub(super) fn binding_for_plan(plan: &barge::LinkPlan) -> Result<Binding> {
+pub(crate) fn binding_for_plan(plan: &LinkPlan) -> Result<Binding> {
     let destination = match &plan.after {
-        barge::Observed::Link { destination } => destination.clone(),
+        Observed::Link { destination } => destination.clone(),
         other => {
             return Err(Error::usage(format!(
                 "the plan's after is {other}, not a link"
@@ -156,7 +160,7 @@ pub(super) fn binding_for_plan(plan: &barge::LinkPlan) -> Result<Binding> {
 
 /// Read the reviewed plan document `bind plan --json` printed, from a file or
 /// `-` for standard input. A document with another schema is refused.
-pub(super) fn read_plan(path: &str) -> Result<barge::LinkPlan> {
+pub(crate) fn read_plan(path: &str) -> Result<LinkPlan> {
     let source = if path == "-" {
         std::io::read_to_string(std::io::stdin().lock()).map_err(|source| {
             Error::new(
@@ -187,9 +191,9 @@ pub(super) fn read_plan(path: &str) -> Result<barge::LinkPlan> {
         .map_err(|source| Error::usage(format!("{path} does not hold a plan: {source}")))
 }
 
-pub(super) fn link_destination(plan: &barge::LinkPlan) -> String {
+pub(crate) fn link_destination(plan: &LinkPlan) -> String {
     match &plan.after {
-        barge::Observed::Link { destination } => destination.display().to_string(),
+        Observed::Link { destination } => destination.display().to_string(),
         other => other.to_string(),
     }
 }

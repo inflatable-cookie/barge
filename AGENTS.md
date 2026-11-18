@@ -23,17 +23,15 @@ the human summary. `crates/barge-machine` contains machine registry,
 Wake-on-LAN, daemon protocol types and the `barged` client, separate from
 storage. `crates/barged` is the machine daemon: state and power over HTTP, with
 Tailscale `whois` and logind behind seams; `packaging/barged/` holds its unit,
-polkit rule and example config. Linux is its only power backend, but it builds
-on macOS so the workspace checks cover it. Toolchain
-`1.97.1` and edition 2021 are pinned in `rust-toolchain.toml`; `Cargo.lock` is
-committed. Oxide depends on the library at an exact Git commit.
-`apps/barge-app` contains the Tauri menu-bar app and Svelte renderer.
+polkit rule and example config. Its platform limits are
+[architecture](docs/knowledge/architecture.md#platforms). Toolchain `1.97.1` and
+edition 2021 are pinned in `rust-toolchain.toml`; `Cargo.lock` is committed.
+Oxide depends on the library at an exact Git commit. `apps/barge-app` contains
+the Tauri menu-bar app and Svelte renderer.
 
-The library follows [architecture](docs/knowledge/architecture.md#library-surface):
-platform facts sit behind the `os` seam, account state under `state`, and
-areas, roots, holds, pins, trash, space policy, scratch, bindings and doctor
-are their own modules. A new mechanic is a module and an ordinary test, not a
-framework.
+The library's module surface is
+[architecture](docs/knowledge/architecture.md#library-surface). A new mechanic is
+a module and an ordinary test, not a framework.
 
 ## Validate
 
@@ -43,8 +41,8 @@ Rust runs through `oxide` (see the block below).
 - `effigy rust:test` — the unit and integration suites through `oxide test`.
 - `effigy rust:lint` — clippy with the workspace lints in `Cargo.toml`.
 - `effigy rust:format` — `oxide fmt --all -- --check`; `rust:format:apply` applies it.
-- `effigy docs:check` — Northstar link and retired-concept checks, the
-  changelog check, and `git diff --check HEAD`. Check its exit code.
+- `effigy docs:check` — Northstar's link check, the changelog check, and
+  `git diff --check HEAD`. Check its exit code.
 - `effigy app:check` — typecheck the Svelte renderer.
 - `effigy app:test` — renderer tests.
 - `effigy app:dev` — run the app locally.

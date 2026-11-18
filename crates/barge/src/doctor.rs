@@ -20,16 +20,19 @@ pub struct DoctorReport {
     /// True when every volume is present with an agreeing layout and every
     /// class folder exists, and every binding is `ok`.
     pub ok: bool,
-    pub volumes: Vec<VolumeReport>,
-    pub bindings: Vec<BindingReport>,
+    pub volume_reports: Vec<VolumeReport>,
+    pub binding_reports: Vec<BindingReport>,
 }
 
 impl DoctorReport {
     /// How many volumes and bindings are not ok.
     pub fn problems(&self) -> usize {
-        self.volumes.iter().filter(|volume| !volume.ok()).count()
+        self.volume_reports
+            .iter()
+            .filter(|volume| !volume.ok())
+            .count()
             + self
-                .bindings
+                .binding_reports
                 .iter()
                 .filter(|binding| !binding.state.is_ok())
                 .count()
@@ -160,8 +163,8 @@ impl Barge {
             && bindings.iter().all(|binding| binding.state.is_ok());
         Ok(DoctorReport {
             ok,
-            volumes,
-            bindings,
+            volume_reports: volumes,
+            binding_reports: bindings,
         })
     }
 

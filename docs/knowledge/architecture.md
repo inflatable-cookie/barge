@@ -1,8 +1,13 @@
 # Architecture
 
-Barge is one Rust library and a thin CLI over it. Oxide links the library and
-works with nothing else installed. Other tools use the CLI and its JSON output.
-Storage needs no daemon: state lives in small files, guarded by file locks.
+Barge is a small Rust workspace with one job per crate: `crates/barge` is the
+storage library, `crates/barge-cli` the thin `barge` binary over it,
+`crates/barge-machine` the machine registry, Wake-on-LAN and `barged` client,
+`crates/barged` the machine daemon ([machines](machines.md)), and
+`apps/barge-app` the menu-bar app ([app](app.md)). Oxide links the storage
+library and works with nothing else installed. Other tools use the
+CLI and its JSON output. Storage needs no daemon: state lives in small files,
+guarded by file locks.
 
 This is the lean design adopted on 2026-11-17 ([vision](vision.md#authority)).
 It replaces the earlier design, whose files are deleted together with its code.
@@ -242,7 +247,8 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 
 - `volume register [--import-layout] | volume list | volume status <name>`;
 - `area declare | area list [--volume v]`;
-- `root list [--bytes] | root pin | root unpin | root evict`;
+- `root list <namespace>/<area> [--bytes]`, and
+  `root pin|unpin|evict <namespace>/<area> <id>`;
 - `prune --volume v [--dry-run]`;
 - `scratch new | scratch sweep`;
 - `status`;
@@ -255,12 +261,14 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
   ([resources](resources.md#reaching-tools-and-agents-without-coupling));
 - `move --plan | --apply [--retarget-unrecorded]`;
 - `doctor`;
-- `machine add | list | remove | wake | status | sleep | restart | shutdown | cancel`
+- `machine add | list | remove | wake | pair | unpair | status | sleep | restart | shutdown | cancel`
   ([machines](machines.md)).
 
 `--json` prints one document with a top-level `schema` field
-(`barge.<kind>/<n>`); consumers check it and refuse unknown versions. `env`
-refuses `--json` because its output is shell code. Exit codes: 0 success, 1
+(`barge.<kind>/<n>`); consumers check it and refuse unknown versions. Every
+document's fields and their shapes are the
+[consumption contract](contracts/consumption.md). `env` refuses `--json`
+because its output is shell code. Exit codes: 0 success, 1
 refused or not found (nothing changed), 2 usage error, 3 internal error.
 `doctor` exits 1 when its read-only report is not ok; `init --check` exits 1 when
 the block is stale or missing.
@@ -272,6 +280,11 @@ at a mount), free space, and the descriptor-relative open, lock and rename
 helpers every other module calls instead of naming a syscall itself. Markers are
 portable, so Linux support is a new identity and space implementation, not a
 redesign.
+
+`barged` targets Linux: its power backend is logind over D-Bus, so sleep,
+restart and shutdown exist only there. The daemon and its tests still build and
+run on macOS so the workspace checks cover them; state and its HTTP protocol do
+not depend on the platform.
 
 ## Testing
 
@@ -323,9 +336,11 @@ path keeps the hold descriptor inherited.
 
 Designed separately, not yet built:
 
-- **Setting bindings, cache and kept placements:**
-  [resources](resources.md). Link and workflow bindings, `init` and `doctor`
-  are built.
+- **Tool adapters** for cache and kept placements ([resources](resources.md#adapters)).
+  Link and workflow bindings, `init`, `move` and `doctor` are built; the
+  `setting` adapters are not.
 - **Worktree pools:** areas of git worktrees leased through holds; see
   [vision](vision.md#direction).
-- **Machine control:** [machines](machines.md).
+- **The machine daemon's later steps:** the remote-control replacement, the
+  Tailscale sign-ins and the Barge app ([machines](machines.md#build-order)).
+  Machine control steps 1-3 are built.

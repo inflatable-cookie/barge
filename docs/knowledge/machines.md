@@ -10,8 +10,9 @@ Remote menu-bar app ([vision](vision.md#direction)).
 
 ## Parts
 
-- **`barge` CLI on the Mac:** `barge machine add|list|remove|wake|pair|unpair|status|sleep|restart|shutdown|cancel`.
-  Wake-on-LAN is a client operation and needs nothing running on the PC.
+- **`barge` CLI on the Mac:** the `machine` verbs listed in
+  [architecture](architecture.md#cli). Wake-on-LAN is a client operation and
+  needs nothing running on the PC.
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
   power actions. On Bazzite it runs as a systemd user unit and asks logind over
   D-Bus for sleep, restart and shutdown, with a polkit rule granting only those

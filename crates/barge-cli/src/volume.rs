@@ -1,6 +1,15 @@
-use super::*;
+use std::path::PathBuf;
 
-pub(super) fn volume(arguments: &[String], json: bool) -> Result<()> {
+use barge::{
+    Availability, Barge, Durability, Error, Result, VolumeRegistration, VolumeState, VolumeStatus,
+};
+use serde_json::json;
+
+use crate::args::{expect_no_positionals, parse_size, Options};
+use crate::human::{describe_state, format_size};
+use crate::output::document;
+
+pub(crate) fn volume(arguments: &[String], json: bool) -> Result<()> {
     let Some(subcommand) = arguments.first().map(String::as_str) else {
         return Err(Error::usage("volume needs register, list or status"));
     };
@@ -88,16 +97,8 @@ pub(super) fn volume(arguments: &[String], json: bool) -> Result<()> {
             let barge = Barge::open_read_only()?;
             let entries = barge.status()?;
             if json {
-                let volumes: Vec<Value> = entries
-                    .iter()
-                    .map(|entry| {
-                        json!({ "spec": entry.spec, "state": entry.state, "free_bytes": entry.free_bytes })
-                    })
-                    .collect();
-                document(
-                    "barge.volume-list/1",
-                    vec![("volumes", Value::Array(volumes))],
-                )?;
+                let volumes: Vec<VolumeStatus> = entries;
+                document("barge.volume-list/1", vec![("volumes", json!(volumes))])?;
             } else if entries.is_empty() {
                 println!("no volumes registered");
             } else {

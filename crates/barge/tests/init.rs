@@ -71,7 +71,7 @@ fn init_inserts_the_block_into_new_and_existing_files() {
     assert_eq!(report.project, "repo");
     assert_eq!(report.path, agents(&repo));
     assert_eq!(report.scratch, scratch);
-    assert_eq!(report.volume, "Builds");
+    assert_eq!(report.volume_name, "Builds");
     assert_eq!(report.volume_state, VolumeState::Present);
     assert_eq!(fs::read_to_string(agents(&repo)).unwrap(), block);
 
@@ -412,10 +412,10 @@ fn doctor_reports_the_block_as_ok_stale_and_missing() {
     let report = fixture.barge.doctor().unwrap();
     assert!(report.ok, "{report:?}");
     assert_eq!(report.problems(), 0);
-    assert_eq!(report.bindings.len(), 1);
-    assert_eq!(report.bindings[0].kind, BindingKind::Workflow);
-    assert_eq!(report.bindings[0].path, agents(&repo));
-    assert_eq!(report.bindings[0].state, BindingState::Ok);
+    assert_eq!(report.binding_reports.len(), 1);
+    assert_eq!(report.binding_reports[0].kind, BindingKind::Workflow);
+    assert_eq!(report.binding_reports[0].path, agents(&repo));
+    assert_eq!(report.binding_reports[0].state, BindingState::Ok);
 
     // A block that no longer matches the layout is stale.
     let text = fs::read_to_string(agents(&repo)).unwrap();
@@ -427,7 +427,7 @@ fn doctor_reports_the_block_as_ok_stale_and_missing() {
     let report = fixture.barge.doctor().unwrap();
     assert!(!report.ok);
     assert_eq!(report.problems(), 1);
-    match &report.bindings[0].state {
+    match &report.binding_reports[0].state {
         BindingState::Stale { reason } => assert!(reason.contains("stale"), "{reason}"),
         other => panic!("expected stale, got {other:?}"),
     }
@@ -436,7 +436,7 @@ fn doctor_reports_the_block_as_ok_stale_and_missing() {
     fs::remove_file(agents(&repo)).unwrap();
     let report = fixture.barge.doctor().unwrap();
     assert!(!report.ok);
-    assert_eq!(report.bindings[0].state, BindingState::Missing);
+    assert_eq!(report.binding_reports[0].state, BindingState::Missing);
 }
 
 #[test]

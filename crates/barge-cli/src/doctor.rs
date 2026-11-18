@@ -1,6 +1,13 @@
-use super::*;
+use std::process::ExitCode;
 
-pub(super) fn doctor(arguments: &[String], json: bool) -> Result<ExitCode> {
+use barge::{Barge, Result};
+use serde_json::json;
+
+use crate::args::{expect_no_positionals, Options};
+use crate::human::print_doctor;
+use crate::output::document;
+
+pub(crate) fn doctor(arguments: &[String], json: bool) -> Result<ExitCode> {
     let options = Options::parse(arguments, &[], &[])?;
     expect_no_positionals(&options)?;
     let report = Barge::open_read_only()?.doctor()?;
@@ -9,8 +16,8 @@ pub(super) fn doctor(arguments: &[String], json: bool) -> Result<ExitCode> {
             "barge.doctor/1",
             vec![
                 ("ok", json!(report.ok)),
-                ("volumes", json!(report.volumes)),
-                ("bindings", json!(report.bindings)),
+                ("volume_reports", json!(report.volume_reports)),
+                ("binding_reports", json!(report.binding_reports)),
             ],
         )?;
     } else {

@@ -451,17 +451,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_lookup_reads_a_real_socket_answer_without_tailscale() {
+        use barge::testing::TempDir;
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
 
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let fixture =
-            std::env::temp_dir().join(format!("barged-whois-{}-{unique}", std::process::id()));
-        std::fs::create_dir_all(&fixture).unwrap();
-        let socket = fixture.join("tailscaled.sock");
+        // A unix socket path is limited to 103 bytes here, and this fixture used
+        // to spend all of them. `TempDir` gives a private folder that removes
+        // itself even when the test panics; the short label and socket name keep
+        // the whole path well inside the limit.
+        let fixture = TempDir::new("wl").unwrap();
+        let socket = fixture.child("s");
         let listener = UnixListener::bind(&socket).unwrap();
 
         let answers = [
@@ -491,7 +490,6 @@ mod tests {
             assert_eq!(node, PeerNode::new("n1234ABCD", "macbook.tail1234.ts.net"));
         }
         server.join().unwrap();
-        std::fs::remove_dir_all(&fixture).unwrap();
     }
 
     #[cfg(unix)]

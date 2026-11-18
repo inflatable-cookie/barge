@@ -1,6 +1,11 @@
-use super::*;
+use barge::{Barge, Error, Result};
+use serde_json::json;
 
-pub(super) fn root(arguments: &[String], json: bool) -> Result<()> {
+use crate::args::Options;
+use crate::human::{describe_root, describe_size};
+use crate::output::document;
+
+pub(crate) fn root(arguments: &[String], json: bool) -> Result<()> {
     let Some(subcommand) = arguments.first().map(String::as_str) else {
         return Err(Error::usage("root needs list, pin, unpin or evict"));
     };
@@ -20,7 +25,7 @@ pub(super) fn root(arguments: &[String], json: bool) -> Result<()> {
                 document(
                     "barge.roots/1",
                     vec![
-                        ("area", json!(area.key().label())),
+                        ("area_key", json!(area.key().label())),
                         ("bytes_included", json!(options.flag("bytes"))),
                         ("roots", json!(listing.roots)),
                         ("stragglers", json!(listing.stragglers)),
@@ -110,12 +115,12 @@ pub(super) fn root(arguments: &[String], json: bool) -> Result<()> {
     }
 }
 
-pub(super) fn finish(json: bool, schema: &str, area: &str, id: &str, action: &str) -> Result<()> {
+pub(crate) fn finish(json: bool, schema: &str, area: &str, id: &str, action: &str) -> Result<()> {
     if json {
         document(
             schema,
             vec![
-                ("area", json!(area)),
+                ("area_key", json!(area)),
                 ("id", json!(id)),
                 ("action", json!(action)),
             ],
