@@ -13,8 +13,8 @@ alias = "barge"
 ]
 
 # Rust runs through the installed `oxide`, never raw `cargo` (AGENTS.md).
-# `rust:lint` is the RustQuality strict profile's mechanical set: clippy::all
-# plus the rustc lints the workspace manifests declare.
+# `rust:lint` is clippy::all plus the rustc lints the workspace manifests
+# declare.
 "rust:compile" = "oxide check --workspace --all-targets --all-features --locked"
 "rust:format" = "oxide fmt --all -- --check"
 "rust:format:apply" = "oxide fmt --all"

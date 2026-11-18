@@ -30,8 +30,9 @@ committed. Oxide depends on the library at an exact Git commit.
 
 The library follows [architecture](docs/knowledge/architecture.md#library-surface):
 platform facts sit behind the `os` seam, account state under `state`, and
-areas, roots, holds, pins, trash, space policy and scratch are their own
-modules. A new mechanic is a module and an ordinary test, not a framework.
+areas, roots, holds, pins, trash, space policy, scratch, bindings and doctor
+are their own modules. A new mechanic is a module and an ordinary test, not a
+framework.
 
 ## Validate
 
@@ -39,32 +40,13 @@ Rust runs through `oxide` (see the block below).
 
 - `effigy rust:compile` — `oxide check --workspace --all-targets --all-features --locked`.
 - `effigy rust:test` — the unit and integration suites through `oxide test`.
-- `effigy rust:lint` — clippy; repair findings or record a deviation in
-  `docs/knowledge/contracts/rust-quality-deviations.json`.
+- `effigy rust:lint` — clippy with the workspace lints in `Cargo.toml`.
 - `effigy rust:format` — `oxide fmt --all -- --check`; `rust:format:apply` applies it.
 - `effigy docs:check` — Northstar link and retired-concept checks, the
   changelog check, and `git diff --check HEAD`. Check its exit code.
 
 Those are the repository's only selectors. Add one only for a check this
 section names, and run it through Effigy rather than raw `cargo`.
-
-RustQuality strict is active for the Rust source, manifests, tests and their
-documentation: `docs/knowledge/contracts/language-quality-activation.json` opts
-in, `rust-quality-profile.json` declares the profile, and
-`rust-quality-deviations.json` records every accepted deviation.
-
-<!-- northstar:rust-quality:start -->
-## Northstar Rust Quality
-
-Scope: Rust source, Cargo manifests, build files, tests, and directly related
-documentation under this directory.
-
-Use Northstar's strict everyday-authoring route for ordinary Rust work. Resolve
-the repository-owned profile and deviations under `docs/knowledge/contracts/`; never
-assume a universal MSRV. Re-enter at task start and coherent batch closeout.
-Preserve unrelated work. A quality audit, no-slop pass, or audit-and-fix request
-is explicit audit intent; never route it through everyday authoring.
-<!-- northstar:rust-quality:end -->
 
 <!-- oxide:begin -->
 <!-- oxide:workspaces: . -->

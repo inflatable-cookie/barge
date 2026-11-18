@@ -83,8 +83,8 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 
 Account state lives in `~/Library/Application Support/barge/` on macOS
 (`$XDG_STATE_HOME/barge/` on Linux; `BARGE_STATE_DIR` overrides both):
-`volumes.json` and `areas/<namespace>.<area>.json`. Writes take the state lock
-and publish by atomic rename.
+`volumes.json`, `areas/<namespace>.<area>.json`, `layout.json` and
+`bindings.json`. Writes take the state lock and publish by atomic rename.
 
 Today's Stash layout (`scratch/`, `caches/`, `oxide-pool/`, `oxide-outputs/`
 at the drive root) is expressed as `root_dir = ""` with Oxide's two areas
@@ -102,8 +102,18 @@ barge.register_volume(VolumeRegistration::new("Builds", mount))?;
 let layout = barge.layout()?;                     // account resource placements
 let scratch = barge.resource_path(Class::Scratch, Some("project"))?;
 let survey = barge.survey("Builds", true)?;       // read-only inventory
+let report = barge.doctor()?;                     // read-only drift report
 let vol = barge.volume("Builds")?;
 vol.state()?;                                     // Present | Absent | Mismatch
+
+let bindings = barge.bindings();
+bindings.list()?;                                 // recorded bindings
+let binding = Binding::link("cargo-registry", Class::Caches, link)
+    .to(class_folder);                            // the binding, passed explicitly
+let plan = bindings.plan(&binding)?;              // exact before and after
+bindings.apply(&binding, &plan, ApplyOptions::default())?;
+bindings.adopt(&binding)?;                        // record an existing link, unchanged
+bindings.undo("cargo-registry")?;                 // restore the prior state
 
 let area = barge.area(
     AreaSpec::new("oxide", "pool", "Builds")
@@ -139,7 +149,8 @@ Missing state is empty. Mutating operations refuse before filesystem access;
 reported as unheld.
 
 The stored documents carry their own schema names (`barge.volumes/1`,
-`barge.layout/1`, `barge.area/1`, `barge.root/1` and `/2`, `barge.pin/1`, `barge.activity/1`
+`barge.layout/1`, `barge.bindings/1`, `barge.area/1`, `barge.root/1` and `/2`,
+`barge.pin/1`, `barge.activity/1`
 and `/2`); activity schema 2 also records each root's bytes at hold release,
 and readers continue to accept schema 1 records.
 Root schema 1 keeps the derived `<label>-<id>` folder rule, while schema 2
@@ -186,11 +197,13 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 
 `barge` wraps the library: `volume register|list|status`, `area list`,
 `root list [--bytes]|pin|unpin|evict`, `prune [--dry-run]`, `scratch new|sweep`,
-`status`, `layout show|set`, `path`, `env`, `survey`. `--json` prints one
+`status`, `layout show|set`, `path`, `env`, `survey`,
+`bind list|plan|apply|adopt|undo`, `doctor`. `--json` prints one
 document with a top-level `schema` field
 (`barge.<kind>/<n>`); consumers check it and refuse unknown versions. `env`
 refuses `--json` because its output is shell code. Exit
 codes: 0 success, 1 refused (nothing changed), 2 usage error, 3 internal error.
+`doctor` exits 1 when its read-only report is not ok.
 
 ## Platforms
 
@@ -214,7 +227,12 @@ identity. Required cases:
 - unmarked or foreign folders in an area are reported and never deleted;
 - pins survive prune; the floor refuses only when nothing idle remains;
 - a different volume at the registered mount is refused;
-- a mismatched area declaration is refused with the differing fields named.
+- a mismatched area declaration is refused with the differing fields named;
+- plan, apply, adopt and undo of a link on temporary paths, including a target
+  that changed after the plan, a preserved directory, and deletion that never
+  follows a symlink;
+- doctor reports ok, drifted, missing and unavailable, and writes nothing on a
+  read-only account.
 
 There are no native proof ladders or capture harnesses. Before Oxide adopts a
 new Barge revision, run `barge volume status` and a `prune --dry-run` against
@@ -233,7 +251,8 @@ path keeps the hold descriptor inherited.
 
 Designed separately, not yet built:
 
-- **Bindings, cache and kept placements, doctor and moves:** [resources](resources.md).
+- **Setting and workflow bindings, cache and kept placements, and moves:**
+  [resources](resources.md). Link bindings and `doctor` are built.
 - **Worktree pools:** areas of git worktrees leased through holds; see
   [vision](vision.md#direction).
 - **Machine control:** [machines](machines.md).

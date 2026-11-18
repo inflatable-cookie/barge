@@ -14,11 +14,9 @@ rust-version = "1.97.1"
 # No registry is chosen in stage 1; the library is consumed by path or git.
 publish = false
 
-# RustQuality strict (docs/knowledge/contracts/rust-quality-deviations.json).
-# The pack's mechanical set for this profile is clippy::all plus the two rustc
-# lints the API and unsafe rules name; its threshold lints (cognitive
-# complexity, too_many_lines, type_complexity) are evaluation-only and are not
-# turned into gates here.
+# Workspace lints: clippy::all plus two rustc lints for API and unsafe hygiene.
+# Threshold lints (cognitive complexity, too_many_lines, type_complexity) are
+# deliberately not gates.
 [workspace.lints.rust]
 missing_debug_implementations = "deny"
 unsafe_op_in_unsafe_fn = "deny"

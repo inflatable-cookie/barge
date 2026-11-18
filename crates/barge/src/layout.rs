@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Absent, Barge, Durability, Error, Result, VolumeState};
+use crate::{Absent, Barge, Core, Durability, Error, Result, VolumeState};
 
 const SCHEMA: &str = "barge.layout/1";
 
@@ -176,10 +176,17 @@ pub struct ResourcePath {
     pub fallback: bool,
 }
 
+impl Core {
+    /// Read the account layout, without creating state.
+    pub(crate) fn account_layout(&self) -> Result<Layout> {
+        Ok(read(&self.state.root().join("layout.json"))?.unwrap_or_default())
+    }
+}
+
 impl Barge {
     /// Read the account layout, without creating state.
     pub fn layout(&self) -> Result<Layout> {
-        Ok(read(&self.state_dir().join("layout.json"))?.unwrap_or_default())
+        self.core.account_layout()
     }
 
     /// Read a volume's record, after checking the registered volume identity.
