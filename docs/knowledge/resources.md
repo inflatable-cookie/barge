@@ -1,6 +1,6 @@
 # Resources and bindings
 
-Status: design approved by Tom, 2026-11-18. Step 1 is built; later steps remain planned. The lean storage core in [architecture](architecture.md) is the mechanism
+Status: design approved by Tom, 2026-11-18. Steps 1 and 2 are built; later steps remain planned. The lean storage core in [architecture](architecture.md) is the mechanism
 this design builds on and does not change.
 
 ## The problem
@@ -114,6 +114,25 @@ Bindings are per machine, stored in account state (`bindings.json`,
 and key, link path, or repository), the value Barge applied, when it applied
 it, and what was there before, so undo restores it exactly.
 
+Only the `link` kind is built. Its rules:
+
+- `plan` shows the exact before and after; `apply` takes the binding explicitly
+  and refuses a target that changed after the plan was made;
+- `adopt` records a symlink that already points into a class folder without
+  changing it;
+- `undo` restores the prior state exactly: nothing, an older link, or a real
+  entry Barge preserved;
+- a real directory or file is only replaced when the plan shows it and the
+  caller passes the explicit replace. It is renamed beside the link
+  (`<name>.barge-prior`) and undo renames it back; moving data is not part of
+  this kind;
+- a destination must be an existing folder inside the class folder, and Barge
+  never creates it;
+- deleting a link removes the link itself and never follows it.
+
+One record names one consumer, so a tool with two links records two consumers
+(`cargo-registry`, `cargo-git`).
+
 **Cache and kept placements** are `link` or `setting` bindings for tool-owned
 data:
 
@@ -200,6 +219,12 @@ Rejected:
 `--json` uses the usual schema contract. Exit codes: 0 when everything is ok,
 1 when anything drifted. Doctor changes nothing.
 
+As built, `0` requires every volume to be present with an agreeing layout, every
+class folder to exist and every binding to be `ok`; an absent or mismatched
+volume, a disagreeing copy, a missing class folder, and a `drifted`, `missing`
+or `unavailable` binding all exit 1. Doctor writes nothing and works on a
+read-only account.
+
 ## Moving a class
 
 Changing where a class lives is the operation the Stash tidy needs, so it is
@@ -264,7 +289,8 @@ CLI:
 Each step is its own brief, reviewed as usual.
 
 1. **Built:** classes and the layout manifest; `path` and `env`; `survey`.
-2. Binding records, the `link` kind and `doctor`; adopt the Cargo links.
+2. **Built:** binding records, the `link` kind and `doctor`. Adopting the real
+   Cargo links is the operator's step after merge.
 3. `init` with workflow blocks; adopt this repository, then Effigy's.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
 5. `move --plan|--apply`; the Stash layout lane then uses it item by item.

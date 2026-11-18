@@ -12,8 +12,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use barge::{
-    Absent, AreaSpec, Availability, Barge, Class, Durability, Error, ErrorKind, Placement, Result,
-    RootInfo, VolumeRegistration, VolumeState, VolumeStatus,
+    Absent, ApplyOptions, AreaSpec, Availability, Barge, Binding, BindingState, Class,
+    DoctorReport, Durability, Error, ErrorKind, Placement, Result, RootInfo, VolumeRegistration,
+    VolumeState, VolumeStatus,
 };
 use barge_machine::{DatagramSender, Machine, Registry, UdpSender};
 use serde_json::{json, Value};
@@ -26,7 +27,7 @@ fn main() -> ExitCode {
         .filter(|argument| argument != "--json")
         .collect();
     match run(&arguments, json) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             report_error(&error, json);
             ExitCode::from(match error.kind() {
@@ -38,7 +39,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(arguments: &[String], json: bool) -> Result<()> {
+fn run(arguments: &[String], json: bool) -> Result<ExitCode> {
     let Some(command) = arguments.first().map(String::as_str) else {
         return Err(Error::usage(usage_text()));
     };
@@ -46,8 +47,18 @@ fn run(arguments: &[String], json: bool) -> Result<()> {
     match command {
         "help" | "--help" | "-h" => {
             println!("{}", usage_text());
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
+        "doctor" => doctor(rest, json),
+        other => {
+            dispatch(other, rest, json)?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn dispatch(command: &str, rest: &[String], json: bool) -> Result<()> {
+    match command {
         "status" => status(rest, json),
         "layout" => layout(rest, json),
         "path" => resource_path(rest, json),
@@ -57,6 +68,7 @@ fn run(arguments: &[String], json: bool) -> Result<()> {
         "volume" => volume(rest, json),
         "area" => area(rest, json),
         "root" => root(rest, json),
+        "bind" => bind(rest, json),
         "prune" => prune(rest, json),
         "scratch" => scratch(rest, json),
         "machine" => machine(rest, json),
@@ -91,6 +103,13 @@ usage: barge [--json] <command>
   root pin <namespace>/<area> <id> [--reason TEXT]
   root unpin <namespace>/<area> <id>
   root evict <namespace>/<area> <id>      rename into trash, then delete
+  bind list                               recorded bindings
+  bind plan --consumer C --class K --link PATH --to DEST
+  bind apply --consumer C --class K --link PATH --to DEST
+    [--replace] [--expect STATE]          create the link, or preserve and link
+  bind adopt --consumer C --class K --link PATH
+  bind undo <consumer>                    restore what was there before
+  doctor                                  volumes, layout and binding drift
   prune --volume V [--dry-run]            evict idle roots to meet policy
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
@@ -361,6 +380,259 @@ fn survey(arguments: &[String], json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn bind(arguments: &[String], json: bool) -> Result<()> {
+    let Some(command) = arguments.first().map(String::as_str) else {
+        return Err(Error::usage("bind needs list, plan, apply, adopt or undo"));
+    };
+    let rest = &arguments[1..];
+    match command {
+        "list" => {
+            let options = Options::parse(rest, &[], &[])?;
+            expect_no_positionals(&options)?;
+            let bindings = Barge::open_read_only()?.bindings().list()?;
+            if json {
+                document("barge.bindings/1", vec![("bindings", json!(bindings))])?;
+            } else if bindings.is_empty() {
+                println!("no bindings recorded");
+            } else {
+                for record in &bindings {
+                    println!(
+                        "{} {} {} at {} -> {}",
+                        record.consumer,
+                        record.class.name(),
+                        record.kind.name(),
+                        record.link_path().display(),
+                        record.applied.value.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        "plan" => {
+            let options = Options::parse(rest, &["consumer", "class", "link", "to"], &[])?;
+            expect_no_positionals(&options)?;
+            let binding = binding_from_options(&options)?;
+            let plan = Barge::open_read_only()?.bindings().plan(&binding)?;
+            if json {
+                document("barge.bind-plan/1", vec![("plan", json!(plan))])?;
+            } else {
+                println!(
+                    "link {} -> {}",
+                    plan.link.display(),
+                    link_destination(&plan)
+                );
+                println!("  before: {}", plan.before);
+                println!("  after: {}", plan.after);
+                println!("  expect: {}", plan.before.token());
+                if plan.replace {
+                    println!("  replace: yes (pass --replace to preserve the existing entry)");
+                }
+            }
+            Ok(())
+        }
+        "apply" => {
+            let options = Options::parse(
+                rest,
+                &["consumer", "class", "link", "to", "expect"],
+                &["replace"],
+            )?;
+            expect_no_positionals(&options)?;
+            let binding = binding_from_options(&options)?;
+            let barge = Barge::open()?;
+            let bindings = barge.bindings();
+            let plan = bindings.plan(&binding)?;
+            if let Some(expect) = options.get("expect") {
+                if expect != plan.before.token() {
+                    return Err(Error::refused(format!(
+                        "target {} is {}, not the {} that was expected",
+                        plan.link.display(),
+                        plan.before,
+                        expect
+                    )));
+                }
+            }
+            let record = bindings.apply(
+                &binding,
+                &plan,
+                ApplyOptions {
+                    replace: options.flag("replace"),
+                },
+            )?;
+            if json {
+                document(
+                    "barge.binding/1",
+                    vec![("action", json!("applied")), ("binding", json!(record))],
+                )?;
+            } else {
+                println!(
+                    "applied {} {} at {} -> {} (was {})",
+                    record.consumer,
+                    record.class.name(),
+                    record.link_path().display(),
+                    record.applied.value.display(),
+                    record.prior
+                );
+            }
+            Ok(())
+        }
+        "adopt" => {
+            let options = Options::parse(rest, &["consumer", "class", "link", "to"], &[])?;
+            expect_no_positionals(&options)?;
+            let binding = binding_from_options(&options)?;
+            let record = Barge::open()?.bindings().adopt(&binding)?;
+            if json {
+                document(
+                    "barge.binding/1",
+                    vec![("action", json!("adopted")), ("binding", json!(record))],
+                )?;
+            } else {
+                println!(
+                    "adopted {} {} at {} -> {}",
+                    record.consumer,
+                    record.class.name(),
+                    record.link_path().display(),
+                    record.applied.value.display()
+                );
+            }
+            Ok(())
+        }
+        "undo" => {
+            let options = Options::parse(rest, &[], &[])?;
+            let consumer = options.single("bind undo", "consumer")?;
+            let record = Barge::open()?.bindings().undo(&consumer)?;
+            if json {
+                document(
+                    "barge.binding/1",
+                    vec![("action", json!("undone")), ("binding", json!(record))],
+                )?;
+            } else {
+                println!(
+                    "undid {} {} at {} (restored {})",
+                    record.consumer,
+                    record.class.name(),
+                    record.link_path().display(),
+                    record.prior
+                );
+            }
+            Ok(())
+        }
+        other => Err(Error::usage(format!(
+            "unknown bind command {other:?}; use list, plan, apply, adopt or undo"
+        ))),
+    }
+}
+
+fn binding_from_options(options: &Options) -> Result<Binding> {
+    let consumer = options.required("consumer")?;
+    let class = options.required("class")?.parse::<Class>()?;
+    let link = options.required("link")?;
+    let mut binding = Binding::link(consumer, class, link);
+    if let Some(value) = options.get("to") {
+        binding = binding.to(value);
+    }
+    Ok(binding)
+}
+
+fn link_destination(plan: &barge::LinkPlan) -> String {
+    match &plan.after {
+        barge::Observed::Link { destination } => destination.display().to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn doctor(arguments: &[String], json: bool) -> Result<ExitCode> {
+    let options = Options::parse(arguments, &[], &[])?;
+    expect_no_positionals(&options)?;
+    let report = Barge::open_read_only()?.doctor()?;
+    if json {
+        document(
+            "barge.doctor/1",
+            vec![
+                ("ok", json!(report.ok)),
+                ("volumes", json!(report.volumes)),
+                ("bindings", json!(report.bindings)),
+            ],
+        )?;
+    } else {
+        print_doctor(&report);
+    }
+    Ok(if report.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+fn print_doctor(report: &DoctorReport) {
+    for volume in &report.volumes {
+        println!(
+            "volume {} at {}: {}",
+            volume.name,
+            volume.mount.display(),
+            describe_state(&volume.state)
+        );
+        if let Some(layout) = &volume.layout {
+            println!(
+                "  layout: {}",
+                if layout.agrees {
+                    "the two copies agree"
+                } else {
+                    "the volume record disagrees with the account"
+                }
+            );
+            for class in &layout.classes {
+                println!(
+                    "  class {} at {}: {}",
+                    class.class.name(),
+                    class.path.display(),
+                    if class.exists { "present" } else { "missing" }
+                );
+            }
+            for path in &layout.unknown {
+                println!("  unknown {}", path.display());
+            }
+        }
+    }
+    for binding in &report.bindings {
+        println!(
+            "binding {} {} {} at {}: {}",
+            binding.consumer,
+            binding.class.name(),
+            binding.kind.name(),
+            binding.link.display(),
+            describe_binding(&binding.state)
+        );
+    }
+    println!(
+        "doctor: {}",
+        if report.ok {
+            "ok".to_string()
+        } else {
+            format!("{} problems", report.problems())
+        }
+    );
+}
+
+fn describe_binding(state: &BindingState) -> String {
+    match state {
+        BindingState::Ok => "ok".to_string(),
+        BindingState::Missing => "missing: nothing is at the target".to_string(),
+        BindingState::Unavailable { reason } => format!("unavailable: {reason}"),
+        BindingState::Drifted {
+            observed,
+            expected,
+            reason,
+        } => format!(
+            "drifted ({reason}): expected {}, observed {}",
+            expected.display(),
+            observed
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "nothing".to_string())
+        ),
+    }
 }
 
 fn status(arguments: &[String], json: bool) -> Result<()> {

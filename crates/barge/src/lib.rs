@@ -17,7 +17,9 @@
 )]
 
 pub mod area;
+pub mod bindings;
 pub mod clock;
+pub mod doctor;
 pub mod error;
 pub mod hold;
 pub mod layout;
@@ -36,7 +38,14 @@ use std::sync::Arc;
 use state::StateDir;
 
 pub use area::{Absent, Area, AreaRecord, AreaSpec, AreaStatus, Location};
+pub use bindings::{
+    Applied, ApplyOptions, Binding, BindingKind, BindingRecord, BindingTarget, Bindings, EntryKind,
+    LinkPlan, Observed, Prior,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use doctor::{
+    BindingReport, BindingState, ClassFolder, DoctorReport, LayoutReport, VolumeReport,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use hold::{Hold, Mode};
 pub use layout::{Class, Layout, Placement, ResourcePath, SurveyItem};
@@ -68,6 +77,16 @@ impl Core {
         } else {
             Ok(())
         }
+    }
+
+    /// One registered volume by name, reading the account's volume list.
+    pub(crate) fn volume(&self, name: &str) -> Result<Volume> {
+        self.state
+            .read_volumes()?
+            .into_iter()
+            .find(|spec| spec.name == name)
+            .map(|spec| Volume::new(self.clone(), spec))
+            .ok_or_else(|| Error::not_found(format!("volume {name} is not registered")))
     }
 }
 
@@ -197,13 +216,7 @@ impl Barge {
 
     /// One registered volume by name.
     pub fn volume(&self, name: &str) -> Result<Volume> {
-        self.core
-            .state
-            .read_volumes()?
-            .into_iter()
-            .find(|spec| spec.name == name)
-            .map(|spec| Volume::new(self.core.clone(), spec))
-            .ok_or_else(|| Error::not_found(format!("volume {name} is not registered")))
+        self.core.volume(name)
     }
 
     /// Declare an area. The stored declaration is authoritative: a second

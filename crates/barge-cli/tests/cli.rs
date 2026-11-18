@@ -296,3 +296,134 @@ fn env_rejects_json_output() {
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("does not support --json"));
 }
+
+#[test]
+fn bindings_record_drift_and_doctor_report_it() {
+    let fixture = Fixture::new();
+    assert!(register(&fixture).status.success());
+    let set = fixture.run(&[
+        "layout", "set", "caches", "--volume", "Builds", "--path", "caches",
+    ]);
+    assert!(set.status.success(), "{}", stderr(&set));
+    let destination = fixture.mount.join("caches/cargo/registry");
+    std::fs::create_dir_all(&destination).unwrap();
+    let home = fixture.temp.folder("home").unwrap();
+    let link = home.join("registry");
+    let link = link.to_str().unwrap();
+    let destination = destination.to_str().unwrap();
+
+    let plan = fixture.json(&[
+        "bind",
+        "plan",
+        "--consumer",
+        "cargo-registry",
+        "--class",
+        "caches",
+        "--link",
+        link,
+        "--to",
+        destination,
+    ]);
+    assert!(plan.status.success(), "{}", stderr(&plan));
+    let document = parse_document(&plan);
+    assert_eq!(document["schema"], "barge.bind-plan/1");
+    assert_eq!(document["data"]["plan"]["before"]["state"], "absent");
+    assert_eq!(document["data"]["plan"]["after"]["state"], "link");
+    assert_eq!(document["data"]["plan"]["replace"], false);
+    assert!(
+        Path::new(link).symlink_metadata().is_err(),
+        "plan writes nothing"
+    );
+
+    let wrong = fixture.run(&[
+        "bind",
+        "apply",
+        "--consumer",
+        "cargo-registry",
+        "--class",
+        "caches",
+        "--link",
+        link,
+        "--to",
+        destination,
+        "--expect",
+        "directory",
+    ]);
+    assert_eq!(wrong.status.code(), Some(1), "{}", stderr(&wrong));
+    assert!(
+        stderr(&wrong).contains("not the directory that was expected"),
+        "{}",
+        stderr(&wrong)
+    );
+
+    let applied = fixture.json(&[
+        "bind",
+        "apply",
+        "--consumer",
+        "cargo-registry",
+        "--class",
+        "caches",
+        "--link",
+        link,
+        "--to",
+        destination,
+        "--expect",
+        "absent",
+    ]);
+    assert!(applied.status.success(), "{}", stderr(&applied));
+    let document = parse_document(&applied);
+    assert_eq!(document["schema"], "barge.binding/1");
+    assert_eq!(document["data"]["action"], "applied");
+    assert_eq!(document["data"]["binding"]["prior"]["state"], "absent");
+    assert_eq!(document["data"]["binding"]["kind"], "link");
+
+    let list = fixture.json(&["bind", "list"]);
+    assert!(list.status.success(), "{}", stderr(&list));
+    let document = parse_document(&list);
+    assert_eq!(document["schema"], "barge.bindings/1");
+    assert_eq!(
+        document["data"]["bindings"][0]["consumer"],
+        "cargo-registry"
+    );
+
+    let doctor = fixture.json(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
+    let document = parse_document(&doctor);
+    assert_eq!(document["schema"], "barge.doctor/1");
+    assert_eq!(document["data"]["ok"], true);
+    assert_eq!(document["data"]["bindings"][0]["state"], "ok");
+    assert_eq!(document["data"]["volumes"][0]["layout"]["agrees"], true);
+
+    // Point the link somewhere else: a drifted binding exits 1.
+    std::fs::remove_file(link).unwrap();
+    let elsewhere = fixture.temp.folder("elsewhere").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, link).unwrap();
+    let doctor = fixture.json(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(1), "{}", stderr(&doctor));
+    let document = parse_document(&doctor);
+    assert_eq!(document["data"]["ok"], false);
+    assert_eq!(document["data"]["bindings"][0]["state"], "drifted");
+    assert_eq!(
+        document["data"]["bindings"][0]["reason"],
+        "the link points somewhere else"
+    );
+
+    // Undo refuses a link that changed since apply.
+    let refused = fixture.run(&["bind", "undo", "cargo-registry"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("refusing to undo"),
+        "{}",
+        stderr(&refused)
+    );
+
+    std::fs::remove_file(link).unwrap();
+    std::os::unix::fs::symlink(destination, link).unwrap();
+    let undone = fixture.json(&["bind", "undo", "cargo-registry"]);
+    assert!(undone.status.success(), "{}", stderr(&undone));
+    assert_eq!(parse_document(&undone)["data"]["action"], "undone");
+    assert!(Path::new(link).symlink_metadata().is_err());
+
+    let doctor = fixture.json(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
+}

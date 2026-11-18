@@ -1,0 +1,825 @@
+//! Bindings: how one consumer is pointed at a class.
+//!
+//! A record lives in `bindings.json` under the account state directory
+//! (`barge.bindings/1`). It names the consumer, the class, the kind, the target,
+//! the value Barge applied and when, and what was there before, so undo restores
+//! the prior state exactly. Writes take the state lock and publish by atomic
+//! rename; reads never create anything.
+//!
+//! Only the `link` kind is built. It owns a symlink at the tool's own path. A
+//! real directory or file is never replaced unless the plan showed it and the
+//! caller passed the explicit replace; it is renamed aside and undo renames it
+//! back. Deleting a link removes the link itself, never what it points at.
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::fs;
+use std::os::unix::fs::symlink;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, ErrorKind, Result};
+use crate::layout::Class;
+use crate::state::{publish, validate_name};
+use crate::{Barge, Core};
+
+/// The schema name of `bindings.json`.
+pub const BINDINGS_SCHEMA: &str = "barge.bindings/1";
+
+/// The file that lists recorded bindings.
+const BINDINGS_NAME: &str = "bindings.json";
+
+/// The suffix a preserved directory or file is renamed to beside its link.
+const PRESERVED_SUFFIX: &str = ".barge-prior";
+
+/// How a consumer learns where a class lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingKind {
+    /// The consumer links the library and asks it: no record, never drifts.
+    Linked,
+    /// The consumer runs `barge path` or `barge env`: no record, never drifts.
+    Queried,
+    /// An adapter writes the consumer's own configuration file.
+    Setting,
+    /// Barge owns a symlink at the consumer's own path.
+    Link,
+    /// A managed block in a repository's `AGENTS.md`.
+    Workflow,
+}
+
+impl BindingKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Linked => "linked",
+            Self::Queried => "queried",
+            Self::Setting => "setting",
+            Self::Link => "link",
+            Self::Workflow => "workflow",
+        }
+    }
+}
+
+/// Where a binding points. A link path today; the tagged shape leaves room for
+/// the setting file and key, and the repository, that later steps add.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BindingTarget {
+    Link { path: PathBuf },
+}
+
+/// The kind of entry a preserved target held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    Directory,
+    File,
+}
+
+/// What was at the target before Barge applied the link. Undo restores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Prior {
+    /// Nothing was there; undo removes the link.
+    Absent,
+    /// A symlink with this exact target was there; undo recreates it.
+    Link { destination: PathBuf },
+    /// A real directory or file was there; it was renamed aside and undo renames
+    /// it back.
+    Preserved { path: PathBuf, entry: EntryKind },
+}
+
+impl fmt::Display for Prior {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("absent"),
+            Self::Link { destination } => write!(formatter, "a link to {}", destination.display()),
+            Self::Preserved { path, entry } => write!(
+                formatter,
+                "a preserved {} at {}",
+                match entry {
+                    EntryKind::Directory => "directory",
+                    EntryKind::File => "file",
+                },
+                path.display()
+            ),
+        }
+    }
+}
+
+/// The value Barge applied and when it applied it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Applied {
+    /// The resolved class value the target now points at.
+    pub value: PathBuf,
+    pub at_unix_ms: u64,
+}
+
+/// One recorded binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingRecord {
+    pub consumer: String,
+    pub class: Class,
+    pub kind: BindingKind,
+    pub target: BindingTarget,
+    pub applied: Applied,
+    pub prior: Prior,
+}
+
+impl BindingRecord {
+    /// The link path this record owns.
+    pub fn link_path(&self) -> &Path {
+        match &self.target {
+            BindingTarget::Link { path } => path,
+        }
+    }
+}
+
+/// What is at a link target now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Observed {
+    Absent,
+    Link { destination: PathBuf },
+    Directory,
+    File,
+}
+
+impl Observed {
+    /// A short stable token a plan and an apply can compare across processes.
+    pub fn token(&self) -> String {
+        match self {
+            Self::Absent => "absent".to_string(),
+            Self::Link { destination } => format!("link:{}", destination.display()),
+            Self::Directory => "directory".to_string(),
+            Self::File => "file".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for Observed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("absent"),
+            Self::Link { destination } => write!(formatter, "a link to {}", destination.display()),
+            Self::Directory => formatter.write_str("a directory"),
+            Self::File => formatter.write_str("a file"),
+        }
+    }
+}
+
+/// A link binding the caller asks for, always passed explicitly: Barge never
+/// discovers and adopts a binding by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    consumer: String,
+    class: Class,
+    link: PathBuf,
+    value: Option<PathBuf>,
+}
+
+impl Binding {
+    /// A link binding for one consumer, class and link path. Apply also needs
+    /// the value with [`Binding::to`]; adopt reads it from the existing link.
+    pub fn link(consumer: impl Into<String>, class: Class, link: impl Into<PathBuf>) -> Self {
+        Self {
+            consumer: consumer.into(),
+            class,
+            link: link.into(),
+            value: None,
+        }
+    }
+
+    /// The class value the link should point at.
+    pub fn to(mut self, value: impl Into<PathBuf>) -> Self {
+        self.value = Some(value.into());
+        self
+    }
+
+    pub fn consumer(&self) -> &str {
+        &self.consumer
+    }
+
+    pub fn class(&self) -> Class {
+        self.class
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.link
+    }
+
+    pub fn value(&self) -> Result<&Path> {
+        self.value.as_deref().ok_or_else(|| {
+            Error::usage(format!(
+                "binding {} needs a destination; pass the class value",
+                self.consumer
+            ))
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_name("binding consumer", &self.consumer)?;
+        if !self.link.is_absolute() {
+            return Err(Error::usage(format!(
+                "link path {} must be absolute",
+                self.link.display()
+            )));
+        }
+        match self.link.file_name() {
+            Some(name) if name != "." && name != ".." => {}
+            _ => {
+                return Err(Error::usage(format!(
+                    "link path {} needs a file name",
+                    self.link.display()
+                )))
+            }
+        }
+        if let Some(value) = &self.value {
+            if !value.is_absolute() {
+                return Err(Error::usage(format!(
+                    "link destination {} must be absolute",
+                    value.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The exact before and after of a link binding; applying takes this plan back.
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkPlan {
+    pub consumer: String,
+    pub class: Class,
+    pub link: PathBuf,
+    pub before: Observed,
+    pub after: Observed,
+    /// The target is a real directory or file: applying needs the explicit
+    /// replace and preserves it beside the link.
+    pub replace: bool,
+}
+
+/// How apply treats a real directory or file at the target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplyOptions {
+    /// Preserve the real entry beside the link and create the link. Undo puts it
+    /// back.
+    pub replace: bool,
+}
+
+/// The recorded bindings of one account.
+#[derive(Debug, Clone)]
+pub struct Bindings {
+    core: Core,
+}
+
+impl Barge {
+    /// The account's recorded bindings.
+    pub fn bindings(&self) -> Bindings {
+        Bindings {
+            core: self.core.clone(),
+        }
+    }
+}
+
+impl Bindings {
+    /// Every recorded binding, in store order.
+    pub fn list(&self) -> Result<Vec<BindingRecord>> {
+        read(&self.core)
+    }
+
+    /// One record by consumer.
+    pub fn get(&self, consumer: &str) -> Result<Option<BindingRecord>> {
+        Ok(read(&self.core)?
+            .into_iter()
+            .find(|record| record.consumer == consumer))
+    }
+
+    /// The exact before and after of a link binding; writes nothing.
+    pub fn plan(&self, binding: &Binding) -> Result<LinkPlan> {
+        binding.validate()?;
+        let value = binding.value()?;
+        self.destination(binding.class, value)?;
+        require_parent(&binding.link)?;
+        if self.get(&binding.consumer)?.is_some() {
+            return Err(Error::refused(format!(
+                "consumer {} is already bound; undo it first",
+                binding.consumer
+            )));
+        }
+        let before = observe(&binding.link)?;
+        Ok(LinkPlan {
+            consumer: binding.consumer.clone(),
+            class: binding.class,
+            link: binding.link.clone(),
+            after: Observed::Link {
+                destination: value.to_path_buf(),
+            },
+            replace: matches!(before, Observed::Directory | Observed::File),
+            before,
+        })
+    }
+
+    /// Apply a plan. The target must still be what the plan observed, and a real
+    /// directory or file is only replaced when the caller passes it explicitly.
+    pub fn apply(
+        &self,
+        binding: &Binding,
+        plan: &LinkPlan,
+        options: ApplyOptions,
+    ) -> Result<BindingRecord> {
+        self.core.ensure_writable()?;
+        binding.validate()?;
+        if plan.consumer != binding.consumer
+            || plan.class != binding.class
+            || plan.link != binding.link
+        {
+            return Err(Error::usage("the plan was made for a different binding"));
+        }
+        let destination = self.destination(binding.class, binding.value()?)?;
+        require_parent(&binding.link)?;
+        let _lock = self.core.state.lock()?;
+        let mut records = read(&self.core)?;
+        if records
+            .iter()
+            .any(|record| record.consumer == binding.consumer)
+        {
+            return Err(Error::refused(format!(
+                "consumer {} is already bound; undo it first",
+                binding.consumer
+            )));
+        }
+        let observed = observe(&binding.link)?;
+        if observed != plan.before {
+            return Err(Error::refused(format!(
+                "target {} changed since it was planned: the plan observed {}, found {}",
+                binding.link.display(),
+                plan.before,
+                observed
+            )));
+        }
+        let prior = prior_for(&binding.link, &observed)?;
+        if let Prior::Preserved { path, .. } = &prior {
+            if !options.replace {
+                return Err(Error::refused(format!(
+                    "{} is {}; pass the explicit replace to preserve it and create the link",
+                    binding.link.display(),
+                    observed
+                )));
+            }
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(Error::refused(format!(
+                    "cannot preserve {}: {} already exists",
+                    binding.link.display(),
+                    path.display()
+                )));
+            }
+        }
+        make_way(&binding.link, &prior)?;
+        if let Err(source) = symlink(&destination, &binding.link) {
+            let mut message = format!(
+                "cannot create the link at {}: {source}",
+                binding.link.display()
+            );
+            if let Err(problem) = roll_back(&binding.link, &prior) {
+                message.push_str(&format!(
+                    "; the prior state could not be restored: {}",
+                    problem.message()
+                ));
+            }
+            return Err(Error::new(ErrorKind::Io, message));
+        }
+        let record = BindingRecord {
+            consumer: binding.consumer.clone(),
+            class: binding.class,
+            kind: BindingKind::Link,
+            target: BindingTarget::Link {
+                path: binding.link.clone(),
+            },
+            applied: Applied {
+                value: destination,
+                at_unix_ms: self.core.clock.now_unix_ms(),
+            },
+            prior: prior.clone(),
+        };
+        records.push(record.clone());
+        if let Err(error) = write(&self.core, &records) {
+            if let Err(problem) = roll_back(&binding.link, &prior) {
+                return Err(Error::refused(format!(
+                    "{}; the prior state could not be restored: {problem}",
+                    error.message()
+                )));
+            }
+            return Err(error);
+        }
+        Ok(record)
+    }
+
+    /// Record a symlink that already points into a class folder, without changing
+    /// it. This is how today's `~/.cargo/{registry,git}` links become bindings.
+    pub fn adopt(&self, binding: &Binding) -> Result<BindingRecord> {
+        self.core.ensure_writable()?;
+        binding.validate()?;
+        let folder = canonical_dir(&self.class_folder(binding.class)?)?;
+        let _lock = self.core.state.lock()?;
+        let mut records = read(&self.core)?;
+        if records
+            .iter()
+            .any(|record| record.consumer == binding.consumer)
+        {
+            return Err(Error::refused(format!(
+                "consumer {} is already bound; undo it first",
+                binding.consumer
+            )));
+        }
+        let observed = observe(&binding.link)?;
+        let Observed::Link { destination } = observed else {
+            return Err(Error::refused(format!(
+                "there is no symlink at {} to adopt; it is {}",
+                binding.link.display(),
+                observed
+            )));
+        };
+        let resolved = fs::canonicalize(&binding.link)
+            .map_err(|source| Error::io("cannot resolve the link at", &binding.link, &source))?;
+        if !resolved.starts_with(&folder) {
+            return Err(Error::refused(format!(
+                "the link at {} points at {}, outside the {} class folder {}",
+                binding.link.display(),
+                resolved.display(),
+                binding.class.name(),
+                folder.display()
+            )));
+        }
+        if let Some(value) = &binding.value {
+            let requested = self.destination(binding.class, value)?;
+            if requested != resolved {
+                return Err(Error::refused(format!(
+                    "the link at {} points at {}, not the requested {}",
+                    binding.link.display(),
+                    resolved.display(),
+                    requested.display()
+                )));
+            }
+        }
+        let record = BindingRecord {
+            consumer: binding.consumer.clone(),
+            class: binding.class,
+            kind: BindingKind::Link,
+            target: BindingTarget::Link {
+                path: binding.link.clone(),
+            },
+            applied: Applied {
+                value: resolved,
+                at_unix_ms: self.core.clock.now_unix_ms(),
+            },
+            prior: Prior::Link { destination },
+        };
+        records.push(record.clone());
+        write(&self.core, &records)?;
+        Ok(record)
+    }
+
+    /// Undo one consumer's binding, restoring exactly what was there before and
+    /// removing the record.
+    pub fn undo(&self, consumer: &str) -> Result<BindingRecord> {
+        self.core.ensure_writable()?;
+        validate_name("binding consumer", consumer)?;
+        let _lock = self.core.state.lock()?;
+        let mut records = read(&self.core)?;
+        let index = records
+            .iter()
+            .position(|record| record.consumer == consumer)
+            .ok_or_else(|| Error::not_found(format!("consumer {consumer} has no binding")))?;
+        let record = records[index].clone();
+        let link = record.link_path().to_path_buf();
+        match observe(&link)? {
+            Observed::Absent => {}
+            Observed::Link { .. } => {
+                let resolved = fs::canonicalize(&link)
+                    .map_err(|source| Error::io("cannot resolve the link at", &link, &source))?;
+                if resolved != record.applied.value {
+                    return Err(Error::refused(format!(
+                        "the link at {} now points at {}, not the applied {}; refusing to undo it",
+                        link.display(),
+                        resolved.display(),
+                        record.applied.value.display()
+                    )));
+                }
+                remove_link(&link)?;
+            }
+            other => {
+                return Err(Error::refused(format!(
+                    "the target {} is {} now, not the link Barge applied; refusing to undo it",
+                    link.display(),
+                    other
+                )))
+            }
+        }
+        if let Err(error) = restore_prior(&link, &record.prior) {
+            // Put the applied link back so the record stays true.
+            let _ = remove_link(&link);
+            let _ = symlink(&record.applied.value, &link);
+            return Err(error);
+        }
+        records.remove(index);
+        if let Err(error) = write(&self.core, &records) {
+            let _ = remove_link(&link);
+            let _ = symlink(&record.applied.value, &link);
+            return Err(error);
+        }
+        Ok(record)
+    }
+
+    /// The class folder a binding's value must sit inside, refusing an absent or
+    /// mismatched volume rather than guessing.
+    fn class_folder(&self, class: Class) -> Result<PathBuf> {
+        let layout = self.core.account_layout()?;
+        let placement = layout.classes.get(&class).ok_or_else(|| {
+            Error::not_found(format!(
+                "class {} has no layout; set one with `barge layout set`",
+                class.name()
+            ))
+        })?;
+        let volume = self.core.volume(&placement.volume)?;
+        volume.require_present()?;
+        Ok(volume.base().join(&placement.path))
+    }
+
+    /// The resolved value, refused unless it is a folder inside the class folder.
+    fn destination(&self, class: Class, value: &Path) -> Result<PathBuf> {
+        let folder = canonical_dir(&self.class_folder(class)?)?;
+        let destination = match fs::canonicalize(value) {
+            Ok(path) => path,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::refused(format!(
+                    "link destination {} does not exist; Barge does not create it",
+                    value.display()
+                )))
+            }
+            Err(source) => return Err(Error::io("cannot resolve", value, &source)),
+        };
+        if !is_directory(&destination) {
+            return Err(Error::refused(format!(
+                "link destination {} is not a folder",
+                value.display()
+            )));
+        }
+        if !destination.starts_with(&folder) {
+            return Err(Error::refused(format!(
+                "link destination {} is outside the {} class folder {}",
+                value.display(),
+                class.name(),
+                folder.display()
+            )));
+        }
+        Ok(destination)
+    }
+}
+
+/// What was at `link` before it is replaced, with the name a preserved entry is
+/// renamed to.
+fn prior_for(link: &Path, observed: &Observed) -> Result<Prior> {
+    Ok(match observed {
+        Observed::Absent => Prior::Absent,
+        Observed::Link { destination } => Prior::Link {
+            destination: destination.clone(),
+        },
+        Observed::Directory => Prior::Preserved {
+            path: preserved_path(link)?,
+            entry: EntryKind::Directory,
+        },
+        Observed::File => Prior::Preserved {
+            path: preserved_path(link)?,
+            entry: EntryKind::File,
+        },
+    })
+}
+
+/// Move the observed entry out of the way so the link can be created.
+fn make_way(link: &Path, prior: &Prior) -> Result<()> {
+    match prior {
+        Prior::Absent => Ok(()),
+        Prior::Link { .. } => remove_link(link),
+        Prior::Preserved { path, .. } => fs::rename(link, path)
+            .map_err(|source| Error::io("cannot preserve the entry at", link, &source)),
+    }
+}
+
+/// Restore the prior state after the link has been removed.
+fn restore_prior(link: &Path, prior: &Prior) -> Result<()> {
+    match prior {
+        Prior::Absent => Ok(()),
+        Prior::Link { destination } => symlink(destination, link)
+            .map_err(|source| Error::io("cannot restore the prior link at", link, &source)),
+        Prior::Preserved { path, .. } => {
+            match fs::symlink_metadata(path) {
+                Ok(_) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::refused(format!(
+                        "the preserved entry {} is gone; refusing to restore the link",
+                        path.display()
+                    )))
+                }
+                Err(source) => return Err(Error::io("cannot inspect", path, &source)),
+            }
+            fs::rename(path, link)
+                .map_err(|source| Error::io("cannot restore the preserved entry to", link, &source))
+        }
+    }
+}
+
+/// Remove the link and restore what was there before, after a failure.
+fn roll_back(link: &Path, prior: &Prior) -> Result<()> {
+    remove_link(link)?;
+    restore_prior(link, prior)
+}
+
+fn preserved_path(link: &Path) -> Result<PathBuf> {
+    let parent = link
+        .parent()
+        .ok_or_else(|| Error::usage(format!("link path {} has no parent", link.display())))?;
+    let name = link
+        .file_name()
+        .ok_or_else(|| Error::usage(format!("link path {} has no file name", link.display())))?;
+    let mut preserved = name.to_os_string();
+    preserved.push(PRESERVED_SUFFIX);
+    Ok(parent.join(preserved))
+}
+
+fn require_parent(link: &Path) -> Result<()> {
+    let parent = link.parent().ok_or_else(|| {
+        Error::usage(format!("link path {} has no parent folder", link.display()))
+    })?;
+    match fs::metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(Error::refused(format!(
+            "the folder above {} is not a directory",
+            link.display()
+        ))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(Error::refused(format!(
+                "the folder above {} does not exist; Barge does not create it",
+                link.display()
+            )))
+        }
+        Err(source) => Err(Error::io("cannot inspect", parent, &source)),
+    }
+}
+
+/// Remove a symlink itself, never what it points at.
+fn remove_link(link: &Path) -> Result<()> {
+    match fs::symlink_metadata(link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(link)
+            .map_err(|source| Error::io("cannot remove the link at", link, &source)),
+        Ok(_) => Err(Error::refused(format!(
+            "{} is not a symlink; refusing to remove it",
+            link.display()
+        ))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::io("cannot inspect", link, &source)),
+    }
+}
+
+fn is_directory(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
+fn canonical_dir(path: &Path) -> Result<PathBuf> {
+    let canonical =
+        fs::canonicalize(path).map_err(|source| Error::io("cannot resolve", path, &source))?;
+    if !is_directory(&canonical) {
+        return Err(Error::refused(format!(
+            "{} is not a directory",
+            path.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+/// What is at `path` now, without following a symlink there.
+pub(crate) fn observe(path: &Path) -> Result<Observed> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Observed::Link {
+            destination: fs::read_link(path)
+                .map_err(|source| Error::io("cannot read the link at", path, &source))?,
+        }),
+        Ok(metadata) if metadata.is_dir() => Ok(Observed::Directory),
+        Ok(_) => Ok(Observed::File),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Observed::Absent),
+        Err(source) => Err(Error::io("cannot inspect", path, &source)),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingsDocument {
+    schema: String,
+    bindings: Vec<BindingRecord>,
+}
+
+fn read(core: &Core) -> Result<Vec<BindingRecord>> {
+    let path = core.state.root().join(BINDINGS_NAME);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(Error::io("cannot read", &path, &source)),
+    };
+    let document: BindingsDocument = serde_json::from_slice(&bytes).map_err(|source| {
+        Error::unknown_state(format!("cannot parse {}: {source}", path.display()))
+    })?;
+    if document.schema != BINDINGS_SCHEMA {
+        return Err(Error::unknown_state(format!(
+            "{} has schema {}, not {BINDINGS_SCHEMA}",
+            path.display(),
+            document.schema
+        )));
+    }
+    let mut consumers = BTreeSet::new();
+    for record in &document.bindings {
+        validate_record(record)?;
+        if !consumers.insert(record.consumer.clone()) {
+            return Err(Error::unknown_state(format!(
+                "{} records consumer {} twice",
+                path.display(),
+                record.consumer
+            )));
+        }
+    }
+    Ok(document.bindings)
+}
+
+fn write(core: &Core, records: &[BindingRecord]) -> Result<()> {
+    let mut consumers = BTreeSet::new();
+    for record in records {
+        validate_record(record)?;
+        if !consumers.insert(record.consumer.clone()) {
+            return Err(Error::unknown_state(format!(
+                "refusing to record consumer {} twice",
+                record.consumer
+            )));
+        }
+    }
+    let document = BindingsDocument {
+        schema: BINDINGS_SCHEMA.to_string(),
+        bindings: records.to_vec(),
+    };
+    let bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|source| Error::unknown_state(format!("cannot encode bindings: {source}")))?;
+    publish(&core.state.root().join(BINDINGS_NAME), &bytes)
+}
+
+fn validate_record(record: &BindingRecord) -> Result<()> {
+    validate_name("binding consumer", &record.consumer)?;
+    match (&record.kind, &record.target) {
+        (BindingKind::Link, BindingTarget::Link { path }) => {
+            if !path.is_absolute() {
+                return Err(Error::unknown_state(format!(
+                    "binding {} has a relative link path {}",
+                    record.consumer,
+                    path.display()
+                )));
+            }
+        }
+        (kind, _) => {
+            return Err(Error::unknown_state(format!(
+                "binding {} has kind {}, which this version does not record",
+                record.consumer,
+                kind.name()
+            )))
+        }
+    }
+    if !record.applied.value.is_absolute() {
+        return Err(Error::unknown_state(format!(
+            "binding {} has a relative applied value {}",
+            record.consumer,
+            record.applied.value.display()
+        )));
+    }
+    match &record.prior {
+        Prior::Absent => {}
+        Prior::Link { destination } => {
+            if destination.as_os_str().is_empty() {
+                return Err(Error::unknown_state(format!(
+                    "binding {} records an empty prior link",
+                    record.consumer
+                )));
+            }
+        }
+        Prior::Preserved { path, .. } => {
+            if !path.is_absolute() {
+                return Err(Error::unknown_state(format!(
+                    "binding {} records a relative preserved path {}",
+                    record.consumer,
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}

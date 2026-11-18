@@ -26,8 +26,9 @@ committed. Oxide depends on the library at an exact Git commit.
 
 The library follows [architecture](docs/knowledge/architecture.md#library-surface):
 platform facts sit behind the `os` seam, account state under `state`, and
-areas, roots, holds, pins, trash, space policy and scratch are their own
-modules. A new mechanic is a module and an ordinary test, not a framework.
+areas, roots, holds, pins, trash, space policy, scratch, bindings and doctor
+are their own modules. A new mechanic is a module and an ordinary test, not a
+framework.
 
 ## Validate
 
