@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Barge windows",
+  "windows": ["main", "popover"],
+  "permissions": ["core:default"]
+}

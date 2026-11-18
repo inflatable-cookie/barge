@@ -27,6 +27,7 @@ polkit rule and example config. Linux is its only power backend, but it builds
 on macOS so the workspace checks cover it. Toolchain
 `1.97.1` and edition 2021 are pinned in `rust-toolchain.toml`; `Cargo.lock` is
 committed. Oxide depends on the library at an exact Git commit.
+`apps/barge-app` contains the Tauri menu-bar app and Svelte renderer.
 
 The library follows [architecture](docs/knowledge/architecture.md#library-surface):
 platform facts sit behind the `os` seam, account state under `state`, and
@@ -44,6 +45,9 @@ Rust runs through `oxide` (see the block below).
 - `effigy rust:format` — `oxide fmt --all -- --check`; `rust:format:apply` applies it.
 - `effigy docs:check` — Northstar link and retired-concept checks, the
   changelog check, and `git diff --check HEAD`. Check its exit code.
+- `effigy app:check` — typecheck the Svelte renderer.
+- `effigy app:test` — renderer tests.
+- `effigy app:dev` — run the app locally.
 
 Those are the repository's only selectors. Add one only for a check this
 section names, and run it through Effigy rather than raw `cargo`.
