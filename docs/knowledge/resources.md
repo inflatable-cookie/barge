@@ -1,7 +1,9 @@
 # Resources and bindings
 
-Status: design approved by Tom, 2026-11-18. Steps 1 and 2 are built; later steps remain planned. The lean storage core in [architecture](architecture.md) is the mechanism
-this design builds on and does not change.
+Status: design approved by Tom, 2026-11-18. Steps 1, 2 and 5 are built;
+steps 3 and 4 remain planned. The lean storage core in
+[architecture](architecture.md) is the mechanism this design builds on and does
+not change.
 
 ## The problem
 
