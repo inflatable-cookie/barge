@@ -336,6 +336,7 @@ impl Area {
 
     /// Create a root with a fresh ID and its marker.
     pub fn create_root(&self, label: &str) -> Result<Root> {
+        self.core.ensure_writable()?;
         self.create_root_with_expiry(label, None)
     }
 
@@ -343,6 +344,7 @@ impl Area {
     /// or declared fallback. Adoption records ownership without changing its
     /// contents.
     pub fn adopt_root(&self, folder: &str, label: &str, id: &str) -> Result<Root> {
+        self.core.ensure_writable()?;
         root::validate_label(label)?;
         root::validate_id(id)?;
         if !root::valid_folder(folder) {
@@ -474,6 +476,7 @@ impl Area {
         label: &str,
         expires_unix_ms: Option<u64>,
     ) -> Result<Root> {
+        self.core.ensure_writable()?;
         root::validate_label(label)?;
         let directory = self.available_dir()?;
         self.ensure_layout(&directory)?;
@@ -650,6 +653,7 @@ impl Area {
 
     /// Hold a root, waiting for another holder to finish.
     pub fn hold(&self, id: &str, mode: Mode) -> Result<Hold> {
+        self.core.ensure_writable()?;
         self.acquire(id, mode, true)?.ok_or_else(|| {
             Error::unknown_state(format!("a waiting hold on root {id} was not acquired"))
         })
@@ -657,6 +661,7 @@ impl Area {
 
     /// Try to hold a root without waiting. `None` means something else holds it.
     pub fn try_hold(&self, id: &str, mode: Mode) -> Result<Option<Hold>> {
+        self.core.ensure_writable()?;
         self.acquire(id, mode, false)
     }
 
@@ -702,6 +707,7 @@ impl Area {
 
     /// Protect a root from prune and eviction until it is unpinned.
     pub fn pin(&self, id: &str, reason: &str) -> Result<()> {
+        self.core.ensure_writable()?;
         let root = self.resolve(id)?;
         let directory = parent(&root.path)?;
         self.ensure_layout(&directory)?;
@@ -719,6 +725,7 @@ impl Area {
 
     /// Remove a root's pin.
     pub fn unpin(&self, id: &str) -> Result<()> {
+        self.core.ensure_writable()?;
         root::validate_id(id)?;
         let mut removed = false;
         for (directory, _) in self.search_dirs()? {
@@ -752,6 +759,7 @@ impl Area {
     /// Evict a root: refuse when it is held or pinned, otherwise rename it into
     /// the area's trash and delete it there.
     pub fn evict(&self, id: &str) -> Result<Eviction> {
+        self.core.ensure_writable()?;
         let root = self.resolve(id)?;
         let directory = parent(&root.path)?;
         self.ensure_layout(&directory)?;
@@ -809,6 +817,7 @@ impl Area {
 
     /// Delete every owned trash entry of this area.
     pub fn sweep_trash(&self) -> Result<SweepReport> {
+        self.core.ensure_writable()?;
         let mut report = SweepReport::default();
         let key = self.key().label();
         for (directory, _) in self.search_dirs()? {
@@ -873,6 +882,7 @@ impl Area {
 
     /// Evict expired, idle, unpinned roots. Scratch uses this.
     pub fn sweep_expired(&self) -> Result<SweepReport> {
+        self.core.ensure_writable()?;
         let now = self.core.clock.now_unix_ms();
         let mut report = SweepReport::default();
         for info in self.list()?.roots {

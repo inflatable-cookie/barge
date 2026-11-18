@@ -95,6 +95,7 @@ code reads better, as long as the behaviour holds.
 
 ```rust
 let barge = Barge::open()?;                       // account state dir
+let preview = Barge::open_read_only()?;           // passive account inspection
 barge.register_volume(VolumeRegistration::new("Builds", mount))?;
 let vol = barge.volume("Builds")?;
 vol.state()?;                                     // Present | Absent | Mismatch
@@ -124,6 +125,12 @@ barge.sweep_trash("Builds")?;
 let run = barge.scratch("Builds", "effigy")?.create("test-run", ttl)?;
 barge.sweep_scratch("Builds", Some("effigy"))?;   // expired idle roots
 ```
+
+`Barge::open_read_only()` and `Barge::open_read_only_with(...)` inspect account
+state without creating directories, lock files, markers or activity records.
+Missing state is empty. Mutating operations refuse before filesystem access;
+`prune(..., true)` remains available as a preview. A missing hold lock is
+reported as unheld.
 
 The stored documents carry their own schema names (`barge.volumes/1`,
 `barge.area/1`, `barge.root/1` and `/2`, `barge.pin/1`, `barge.activity/1`);

@@ -37,7 +37,14 @@ impl Scratch {
             .counts_toward_reserve(true)
             .into_record();
         proposed.validate()?;
-        let record = {
+        let record = if core.read_only {
+            core.state.read_area(&proposed.key())?.ok_or_else(|| {
+                Error::refused(format!(
+                    "scratch area {} is not declared on a read-only account",
+                    proposed.key().label()
+                ))
+            })?
+        } else {
             let _lock = core.state.lock()?;
             match core.state.read_area(&proposed.key())? {
                 Some(stored) => {
