@@ -108,7 +108,7 @@ impl Harness {
             clock.clone(),
         ));
         let server = daemon.bind().unwrap();
-        let address = server.server_addr().to_ip().unwrap();
+        let address = server.local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let serving = Arc::clone(&running);
         let handle = thread::spawn(move || {
@@ -418,7 +418,7 @@ fn lan_pairing_and_authenticated_requests() {
         clock,
     ));
     let server = daemon.bind().unwrap();
-    let address = server.server_addr().to_ip().unwrap();
+    let address = server.local_addr().unwrap();
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
     let thread = thread::spawn(move || daemon.serve(server, &flag).unwrap());
@@ -486,4 +486,25 @@ fn lan_pairing_and_authenticated_requests() {
     running.store(false, Ordering::SeqCst);
     thread.join().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn oversized_body_is_rejected() {
+    let harness = Harness::new();
+    let request =
+        "POST /v1/power HTTP/1.1\r\nHost: x\r\nContent-Length: 16385\r\nConnection: close\r\n\r\n";
+    let (status, _) = harness.raw(request);
+    assert_eq!(status, 413);
+}
+
+#[test]
+fn stalled_body_times_out_and_the_next_client_is_served() {
+    let harness = Harness::new();
+    let mut slow = TcpStream::connect(harness.address).unwrap();
+    slow.write_all(b"POST /v1/power HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n{")
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let start = std::time::Instant::now();
+    assert_eq!(harness.state().power, PowerState::Awake);
+    assert!(start.elapsed() < std::time::Duration::from_secs(8));
 }
