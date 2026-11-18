@@ -6,6 +6,8 @@ Barge moves heavy, rebuildable developer data off the internal drive onto a dedi
 
 Repository: `inflatable-cookie/barge`. Who plans, owns and may change Barge is recorded in [vision](docs/knowledge/vision.md#authority); this file does not restate it. Briefs, tasks and reviews run through Nucleus; do not create repository planning or status mirrors. Product changes go through a brief, a PR and one independent review. Scope or direction changes go to Tom.
 
+**Quality gate:** every change keeps the parts it touches at 8/10 or above on the [quality rubric](docs/knowledge/contracts/quality.md). Workers rate touched parts before reporting ready; the reviewer rates them at the exact head, lists the scores, and requires changes for any part the change made worse or that is new and below 8.
+
 ## Guardrails
 
 - Keep it small. The lean design in [architecture](docs/knowledge/architecture.md) is the target: cooperative holds, trash-then-delete, no process scanning, no journals, no capture harnesses, no native proof ladders. Adding machinery of that kind is a scope change for Tom.

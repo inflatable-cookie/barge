@@ -5,6 +5,7 @@
 Contracts:
 
 - [Consumption](contracts/consumption.md) owns the exact-revision dependency path and the CLI JSON contract consumers check.
+- [Quality](contracts/quality.md) owns the code-quality rubric, the per-change gate and sweeps.
 
 There are no other contracts. A fact belongs to the file that owns it; link to
 it rather than restating it.
