@@ -1,6 +1,6 @@
 # Knowledge map
 
-[Vision](vision.md) owns scope, Tom's rulings, direction and authority. [Architecture](architecture.md) owns the lean storage design: safety model, concepts, layout, library surface, space policy, CLI, testing and the boundary with Oxide. [Resources](resources.md) owns the resource classes, layout manifest, bindings (including workflow blocks) and doctor. [Machines](machines.md) owns machine control: the daemon, protocol and UI. [Questions](questions.md) owns design decisions.
+[Vision](vision.md) owns scope, Tom's rulings, direction and authority. [Architecture](architecture.md) owns the lean storage design: safety model, concepts, layout, library surface, space policy, CLI, testing and the boundary with Oxide. [Resources](resources.md) owns the resource classes, layout manifest, bindings (including workflow blocks) and doctor. [Machines](machines.md) owns machine control: the daemon and protocol. [App](app.md) owns the Barge desktop app: form, scope, architecture and build order. [Questions](questions.md) owns design decisions.
 
 Contracts:
 

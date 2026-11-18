@@ -16,8 +16,8 @@ Remote menu-bar app ([vision](vision.md#direction)).
   power actions. On Bazzite it runs as a systemd user unit and asks logind over
   D-Bus for sleep, restart and shutdown, with a polkit rule granting only those
   actions. It never runs a shell command it was sent. It binds one configured address and accepts either allowlisted Tailscale nodes or authenticated LAN clients. [Install guide](../install-barged.md).
-- **Barge UI:** a fresh Tauri app (Tom, 2026-11-18). Machine control comes
-  first. Storage, worktrees and resources join later in the same app.
+- **Barge app:** a menu-bar Tauri app built with Poodle and Longhorn,
+  covering machines and storage first ([app](app.md)).
 
 The storage library stays daemon-free: Oxide never depends on `barged` or the UI.
 
@@ -86,20 +86,8 @@ exit 2 — and is refused where the machine is built.
 
 ## UI
 
-Barge's UI does much more than MoonDeck Remote, so its information
-architecture is designed before it's built (Tom: "much more professional and
-carefully laid out"). Its main areas, eventually:
-
-- **Machines:** this Mac and the PC: state, power, and later load and
-  resources.
-- **Storage:** volumes, layout classes, space, bindings and doctor findings.
-- **Worktrees:** pools, leases, warm state.
-- **Activity:** recent actions and their results.
-
-The first release ships Machines only, inside a layout that already has room
-for the rest. A menu-bar entry keeps the daily power controls one click away.
-The design pass produces the layout and visual system, reviewed by Tom before
-the build brief.
+The Barge app is specced in [app](app.md): a menu-bar app built with Tauri,
+Poodle and Longhorn, covering Machines and Storage in its first release.
 
 ## Repository layout
 
@@ -109,7 +97,7 @@ the build brief.
   example config in `packaging/barged/`.
 - `crates/barge-cli`: the `barge` binary, which carries the machine verbs
   beside the storage ones.
-- `apps/barge-ui`: the Tauri app, planned and not yet built.
+- `apps/barge-app`: the Barge app, specced in [app](app.md), not yet built.
 
 ## Build order
 
@@ -121,9 +109,8 @@ the build brief.
    systemd unit and polkit rule in `packaging/barged/`, and the
    [install guide](../install-barged.md) for Bazzite.
 3. **Built:** LAN pairing and authenticated requests, with no Tailscale required.
-4. UI design pass: information architecture and visual system, for Tom's
-   review.
-5. The Tauri app: Machines plus the menu-bar entry.
+4. Tailscale on both machines, once Tom is ready for the sign-ins.
+5. The Barge app: see [app](app.md#build-order).
 6. Retire MoonDeck Buddy on the PC. This changes host software, so it needs
    Tom's go-ahead. The Steam Deck needs a `barged` client first, or loses
    remote control until it has one.

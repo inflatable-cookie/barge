@@ -67,8 +67,9 @@ Tom's rulings of 2026-11-18 set the next steps:
   into Barge, in the style of Treehouse. Oxide stays standalone because it is a
   drop-in Cargo replacement that only lightly touches Barge's domain.
 - **Barge controls machines.** A daemon on the Bazzite PC and a Barge UI
-  replace MoonDeck Buddy and MoonDeck Remote. The UI is a fresh Tauri app,
-  professionally laid out for the much larger job. See [machines](machines.md).
+  replace MoonDeck Buddy and MoonDeck Remote. The UI is a menu-bar Tauri app
+  built with Poodle and Longhorn, covering machines and storage. See
+  [machines](machines.md) and [app](app.md).
 
 Compute scheduling across machines (Tailscale, Nomad) follows machine control
 as a spike.
