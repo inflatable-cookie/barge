@@ -102,6 +102,23 @@ fn parse_document(output: &Output) -> Value {
         "barge.bind-plan/1" => &["plan"],
         "barge.binding/1" => &["action", "binding"],
         "barge.doctor/1" => &["ok", "volumes", "bindings"],
+        "barge.init/1" => &[
+            "project",
+            "path",
+            "action",
+            "scratch",
+            "volume",
+            "volume_state",
+        ],
+        "barge.init-check/1" => &[
+            "project",
+            "path",
+            "state",
+            "scratch",
+            "volume",
+            "volume_state",
+            "diff",
+        ],
         "barge.machine/1" => &["machine"],
         "barge.machine-list/1" => &["machines"],
         "barge.machine-removed/1" => &["removed"],
@@ -891,6 +908,7 @@ fn usage_and_passive_commands_do_not_create_state() {
         vec!["layout", "bogus"],
         vec!["area", "bogus"],
         vec!["bind", "bogus"],
+        vec!["init", "--bogus"],
     ] {
         let output = run(&args);
         assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
@@ -927,4 +945,122 @@ fn usage_and_passive_commands_do_not_create_state() {
     assert_eq!(stderr(&value), "barge: project \"--json\" must be 1-64 characters of lowercase letters, digits, '-', '_' or '.'\n");
     let misplaced = run(&["status", "--json"]);
     assert_eq!(stderr(&misplaced), "barge: unknown option --json\n");
+}
+
+#[test]
+fn init_checks_and_doctor_report_the_workflow_block() {
+    let fixture = Fixture::new();
+    assert!(register(&fixture).status.success());
+    let set = fixture.json(&[
+        "layout", "set", "scratch", "--volume", "Builds", "--path", "scratch",
+    ]);
+    assert!(set.status.success(), "{}", stderr(&set));
+    std::fs::create_dir_all(fixture.mount.join("scratch")).unwrap();
+    let repo = fixture.temp.folder("repo").unwrap();
+    let repo_text = repo.to_str().unwrap();
+    let agents = repo.join("AGENTS.md");
+    let canonical_repo = std::fs::canonicalize(&repo).unwrap();
+
+    let written = fixture.run(&["init", "--path", repo_text]);
+    assert_eq!(written.status.code(), Some(0), "{}", stderr(&written));
+    let text = std::fs::read_to_string(&agents).unwrap();
+    assert!(text.starts_with("<!-- barge:workflow:start -->"), "{text}");
+    assert!(
+        text.contains("barge scratch new --volume Builds --project repo"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Never write scratch to a home folder or a drive root"),
+        "{text}"
+    );
+
+    let check = fixture.json(&["init", "--check", "--path", repo_text]);
+    assert_eq!(check.status.code(), Some(0), "{}", stderr(&check));
+    let document = parse_document(&check);
+    assert_eq!(document["schema"], "barge.init-check/1");
+    assert_eq!(document["data"]["state"], "current");
+    assert_eq!(document["data"]["project"], "repo");
+    assert_eq!(document["data"]["path"], agents.to_str().unwrap());
+    assert_eq!(document["data"]["diff"].as_array().unwrap().len(), 0);
+
+    let doctor = fixture.json(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
+    let document = parse_document(&doctor);
+    assert_eq!(document["data"]["bindings"][0]["kind"], "workflow");
+    assert_eq!(document["data"]["bindings"][0]["state"], "ok");
+    assert_eq!(
+        document["data"]["bindings"][0]["path"],
+        canonical_repo.join("AGENTS.md").to_str().unwrap()
+    );
+
+    // A block that no longer matches the layout is stale: --check and doctor
+    // both exit 1, and the human summary carries a diff.
+    std::fs::write(
+        &agents,
+        text.replace("## Scratch for this project", "## Old scratch"),
+    )
+    .unwrap();
+    let stale = fixture.json(&["init", "--check", "--path", repo_text]);
+    assert_eq!(stale.status.code(), Some(1), "{}", stderr(&stale));
+    let document = parse_document(&stale);
+    assert_eq!(document["data"]["state"], "stale");
+    assert!(document["data"]["diff"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| line.as_str().unwrap() == "-## Old scratch"));
+    assert!(
+        stderr(&stale).is_empty(),
+        "a --json report writes only the document: {}",
+        stderr(&stale)
+    );
+    let human = fixture.run(&["init", "--check", "--path", repo_text]);
+    assert_eq!(human.status.code(), Some(1), "{}", stderr(&human));
+    assert!(stdout(&human).contains("+++ "), "{}", stdout(&human));
+    assert!(stderr(&human).contains("stale"), "{}", stderr(&human));
+    let doctor = fixture.json(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(1), "{}", stderr(&doctor));
+    let document = parse_document(&doctor);
+    assert_eq!(document["data"]["bindings"][0]["state"], "stale");
+
+    // `init` fixes it, reports the action, and a second run changes nothing.
+    let fixed = fixture.json(&["init", "--path", repo_text]);
+    assert!(fixed.status.success(), "{}", stderr(&fixed));
+    let document = parse_document(&fixed);
+    assert_eq!(document["schema"], "barge.init/1");
+    assert_eq!(document["data"]["action"], "replaced");
+    assert_eq!(document["data"]["volume_state"]["state"], "present");
+    let repaired = std::fs::read(&agents).unwrap();
+    let again = fixture.json(&["init", "--path", repo_text]);
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert_eq!(parse_document(&again)["data"]["action"], "unchanged");
+    assert_eq!(std::fs::read(&agents).unwrap(), repaired);
+    let check = fixture.json(&["init", "--check", "--path", repo_text]);
+    assert_eq!(check.status.code(), Some(0), "{}", stderr(&check));
+    let doctor = fixture.json(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(0), "{}", stderr(&doctor));
+
+    // `--check` and `doctor` are read-only: they change neither the file nor the
+    // account, and a missing account stays missing.
+    let bindings = std::fs::read(fixture.state.join("bindings.json")).unwrap();
+    let before = std::fs::read(&agents).unwrap();
+    assert!(fixture
+        .run(&["init", "--check", "--path", repo_text])
+        .status
+        .success());
+    assert!(fixture.run(&["doctor"]).status.success());
+    assert_eq!(std::fs::read(&agents).unwrap(), before);
+    assert_eq!(
+        std::fs::read(fixture.state.join("bindings.json")).unwrap(),
+        bindings
+    );
+
+    let missing_state = fixture.temp.child("missing-state");
+    let check = Command::new(env!("CARGO_BIN_EXE_barge"))
+        .args(["init", "--check", "--path", repo_text])
+        .env("BARGE_STATE_DIR", &missing_state)
+        .output()
+        .unwrap();
+    assert_eq!(check.status.code(), Some(1), "{}", stderr(&check));
+    assert!(!missing_state.exists(), "check created account state");
 }

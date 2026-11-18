@@ -164,7 +164,7 @@ pub(super) fn print_doctor(report: &DoctorReport) {
             binding.consumer,
             binding.class.name(),
             binding.kind.name(),
-            binding.link.display(),
+            binding.path.display(),
             describe_binding(&binding.state)
         );
     }
@@ -183,6 +183,7 @@ pub(super) fn describe_binding(state: &BindingState) -> String {
         BindingState::Ok => "ok".to_string(),
         BindingState::Missing => "missing: nothing is at the target".to_string(),
         BindingState::Unavailable { reason } => format!("unavailable: {reason}"),
+        BindingState::Stale { reason } => format!("stale: {reason}"),
         BindingState::Drifted {
             observed,
             expected,
@@ -195,6 +196,52 @@ pub(super) fn describe_binding(state: &BindingState) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "nothing".to_string())
         ),
+    }
+}
+
+pub(super) fn print_init(report: &InitReport) {
+    println!(
+        "{} the barge workflow block in {}",
+        match report.action {
+            InitAction::Inserted => "inserted",
+            InitAction::Replaced => "replaced",
+            InitAction::Unchanged => "left unchanged",
+        },
+        report.path.display()
+    );
+    println!("  scratch: {}", report.scratch.display());
+    if !report.volume_present() {
+        eprintln!(
+            "barge: volume {} is {}; rendered from the layout",
+            report.volume,
+            describe_state(&report.volume_state)
+        );
+    }
+}
+
+pub(super) fn print_init_check(check: &InitCheck) {
+    match check.state {
+        BlockState::Current => println!(
+            "the barge workflow block in {} is current",
+            check.path.display()
+        ),
+        BlockState::Stale | BlockState::Missing => {
+            for line in &check.diff {
+                println!("{line}");
+            }
+            eprintln!(
+                "barge: the barge workflow block in {} is {}; run `barge init`",
+                check.path.display(),
+                check.state.name()
+            );
+        }
+    }
+    if !check.volume_present() {
+        eprintln!(
+            "barge: volume {} is {}; rendered from the layout",
+            check.volume,
+            describe_state(&check.volume_state)
+        );
     }
 }
 

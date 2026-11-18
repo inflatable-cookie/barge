@@ -21,7 +21,7 @@ pub(super) fn bind(arguments: &[String], json: bool) -> Result<()> {
                         record.consumer,
                         record.class.name(),
                         record.kind.name(),
-                        record.link_path().display(),
+                        record.owned_path().display(),
                         record.applied.value.display()
                     );
                 }
@@ -77,7 +77,7 @@ pub(super) fn bind(arguments: &[String], json: bool) -> Result<()> {
                     "applied {} {} at {} -> {} (was {})",
                     record.consumer,
                     record.class.name(),
-                    record.link_path().display(),
+                    record.owned_path().display(),
                     record.applied.value.display(),
                     record.prior
                 );
@@ -99,7 +99,7 @@ pub(super) fn bind(arguments: &[String], json: bool) -> Result<()> {
                     "adopted {} {} at {} -> {}",
                     record.consumer,
                     record.class.name(),
-                    record.link_path().display(),
+                    record.owned_path().display(),
                     record.applied.value.display()
                 );
             }
@@ -119,7 +119,7 @@ pub(super) fn bind(arguments: &[String], json: bool) -> Result<()> {
                     "undid {} {} at {} (restored {})",
                     record.consumer,
                     record.class.name(),
-                    record.link_path().display(),
+                    record.owned_path().display(),
                     record.prior
                 );
             }
