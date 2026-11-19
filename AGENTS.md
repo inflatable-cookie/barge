@@ -30,7 +30,8 @@ polkit rule and example config. Its platform limits are
 pinned in `rust-toolchain.toml`; edition 2021 is set in `Cargo.toml` and
 `Cargo.lock` is committed.
 Oxide depends on the library at an exact Git commit. `apps/barge-app` contains
-the Tauri menu-bar app and Svelte renderer.
+the Tauri menu-bar app and Svelte renderer. UI work on it uses the Impeccable skill
+vendored in `.agents/skills/impeccable` (Claude reads it through `.claude/skills`).
 
 The library's module surface is
 [architecture](docs/knowledge/architecture.md#library-surface). A new mechanic is
