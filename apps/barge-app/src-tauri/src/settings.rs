@@ -208,4 +208,31 @@ mod tests {
         assert!(!unit.reset_supported);
         assert_eq!(page.readable_scope_ids, vec![unit.scope_id.clone()]);
     }
+
+    #[test]
+    fn preferences_accept_supported_values_and_reject_login_item_changes() {
+        let adapter = Adapter;
+        let current = Preferences::default();
+        let projection = adapter.project(&current).unwrap();
+
+        let mut changed = current.clone();
+        changed.theme = "dark".into();
+        changed.refresh_interval = 30;
+        adapter
+            .validate_intent(&current, &changed, &projection)
+            .unwrap();
+
+        let mut login_item_change = current.clone();
+        login_item_change.launch_at_login = true;
+        let rejection = adapter
+            .validate_intent(&current, &login_item_change, &projection)
+            .unwrap_err();
+        assert_eq!(rejection.code, SettingsRejectionCode::Unsupported);
+
+        let mut invalid = current.clone();
+        invalid.theme = "sepia".into();
+        assert!(adapter
+            .validate_intent(&current, &invalid, &projection)
+            .is_err());
+    }
 }

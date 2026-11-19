@@ -16,7 +16,7 @@ barge area declare --namespace oxide --name pool --volume Builds \
 barge root list oxide/pool
 barge prune --volume Builds --dry-run
 barge scratch new --volume Builds --project effigy --label test-run --ttl 3600
-barge status --json
+barge --json status
 ```
 
 `area declare` records the declaration the library and later callers must match;

@@ -6,6 +6,8 @@ Barge moves heavy, rebuildable developer data (build output, caches, scratch) of
 - [Architecture: the lean storage design](knowledge/architecture.md)
 - [Resources and bindings](knowledge/resources.md)
 - [Machines](knowledge/machines.md)
+- [Barge app](knowledge/app.md)
+- [Consumption contract](knowledge/contracts/consumption.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
 - [Install `barged` on Bazzite](install-barged.md)

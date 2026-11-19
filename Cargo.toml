@@ -39,8 +39,17 @@ libc = "0.2.190"
 # tailnet (docs/knowledge/machines.md, "Protocol and trust").
 ureq = { version = "3.4.2", default-features = false }
 
-# The daemon's server. Blocking, one thread, no async runtime: it answers three
-# endpoints for one operator.
+# The daemon parses its small HTTP/1.1 request headers with this library; the
+# server itself stays blocking, one thread, with no async runtime.
+httparse = "1.10.1"
+
+# Machine request authentication and the menu-bar app's Tauri runtime.
+getrandom = "0.3.4"
+hmac = "0.12.1"
+sha2 = "0.10.9"
+tauri = { version = "2.12.7", features = ["tray-icon"] }
+tauri-build = { version = "2.7.6", features = [] }
+tauri-plugin-autostart = "2.7.0"
 
 # logind over D-Bus, Linux only. The macOS workspace checks never build it, so
 # the daemon still compiles (and reports state) on the Mac.

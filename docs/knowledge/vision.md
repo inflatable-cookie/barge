@@ -7,9 +7,9 @@ each reinvent drive handling link Barge's library or call its CLI instead.
 
 ## What it does
 
-- **Registers volumes.** A volume is identified by its UUID at its mount, and
-  declares its availability (permanent or ephemeral) and durability (expendable
-  data Barge may prune, or kept data it never touches).
+- **Registers volumes.** A volume is identified by its UUID at its mount and
+  declares its availability (permanent or ephemeral). Durability belongs to
+  resource classes; see [resources](resources.md#resource-classes).
 - **Gives consumers areas.** A consumer such as Oxide declares an area on a
   volume. Barge creates owned roots there, tracks holds and pins, and prunes
   whole idle roots when space runs low. What lives inside a root is the

@@ -26,8 +26,9 @@ Wake-on-LAN, daemon protocol types and the `barged` client, separate from
 storage. `crates/barged` is the machine daemon: state and power over HTTP, with
 Tailscale `whois` and logind behind seams; `packaging/barged/` holds its unit,
 polkit rule and example config. Its platform limits are
-[architecture](docs/knowledge/architecture.md#platforms). Toolchain `1.97.1` and
-edition 2021 are pinned in `rust-toolchain.toml`; `Cargo.lock` is committed.
+[architecture](docs/knowledge/architecture.md#platforms). Toolchain `1.97.1` is
+pinned in `rust-toolchain.toml`; edition 2021 is set in `Cargo.toml` and
+`Cargo.lock` is committed.
 Oxide depends on the library at an exact Git commit. `apps/barge-app` contains
 the Tauri menu-bar app and Svelte renderer.
 
@@ -52,7 +53,7 @@ Rust runs through `oxide` (see the block below).
   (`bun install --frozen-lockfile`) and starts Tauri through `oxide exec`. The
   renderer uses bun, not npm; `apps/barge-app/bun.lock` is committed.
 
-Those are the repository's only selectors. Add one only for a check this
+These are the repository's Effigy selectors. Add one only for a check this
 section names, and run it through Effigy rather than raw `cargo`.
 
 <!-- oxide:begin -->
