@@ -70,6 +70,14 @@ impl Tree {
         &self.directory
     }
 
+    /// Whether the folder holds nothing but entries named in `allowed`, read
+    /// through the descriptor it was opened on.
+    pub(crate) fn holds_only(&self, allowed: &[&OsStr]) -> Result<bool> {
+        let names = read_names(&self.directory)
+            .map_err(|source| Error::io("cannot list", &self.path, &source))?;
+        Ok(names.iter().all(|name| allowed.contains(&name.as_os_str())))
+    }
+
     /// The path the folder was opened at, for the reports that name it.
     pub(crate) fn path(&self) -> &Path {
         &self.path

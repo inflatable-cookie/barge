@@ -132,8 +132,10 @@ The `link` kind's rules:
 - `adopt` records a symlink that already points into a class folder without
   changing it;
 - `undo` restores the prior state exactly: nothing, an older link, or a real
-  entry Barge preserved. A failed undo leaves the applied link and its record in
-  place;
+  entry Barge preserved. It recognises the link by what it resolves to, as
+  doctor does, so a link `adopt` found written with a relative path or through a
+  symlinked folder is still the link it removes. A failed undo leaves the
+  applied link and its record in place;
 - one target belongs to one consumer: a second consumer is refused, even through
   an equivalent path;
 - a real directory or file is only replaced when the plan shows it and the

@@ -134,7 +134,6 @@ impl Area {
 
     /// Create a root with a fresh ID and its marker.
     pub fn create_root(&self, label: &str) -> Result<Root> {
-        self.core.ensure_writable()?;
         self.create_root_with_expiry(label, None)
     }
 
@@ -161,38 +160,21 @@ impl Area {
             let path = directory.join(folder);
             match fs::symlink_metadata(&path) {
                 Ok(metadata) => {
-                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                        return Err(Error::refused(format!(
-                            "root folder {} is not a real directory",
-                            path.display()
-                        )));
-                    }
+                    check_adoptable(&path, &metadata)?;
                     if candidate.is_none() {
-                        candidate = Some((directory, path, metadata));
+                        candidate = Some((directory, path));
                     }
                 }
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
                 Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
             }
         }
-        let (_directory, path, metadata) = candidate.ok_or_else(|| {
+        let (_directory, path) = candidate.ok_or_else(|| {
             Error::not_found(format!(
                 "root folder {folder:?} does not exist directly inside area {}",
                 self.key().label()
             ))
         })?;
-        if metadata.uid() != crate::os::effective_uid() {
-            return Err(Error::refused(format!(
-                "root folder {} is not owned by the calling user",
-                path.display()
-            )));
-        }
-        if metadata.permissions().mode() & 0o022 != 0 {
-            return Err(Error::refused(format!(
-                "root folder {} is group- or other-writable",
-                path.display()
-            )));
-        }
 
         #[cfg(test)]
         ADOPT_HOOK.with(|hook| {
@@ -215,16 +197,7 @@ impl Area {
         }
         let metadata =
             fs::symlink_metadata(&path).map_err(|e| Error::io("cannot inspect", &path, &e))?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != crate::os::effective_uid()
-            || metadata.permissions().mode() & 0o022 != 0
-        {
-            return Err(Error::refused(format!(
-                "root folder {} is not a safely owned directory",
-                path.display()
-            )));
-        }
+        check_adoptable(&path, &metadata)?;
         match read_marker(&path) {
             MarkerRead::Valid(marker) => {
                 let differences = marker_differences(&marker, &key, id, label, folder);
@@ -297,7 +270,10 @@ impl Area {
                         folder: None,
                     };
                     if let Err(error) = root::write_marker(&path, &marker) {
-                        let _ = fs::remove_dir_all(&path);
+                        // The folder was created a moment ago and holds nothing
+                        // but a partial marker, so it is deleted through the
+                        // owned walk: a replacement at the path is never walked.
+                        let _ = crate::trash::remove_half_made(&path);
                         return Err(error);
                     }
                     self.record_activity(&directory, &id, now);
@@ -433,14 +409,14 @@ impl Area {
                 hold::RecordedSize::Exact(size.bytes)
             };
             let key = self.key().label();
-            let measurement = Measurement {
+            let measurement = hold::Measurement {
                 root_id: &info.id,
                 path: &info.path,
                 identity,
                 size: recorded,
                 unix_ms: info.last_used_unix_ms,
             };
-            let _ = record_size_if_unchanged(&directory, &measurement, |marker| {
+            let _ = hold::record_size_if_unchanged(&directory, &measurement, |marker| {
                 marker.id == info.id && marker.area == key
             });
         }
@@ -503,7 +479,8 @@ impl Area {
         self.core.ensure_writable()?;
         let root = self.resolve(id)?;
         let directory = self.hold_directory(&root)?;
-        let file = lock_root_waiting(&hold_lock_path(&directory, &root.id), mode)?;
+        let lock_path = hold::hold_lock_path(&directory, &root.id);
+        let file = hold::lock_root_waiting(&lock_path, mode)?;
         self.begin_hold(root, directory, file, mode)
     }
 
@@ -513,8 +490,8 @@ impl Area {
         for _ in 0..2 {
             let root = self.resolve(id)?;
             let directory = self.hold_directory(&root)?;
-            let lock_path = hold_lock_path(&directory, &root.id);
-            let Some(file) = lock_root_try(&lock_path, mode)? else {
+            let lock_path = hold::hold_lock_path(&directory, &root.id);
+            let Some(file) = hold::lock_root_try(&lock_path, mode)? else {
                 // Listing a root probes its lock exclusively to report it as held,
                 // so a probe running right now can make one non-waiting attempt
                 // fail spuriously. The second attempt covers that window; a real
@@ -601,10 +578,10 @@ impl Area {
             }
         });
         let directory = self.hold_directory(&root)?;
-        let lock_path = hold_lock_path(&directory, &id);
+        let lock_path = hold::hold_lock_path(&directory, &id);
         let mut hold_lock = None;
         for _ in 0..2 {
-            hold_lock = lock_root_try(&lock_path, Mode::Exclusive)?;
+            hold_lock = hold::lock_root_try(&lock_path, Mode::Exclusive)?;
             if hold_lock.is_some() {
                 break;
             }
@@ -627,7 +604,12 @@ impl Area {
                 "root {id} is pinned; refusing to evict it"
             )));
         }
-        let size = tree_bytes(&root.path);
+        // The size is never measured here: walking the tree under the area lock
+        // would hold it for as long as the data takes to read. The deletion
+        // below counts what it removes, and a release's recorded size covers a
+        // deletion that leaves part of the tree in the trash.
+        let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
+        let recorded = hold::read_activity_bytes(&activity, &id);
         let trash = directory.join(TRASH_DIR);
         fs::create_dir_all(&trash)
             .map_err(|source| Error::io("cannot create the trash at", &trash, &source))?;
@@ -654,25 +636,42 @@ impl Area {
         // lock file is no longer useful. Unlinking it does not release our lock;
         // dropping the descriptor does.
         let _ = fs::remove_file(&lock_path);
-        let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         let _ = fs::remove_file(hold::activity_path(&activity, &id));
         let _ = fs::remove_file(crate::pin::pin_path(&directory, &id));
         // The rename is done and the hold lock's file is unlinked, so it protects
         // nothing more. The area lock is also released before the tree delete.
         drop(hold_lock);
         drop(area_lock);
-        let (deleted, kept_reason) = match crate::trash::remove_evicted_tree(&trash_path, &key, &id)
-        {
-            Ok(removed) if removed.removed => (true, None),
-            Ok(removed) => (false, Some(crate::trash::stayed_reason(&removed))),
-            Err(error) => {
-                return Err(Error::io_message(format!(
-                    "{}; evicted root remains in trash at {}",
-                    error.message(),
-                    trash_path.display()
-                )))
-            }
-        };
+        let (deleted, kept_reason, size) =
+            match crate::trash::remove_evicted_tree(&trash_path, &key, &id) {
+                // The walk counted every byte it removed, so the size is exact.
+                Ok(removed) if removed.removed => (
+                    true,
+                    None,
+                    TreeSize {
+                        bytes: removed.bytes,
+                        approximate: false,
+                    },
+                ),
+                Ok(removed) => (
+                    false,
+                    Some(crate::trash::stayed_reason(&removed)),
+                    recorded.map_or_else(
+                        || tree_bytes(&trash_path),
+                        |bytes| TreeSize {
+                            bytes,
+                            approximate: false,
+                        },
+                    ),
+                ),
+                Err(error) => {
+                    return Err(Error::io_message(format!(
+                        "{}; evicted root remains in trash at {}",
+                        error.message(),
+                        trash_path.display()
+                    )))
+                }
+            };
         Ok(Eviction {
             area: key,
             id,
@@ -848,11 +847,6 @@ pub(crate) struct AreaLock {
     _file: File,
 }
 
-/// How long a release waits for the area lock before it skips its size record.
-/// The record is advisory and the hold is already released, so a release never
-/// waits on another process for longer than this.
-const RELEASE_LOCK_WAIT: Duration = Duration::from_millis(50);
-
 impl AreaLock {
     pub(crate) fn acquire(directory: &Path) -> Result<Self> {
         let path = directory.join(BARGE_DIR).join(AREA_LOCK);
@@ -879,62 +873,38 @@ impl AreaLock {
     }
 }
 
-/// What a measurement saw, so it can be recorded only while it still describes
-/// the root it was taken from.
-pub(crate) struct Measurement<'a> {
-    /// The root's ID, and the folder it was found in.
-    pub root_id: &'a str,
-    /// The folder that was measured.
-    pub path: &'a Path,
-    /// The identity read before the measurement, if the folder was there.
-    pub identity: Option<(u64, u64)>,
-    /// The size, exact or unknown, and when it was taken.
-    pub size: hold::RecordedSize,
-    pub unix_ms: u64,
-}
-
-/// Record a measured root's size, but only while the folder is still the entry
-/// that was measured and its marker still names the root.
-///
-/// This is the one path by which a size is recorded: the area lock serialises it
-/// against adoption, eviction and a marker write. Returns `None` when the record
-/// was written, or the reason it was skipped, which a release reports rather than
-/// hides.
-pub(crate) fn record_size_if_unchanged(
-    directory: &Path,
-    measurement: &Measurement<'_>,
-    marker_names_root: impl FnOnce(&RootMarker) -> bool,
-) -> Option<&'static str> {
-    let _lock = match AreaLock::acquire_within(directory, RELEASE_LOCK_WAIT) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => return Some("the area lock stayed busy"),
-        Err(_) => return Some("the area lock could not be opened"),
-    };
-    if measurement.identity.is_none()
-        || crate::os::path_identity(measurement.path).ok().flatten() != measurement.identity
-    {
-        return Some("the root was replaced while it was measured");
-    }
-    if !matches!(read_marker(measurement.path), MarkerRead::Valid(ref marker) if marker_names_root(marker))
-    {
-        return Some("the root's marker changed while it was measured");
-    }
-    let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
-    match hold::record_activity(
-        &activity,
-        measurement.root_id,
-        measurement.unix_ms,
-        measurement.size,
-    ) {
-        Ok(()) => None,
-        Err(_) => Some("the size could not be recorded"),
-    }
-}
-
 pub(crate) fn parent(path: &Path) -> Result<PathBuf> {
     path.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| Error::unknown_state(format!("{} has no parent folder", path.display())))
+}
+
+/// Check that a folder is one adoption may record: a real directory, owned by
+/// the calling user and writable by neither group nor others.
+///
+/// Adoption checks this twice on purpose: once to pick the candidate, and again
+/// under the area lock, because a racing writer can replace the folder between
+/// the two. Both readings ask the same question, so they share one check.
+fn check_adoptable(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::refused(format!(
+            "root folder {} is not a real directory",
+            path.display()
+        )));
+    }
+    if metadata.uid() != crate::os::effective_uid() {
+        return Err(Error::refused(format!(
+            "root folder {} is not owned by the calling user",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(Error::refused(format!(
+            "root folder {} is group- or other-writable",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn root_from_marker(path: PathBuf, marker: RootMarker) -> Root {
@@ -1006,120 +976,13 @@ pub(crate) fn unchanged_marker(root: &Root, area: &str) -> bool {
     matches!(read_marker(&root.path), MarkerRead::Valid(marker) if marker_matches(&marker, area, &root.id, &root.label, &root.folder))
 }
 
-/// The hold lock file a root's ID uses inside an area directory.
-pub(crate) fn hold_lock_path(directory: &Path, id: &str) -> PathBuf {
-    directory
-        .join(BARGE_DIR)
-        .join(LOCKS_DIR)
-        .join(format!("{id}.lock"))
-}
-
-/// Open a hold lock and take it, waiting for every other holder to finish.
-///
-/// Eviction unlinks `<id>.lock` while it holds it, so a waiting hold can wake
-/// holding a file nobody else can see; a caller-chosen folder re-adopted with the
-/// same ID would then reopen and lock the same root twice. A descriptor that does
-/// not match the path is therefore dropped and the attempt repeated once. A
-/// waiting `flock` returns only once the lock is held, so that repeat is the only
-/// case that reaches a second attempt.
-pub(crate) fn lock_root_waiting(lock_path: &Path, mode: Mode) -> Result<File> {
-    let mut attempt = 0;
-    while attempt < 2 {
-        attempt += 1;
-        let file = open_hold_lock(lock_path)?;
-        crate::os::flock(&file, mode, true)?;
-        run_lock_hook();
-        if lock_is_current(&file, lock_path)? {
-            return Ok(file);
-        }
-    }
-    Err(replaced_lock(lock_path))
-}
-
-/// Open a hold lock and take it only if it is free. `None` means another holder
-/// has it.
-pub(crate) fn lock_root_try(lock_path: &Path, mode: Mode) -> Result<Option<File>> {
-    let mut attempt = 0;
-    while attempt < 2 {
-        attempt += 1;
-        let file = open_hold_lock(lock_path)?;
-        if !crate::os::flock(&file, mode, false)? {
-            return Ok(None);
-        }
-        run_lock_hook();
-        if lock_is_current(&file, lock_path)? {
-            return Ok(Some(file));
-        }
-    }
-    Err(replaced_lock(lock_path))
-}
-
-/// Open the hold lock file, past the window an eviction exploits: the file is
-/// open, the lock is not yet taken, so an eviction may rename the root, unlink
-/// this file and a caller may re-adopt the folder with the same ID before the
-/// lock lands.
-fn open_hold_lock(lock_path: &Path) -> Result<File> {
-    let file = crate::os::open_lock(lock_path, "cannot open the hold lock")?;
-    #[cfg(test)]
-    LOCK_OPEN_HOOK.with(|hooks| {
-        let hook = hooks.borrow_mut().pop();
-        if let Some(hook) = hook {
-            hook();
-        }
-    });
-    Ok(file)
-}
-
-/// The test seam after a lock lands, before the descriptor is verified.
-#[cfg(test)]
-fn run_lock_hook() {
-    LOCK_HOOK.with(|hooks| {
-        let hook = hooks.borrow_mut().pop();
-        if let Some(hook) = hook {
-            hook();
-        }
-    });
-}
-
-#[cfg(not(test))]
-fn run_lock_hook() {}
-
-fn replaced_lock(lock_path: &Path) -> Error {
-    Error::unknown_state(format!(
-        "the hold lock {} was replaced while it was being taken; refusing to hold it",
-        lock_path.display()
-    ))
-}
-
-fn lock_is_current(file: &File, path: &Path) -> Result<bool> {
-    let held = crate::os::file_identity(file)
-        .map_err(|source| Error::io("cannot inspect the hold lock", path, &source))?;
-    let now = crate::os::path_identity(path)
-        .map_err(|source| Error::io("cannot inspect the hold lock", path, &source))?;
-    Ok(now == Some(held))
-}
-
 #[cfg(test)]
 thread_local! {
     static EVICT_PROBE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     pub(crate) static EVICT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     pub(crate) static PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ADOPT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
-    static LOCK_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
-    static LOCK_OPEN_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
     static LIST_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// A test hook that runs between opening a hold lock file and taking its lock.
-#[cfg(test)]
-fn push_lock_open_hook(hook: impl FnOnce() + 'static) {
-    LOCK_OPEN_HOOK.with(|hooks| hooks.borrow_mut().push(Box::new(hook)));
-}
-
-/// A test hook that runs after a hold lock is taken, before it is verified.
-#[cfg(test)]
-fn push_lock_hook(hook: impl FnOnce() + 'static) {
-    LOCK_HOOK.with(|hooks| hooks.borrow_mut().push(Box::new(hook)));
 }
 
 #[cfg(test)]

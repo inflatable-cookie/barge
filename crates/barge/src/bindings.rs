@@ -400,7 +400,10 @@ impl Bindings {
                 "cannot create the link at {}: {source}",
                 binding.link.display()
             );
-            if let Err(problem) = roll_back(&binding.link, &prior) {
+            // Nothing was created at the path, so only the prior entry moved
+            // aside is put back. Removing a link here could delete one another
+            // writer made in the same moment.
+            if let Err(problem) = restore_prior(&binding.link, &prior) {
                 message.push_str(&format!(
                     "; the prior state could not be restored: {}",
                     problem.message()
@@ -522,14 +525,25 @@ impl Bindings {
         let link = record.owned_path();
         match observe(&link)? {
             Observed::Absent => {}
-            Observed::Link {
-                destination: resolved,
-            } => {
-                if resolved != record.applied.value {
+            Observed::Link { destination } => {
+                // The record keeps the resolved destination, while the link keeps
+                // whatever text it was written with: a relative link, one through
+                // a symlinked folder or a macOS `/var` path reads differently.
+                // Compare what the link resolves to, as doctor does. A link whose
+                // destination is unreachable dangles, so it is matched on the text
+                // Barge wrote (`applied`) or the text adopt found (`prior`).
+                let resolved = fs::canonicalize(&link).ok();
+                let still_ours = resolved.as_deref() == Some(record.applied.value.as_path())
+                    || destination == record.applied.value
+                    || matches!(&record.prior, Prior::Link { destination: prior } if prior == &destination);
+                if !still_ours {
                     return Err(Error::refused(format!(
                         "the link at {} now points at {}, not the applied {}; refusing to undo it",
                         link.display(),
-                        resolved.display(),
+                        resolved
+                            .as_deref()
+                            .unwrap_or(destination.as_path())
+                            .display(),
                         record.applied.value.display()
                     )));
                 }
@@ -1082,6 +1096,26 @@ mod rollback_kind_tests {
         assert_eq!(std::fs::read(&preserved).unwrap(), b"concurrent");
         assert_eq!(std::fs::read(&link).unwrap(), b"original");
     }
+    #[test]
+    fn a_failed_link_creation_never_removes_a_link_it_did_not_make() {
+        let temp = crate::testing::TempDir::new("binding-failed-create").unwrap();
+        let link = temp.child("entry");
+        let preserved = temp.child("entry.barge-prior");
+        std::fs::write(&preserved, b"original").unwrap();
+        // `make_way` moved the prior entry aside and the link creation failed;
+        // in that moment another writer put its own link at the path. Restoring
+        // the prior entry must refuse rather than delete that link.
+        std::fs::write(temp.child("elsewhere"), b"theirs").unwrap();
+        symlink(temp.child("elsewhere"), &link).unwrap();
+        let prior = Prior::Preserved {
+            path: preserved.clone(),
+            entry: EntryKind::File,
+        };
+        assert!(restore_prior(&link, &prior).is_err());
+        assert_eq!(fs::read_link(&link).unwrap(), temp.child("elsewhere"));
+        assert!(preserved.exists(), "the prior entry is still preserved");
+    }
+
     #[test]
     fn failed_reapply_reports_unknown_state() {
         let error = failed_undo(

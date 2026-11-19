@@ -10,12 +10,14 @@ use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::area::{AreaLock, ACTIVITY_DIR, BARGE_DIR, LOCKS_DIR};
 use crate::clock::Clock;
 use crate::error::{Error, Result};
-use crate::root::tree_bytes;
+use crate::root::{read_marker, tree_bytes, MarkerRead, RootMarker};
 use crate::state::publish;
 
 /// The schema name of an activity record.
@@ -125,16 +127,15 @@ impl Drop for Hold {
         // for the area lock only briefly and is skipped, with its reason, rather
         // than hanging: the record is advisory and a release must never block.
         let marker = &self.marker;
-        let measurement = crate::area::Measurement {
+        let measurement = Measurement {
             root_id: &self.root_id,
             path: &self.root_path,
             identity: crate::os::file_identity(&self.root_directory).ok(),
             size: recorded,
             unix_ms: now,
         };
-        let skipped = crate::area::record_size_if_unchanged(directory, &measurement, |current| {
-            current == marker
-        });
+        let skipped =
+            record_size_if_unchanged(directory, &measurement, |current| current == marker);
         if let Some(reason) = skipped {
             eprintln!(
                 "barge: not recording the size of {}: {reason}",
@@ -160,6 +161,99 @@ pub(crate) fn is_locked(path: &Path) -> Result<bool> {
         Err(source) => return Err(Error::io("cannot open the hold lock", path, &source)),
     };
     Ok(!crate::os::flock(&file, Mode::Exclusive, false)?)
+}
+
+/// The hold lock file a root's ID uses inside an area directory.
+pub(crate) fn hold_lock_path(directory: &Path, id: &str) -> PathBuf {
+    directory
+        .join(BARGE_DIR)
+        .join(LOCKS_DIR)
+        .join(format!("{id}.lock"))
+}
+
+/// Open a hold lock and take it, waiting for every other holder to finish.
+///
+/// Eviction unlinks `<id>.lock` while it holds it, so a waiting hold can wake
+/// holding a file nobody else can see; a caller-chosen folder re-adopted with the
+/// same ID would then reopen and lock the same root twice. A descriptor that does
+/// not match the path is therefore dropped and the attempt repeated once. A
+/// waiting `flock` returns only once the lock is held, so that repeat is the only
+/// case that reaches a second attempt.
+pub(crate) fn lock_root_waiting(lock_path: &Path, mode: Mode) -> Result<File> {
+    let mut attempt = 0;
+    while attempt < 2 {
+        attempt += 1;
+        let file = open_hold_lock(lock_path)?;
+        crate::os::flock(&file, mode, true)?;
+        run_lock_hook();
+        if lock_is_current(&file, lock_path)? {
+            return Ok(file);
+        }
+    }
+    Err(replaced_lock(lock_path))
+}
+
+/// Open a hold lock and take it only if it is free. `None` means another holder
+/// has it.
+pub(crate) fn lock_root_try(lock_path: &Path, mode: Mode) -> Result<Option<File>> {
+    let mut attempt = 0;
+    while attempt < 2 {
+        attempt += 1;
+        let file = open_hold_lock(lock_path)?;
+        if !crate::os::flock(&file, mode, false)? {
+            return Ok(None);
+        }
+        run_lock_hook();
+        if lock_is_current(&file, lock_path)? {
+            return Ok(Some(file));
+        }
+    }
+    Err(replaced_lock(lock_path))
+}
+
+/// Open the hold lock file, past the window an eviction exploits: the file is
+/// open, the lock is not yet taken, so an eviction may rename the root, unlink
+/// this file and a caller may re-adopt the folder with the same ID before the
+/// lock lands.
+fn open_hold_lock(lock_path: &Path) -> Result<File> {
+    let file = crate::os::open_lock(lock_path, "cannot open the hold lock")?;
+    #[cfg(test)]
+    LOCK_OPEN_HOOK.with(|hooks| {
+        let hook = hooks.borrow_mut().pop();
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
+    Ok(file)
+}
+
+/// The test seam after a lock lands, before the descriptor is verified.
+#[cfg(test)]
+fn run_lock_hook() {
+    LOCK_HOOK.with(|hooks| {
+        let hook = hooks.borrow_mut().pop();
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_lock_hook() {}
+
+fn replaced_lock(lock_path: &Path) -> Error {
+    Error::unknown_state(format!(
+        "the hold lock {} was replaced while it was being taken; refusing to hold it",
+        lock_path.display()
+    ))
+}
+
+fn lock_is_current(file: &File, path: &Path) -> Result<bool> {
+    let held = crate::os::file_identity(file)
+        .map_err(|source| Error::io("cannot inspect the hold lock", path, &source))?;
+    let now = crate::os::path_identity(path)
+        .map_err(|source| Error::io("cannot inspect the hold lock", path, &source))?;
+    Ok(now == Some(held))
 }
 
 /// What a call records about a root's size.
@@ -238,6 +332,81 @@ fn read_activity_record(activity_dir: &Path, root_id: &str) -> Option<ActivityRe
 
 pub(crate) fn activity_path(activity_dir: &Path, root_id: &str) -> PathBuf {
     activity_dir.join(format!("{root_id}.json"))
+}
+
+/// How long a release waits for the area lock before it skips its size record.
+/// The record is advisory and the hold is already released, so a release never
+/// waits on another process for longer than this.
+const RELEASE_LOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// What a measurement saw, so it can be recorded only while it still describes
+/// the root it was taken from.
+pub(crate) struct Measurement<'a> {
+    /// The root's ID, and the folder it was found in.
+    pub root_id: &'a str,
+    /// The folder that was measured.
+    pub path: &'a Path,
+    /// The identity read before the measurement, if the folder was there.
+    pub identity: Option<(u64, u64)>,
+    /// The size, exact or unknown, and when it was taken.
+    pub size: RecordedSize,
+    pub unix_ms: u64,
+}
+
+/// Record a measured root's size, but only while the folder is still the entry
+/// that was measured and its marker still names the root.
+///
+/// This is the one path by which a size is recorded: the area lock serialises it
+/// against adoption, eviction and a marker write. Returns `None` when the record
+/// was written, or the reason it was skipped, which a release reports rather than
+/// hides.
+pub(crate) fn record_size_if_unchanged(
+    directory: &Path,
+    measurement: &Measurement<'_>,
+    marker_names_root: impl FnOnce(&RootMarker) -> bool,
+) -> Option<&'static str> {
+    let _lock = match AreaLock::acquire_within(directory, RELEASE_LOCK_WAIT) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Some("the area lock stayed busy"),
+        Err(_) => return Some("the area lock could not be opened"),
+    };
+    if measurement.identity.is_none()
+        || crate::os::path_identity(measurement.path).ok().flatten() != measurement.identity
+    {
+        return Some("the root was replaced while it was measured");
+    }
+    if !matches!(read_marker(measurement.path), MarkerRead::Valid(ref marker) if marker_names_root(marker))
+    {
+        return Some("the root's marker changed while it was measured");
+    }
+    let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
+    match record_activity(
+        &activity,
+        measurement.root_id,
+        measurement.unix_ms,
+        measurement.size,
+    ) {
+        Ok(()) => None,
+        Err(_) => Some("the size could not be recorded"),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOCK_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LOCK_OPEN_HOOK: std::cell::RefCell<Vec<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A test hook that runs between opening a hold lock file and taking its lock.
+#[cfg(test)]
+pub(crate) fn push_lock_open_hook(hook: impl FnOnce() + 'static) {
+    LOCK_OPEN_HOOK.with(|hooks| hooks.borrow_mut().push(Box::new(hook)));
+}
+
+/// A test hook that runs after a hold lock is taken, before it is verified.
+#[cfg(test)]
+pub(crate) fn push_lock_hook(hook: impl FnOnce() + 'static) {
+    LOCK_HOOK.with(|hooks| hooks.borrow_mut().push(Box::new(hook)));
 }
 
 #[cfg(test)]
