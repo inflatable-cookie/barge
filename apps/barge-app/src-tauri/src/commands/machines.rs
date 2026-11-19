@@ -284,6 +284,45 @@ mod tests {
     }
 
     #[test]
+    fn machines_list_returns_registered_machines_without_touching_the_network() {
+        use tauri::Manager;
+
+        // A daemon address nothing answers on: any poll would hang until the
+        // request timeout and record its failure, so a clean Checking
+        // snapshot proves the command never touched the network.
+        let temp = barge::testing::TempDir::new("app-machine-list").unwrap();
+        let state_dir = temp.child("state");
+        Registry::open(&state_dir)
+            .unwrap()
+            .add(Machine::new("pc", "192.0.2.1", "00:11:22:33:44:55").unwrap())
+            .unwrap();
+
+        let previous = std::env::var_os("BARGE_STATE_DIR");
+        std::env::set_var("BARGE_STATE_DIR", &state_dir);
+        let views = {
+            let app = tauri::test::mock_app();
+            app.manage(MachineState::default());
+            let state = app.state::<MachineState>();
+            tauri::async_runtime::block_on(machines_list(state))
+        };
+        match previous {
+            Some(value) => std::env::set_var("BARGE_STATE_DIR", value),
+            None => std::env::remove_var("BARGE_STATE_DIR"),
+        }
+
+        let views = views.unwrap();
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view.name, "pc");
+        assert!(!view.reachable);
+        // A poll would have recorded its failure here.
+        assert_eq!(view.error, None);
+        assert_eq!(view.seen_at_unix_ms, None);
+        assert_eq!(view.status.phase, crate::machine_state::Phase::Checking);
+        assert_eq!(view.status.offers, vec![crate::machine_state::Offer::Wake]);
+    }
+
+    #[test]
     fn cancel_refusal_from_daemon_is_visible() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
