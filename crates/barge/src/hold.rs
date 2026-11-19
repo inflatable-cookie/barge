@@ -31,15 +31,6 @@ pub enum Mode {
     Shared,
 }
 
-impl Mode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Exclusive => "exclusive",
-            Self::Shared => "shared",
-        }
-    }
-}
-
 /// A held root lock. Dropping it records the release time and releases the lock
 /// when this process's last descriptor for it closes.
 #[derive(Debug)]
@@ -47,7 +38,6 @@ pub struct Hold {
     root_id: String,
     mode: Mode,
     file: Option<File>,
-    activity_dir: PathBuf,
     root_path: PathBuf,
     marker: crate::root::RootMarker,
     root_directory: File,
@@ -58,7 +48,6 @@ impl Hold {
     pub(crate) fn new(
         mode: Mode,
         file: File,
-        activity_dir: PathBuf,
         root_path: PathBuf,
         marker: crate::root::RootMarker,
         root_directory: File,
@@ -68,7 +57,6 @@ impl Hold {
             root_id: marker.id.clone(),
             mode,
             file: Some(file),
-            activity_dir,
             root_path,
             marker,
             root_directory,
@@ -99,15 +87,13 @@ impl Hold {
         crate::os::set_inheritable(file, inheritable)
     }
 
-    /// Consume the hold and leave its descriptor inheritable.
+    /// Consume the hold and leave its descriptor inheritable, so a child that
+    /// keeps it keeps the hold across `exec`.
+    ///
+    /// Oxide's output holds use this to hand selected roots to a child process.
     pub fn into_inheritable(self) -> Result<Self> {
         self.set_inheritable(true)?;
         Ok(self)
-    }
-
-    /// A human-readable description, for the CLI summary.
-    pub fn describe(&self) -> String {
-        format!("{} hold on {}", self.mode.as_str(), self.root_id)
     }
 }
 
@@ -132,18 +118,28 @@ impl Drop for Hold {
         } else {
             RecordedSize::Exact(size.bytes)
         };
-        if let Some(directory) = self.root_path.parent() {
-            if let Ok(_lock) = crate::area::AreaLock::acquire(directory) {
-                if crate::os::file_identity(&self.root_directory)
-                    .ok()
-                    .is_some_and(|identity| {
-                        crate::os::path_identity(&self.root_path).ok().flatten() == Some(identity)
-                    })
-                    && matches!(crate::root::read_marker(&self.root_path), crate::root::MarkerRead::Valid(ref marker) if marker == &self.marker)
-                {
-                    let _ = record_activity(&self.activity_dir, &self.root_id, now, recorded);
-                }
-            }
+        let Some(directory) = self.root_path.parent() else {
+            return;
+        };
+        // The release itself has already happened, so recording the size waits
+        // for the area lock only briefly and is skipped, with its reason, rather
+        // than hanging: the record is advisory and a release must never block.
+        let marker = &self.marker;
+        let measurement = crate::area::Measurement {
+            root_id: &self.root_id,
+            path: &self.root_path,
+            identity: crate::os::file_identity(&self.root_directory).ok(),
+            size: recorded,
+            unix_ms: now,
+        };
+        let skipped = crate::area::record_size_if_unchanged(directory, &measurement, |current| {
+            current == marker
+        });
+        if let Some(reason) = skipped {
+            eprintln!(
+                "barge: not recording the size of {}: {reason}",
+                self.root_path.display()
+            );
         }
     }
 }

@@ -12,6 +12,7 @@
 use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -431,19 +432,17 @@ impl Area {
             } else {
                 hold::RecordedSize::Exact(size.bytes)
             };
-            if let Ok(_lock) = AreaLock::acquire(&directory) {
-                if identity.is_some()
-                    && crate::os::path_identity(&info.path).ok().flatten() == identity
-                    && matches!(read_marker(&info.path), MarkerRead::Valid(ref marker) if marker.id == info.id && marker.area == self.key().label())
-                {
-                    let _ = hold::record_activity(
-                        &activity,
-                        &info.id,
-                        info.last_used_unix_ms,
-                        recorded,
-                    );
-                }
-            }
+            let key = self.key().label();
+            let measurement = Measurement {
+                root_id: &info.id,
+                path: &info.path,
+                identity,
+                size: recorded,
+                unix_ms: info.last_used_unix_ms,
+            };
+            let _ = record_size_if_unchanged(&directory, &measurement, |marker| {
+                marker.id == info.id && marker.area == key
+            });
         }
         size
     }
@@ -550,7 +549,6 @@ impl Area {
                 self.key().label()
             )));
         }
-        let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
         let _area_lock = AreaLock::acquire(&directory)?;
         let marker = match read_marker(&current.path) {
             MarkerRead::Valid(marker)
@@ -566,7 +564,6 @@ impl Area {
         Ok(Hold::new(
             mode,
             file,
-            activity,
             current.path,
             marker,
             root_directory,
@@ -851,12 +848,86 @@ pub(crate) struct AreaLock {
     _file: File,
 }
 
+/// How long a release waits for the area lock before it skips its size record.
+/// The record is advisory and the hold is already released, so a release never
+/// waits on another process for longer than this.
+const RELEASE_LOCK_WAIT: Duration = Duration::from_millis(50);
+
 impl AreaLock {
     pub(crate) fn acquire(directory: &Path) -> Result<Self> {
         let path = directory.join(BARGE_DIR).join(AREA_LOCK);
         let file = crate::os::open_lock(&path, "cannot open the area lock")?;
         crate::os::flock(&file, Mode::Exclusive, true)?;
         Ok(Self { _file: file })
+    }
+
+    /// Take the area lock, waiting no longer than `wait`. `None` means another
+    /// holder kept it for that long, so the caller can skip advisory work.
+    pub(crate) fn acquire_within(directory: &Path, wait: Duration) -> Result<Option<Self>> {
+        let path = directory.join(BARGE_DIR).join(AREA_LOCK);
+        let started = Instant::now();
+        loop {
+            let file = crate::os::open_lock(&path, "cannot open the area lock")?;
+            if crate::os::flock(&file, Mode::Exclusive, false)? {
+                return Ok(Some(Self { _file: file }));
+            }
+            if started.elapsed() >= wait {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// What a measurement saw, so it can be recorded only while it still describes
+/// the root it was taken from.
+pub(crate) struct Measurement<'a> {
+    /// The root's ID, and the folder it was found in.
+    pub root_id: &'a str,
+    /// The folder that was measured.
+    pub path: &'a Path,
+    /// The identity read before the measurement, if the folder was there.
+    pub identity: Option<(u64, u64)>,
+    /// The size, exact or unknown, and when it was taken.
+    pub size: hold::RecordedSize,
+    pub unix_ms: u64,
+}
+
+/// Record a measured root's size, but only while the folder is still the entry
+/// that was measured and its marker still names the root.
+///
+/// This is the one path by which a size is recorded: the area lock serialises it
+/// against adoption, eviction and a marker write. Returns `None` when the record
+/// was written, or the reason it was skipped, which a release reports rather than
+/// hides.
+pub(crate) fn record_size_if_unchanged(
+    directory: &Path,
+    measurement: &Measurement<'_>,
+    marker_names_root: impl FnOnce(&RootMarker) -> bool,
+) -> Option<&'static str> {
+    let _lock = match AreaLock::acquire_within(directory, RELEASE_LOCK_WAIT) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Some("the area lock stayed busy"),
+        Err(_) => return Some("the area lock could not be opened"),
+    };
+    if measurement.identity.is_none()
+        || crate::os::path_identity(measurement.path).ok().flatten() != measurement.identity
+    {
+        return Some("the root was replaced while it was measured");
+    }
+    if !matches!(read_marker(measurement.path), MarkerRead::Valid(ref marker) if marker_names_root(marker))
+    {
+        return Some("the root's marker changed while it was measured");
+    }
+    let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
+    match hold::record_activity(
+        &activity,
+        measurement.root_id,
+        measurement.unix_ms,
+        measurement.size,
+    ) {
+        Ok(()) => None,
+        Err(_) => Some("the size could not be recorded"),
     }
 }
 

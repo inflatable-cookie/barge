@@ -70,6 +70,81 @@ fn shared_holds_coexist_and_an_exclusive_hold_waits_for_them() {
 }
 
 #[test]
+fn a_reserve_pass_counts_the_bytes_it_evicts_instead_of_rechecking_free_space() {
+    // The fake reports the same free space after every eviction, as APFS can
+    // report freed space late. The run still stops once the measured bytes it
+    // evicted reach the reserve, instead of evicting every root, and the report
+    // reads the filesystem once at the end.
+    let mut fixture = Fixture::new();
+    fixture.reserve = 6_000;
+    fixture.os.set_free(&fixture.mount, 0);
+    fixture.register();
+    let area = fixture.area("pool");
+    let mut roots = Vec::new();
+    for _ in 0..3 {
+        let root = area.create_root("slot").unwrap();
+        fill(&root, 8_192);
+        roots.push(root);
+    }
+
+    let report = fixture.barge.prune("Builds", false).unwrap();
+
+    assert_eq!(
+        report.evicted.len(),
+        1,
+        "one evicted root's measured bytes reach the reserve"
+    );
+    assert!(report.freed_bytes >= 6_000, "{report:?}");
+    assert_eq!(
+        report.free_after_bytes, 0,
+        "the report reads the filesystem once at the end"
+    );
+    assert_eq!(
+        roots.iter().filter(|root| root.path.is_dir()).count(),
+        2,
+        "the other roots were never touched"
+    );
+}
+
+#[test]
+fn a_soft_cap_counts_fallback_roots_without_crediting_the_volume() {
+    let fixture = Fixture::new();
+    fixture.os.set_free(&fixture.mount, TIB);
+    fixture.register();
+    let fallback = fixture.temp.child("internal");
+    let area = fixture
+        .barge
+        .area(
+            AreaSpec::new("test", "outputs", "Builds")
+                .absent(Absent::Fallback {
+                    path: fallback.clone(),
+                })
+                .soft_cap_bytes(Some(1_000)),
+        )
+        .unwrap();
+    let folder = fallback.join("old-output");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("data.bin"), vec![b'x'; 4_096]).unwrap();
+    let root = area.adopt_root("old-output", "old", "fallback-id").unwrap();
+    assert_eq!(root.path, folder);
+
+    let report = fixture.barge.prune("Builds", true).unwrap();
+
+    assert_eq!(
+        report.evicted.len(),
+        1,
+        "the soft cap counts the area's fallback root"
+    );
+    assert_eq!(report.evicted[0].id, root.id);
+    assert_eq!(report.evicted[0].reason, PruneReason::SoftCap);
+    assert_eq!(report.freed_bytes, report.evicted[0].bytes);
+    assert_eq!(
+        report.free_after_bytes, report.free_before_bytes,
+        "a fallback root on the internal drive leaves the volume's free space alone"
+    );
+}
+
+#[test]
 fn a_dry_run_reports_evictions_and_changes_nothing() {
     let mut fixture = Fixture::new();
     fixture.reserve = TIB;

@@ -7,21 +7,26 @@
 //! [`MoveApplyOptions::retarget_unrecorded`]; then those links are retargeted in
 //! the same transaction and rolled back with everything else.
 
-use std::fs;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::fs::{self, File};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bindings::{observe, same_target, BindingRecord, Observed};
+use crate::bindings::{
+    entry_identity, observe, same_target, BindingRecord, EntryIdentity, Observed,
+};
 use crate::{AreaRecord, Barge, BindingTarget, Class, Error, Placement, Result};
 
+/// The schema name a reviewed move plan is written with.
+const MOVE_PLAN_SCHEMA: &str = "barge.move-plan/2";
+
 /// The filesystem identity captured for an existing entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MoveIdentity {
-    pub dev: u64,
-    pub ino: u64,
-}
+///
+/// A plan and a binding both mean the same thing by "the same entry": the
+/// device-and-inode pair `EntryIdentity` records, so a move plan reuses it
+/// instead of defining a second copy of the same two fields.
+pub type MoveIdentity = EntryIdentity;
 
 /// A recorded link and its exact observed and planned values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,12 +108,15 @@ pub struct MoveArea {
     pub after: AreaRecord,
 }
 
-fn identity(path: &Path) -> Result<MoveIdentity> {
-    let metadata = fs::symlink_metadata(path).map_err(|e| Error::io("cannot inspect", path, &e))?;
-    Ok(MoveIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    })
+fn move_source(path: &Path) -> Result<PathBuf> {
+    if fs::symlink_metadata(path)
+        .map_err(|e| Error::io("cannot inspect", path, &e))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(Error::refused("move source must not be a symlink"));
+    }
+    canonical(path)
 }
 
 fn canonical(path: &Path) -> Result<PathBuf> {
@@ -160,14 +168,7 @@ impl Barge {
         let volume = self.volume(&placement.volume)?;
         volume.require_present()?;
         let base = canonical(&volume.base())?;
-        if fs::symlink_metadata(source)
-            .map_err(|e| Error::io("cannot inspect", source, &e))?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(Error::refused("move source must not be a symlink"));
-        }
-        let source = canonical(source)?;
+        let source = move_source(source)?;
         if source.parent() != Some(base.as_path()) {
             return Err(Error::refused(
                 "item must be directly inside the volume base",
@@ -203,15 +204,9 @@ impl Barge {
     ) -> Result<MovePlan> {
         let volume = self.volume(volume_name)?;
         volume.require_present()?;
+        let layout_record = self.layout()?;
         let base = canonical(&volume.base())?;
-        if fs::symlink_metadata(source)
-            .map_err(|e| Error::io("cannot inspect", source, &e))?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(Error::refused("move source must not be a symlink"));
-        }
-        let source = canonical(source)?;
+        let source = move_source(source)?;
         let parent = destination
             .parent()
             .ok_or_else(|| Error::usage("destination needs a parent"))?;
@@ -226,7 +221,7 @@ impl Barge {
                     .file_name()
                     .ok_or_else(|| Error::usage("class folder needs a name"))?;
                 let parent = ancestor.join(name);
-                let class_folder = self.layout()?.classes.values().any(|placement| {
+                let class_folder = layout_record.classes.values().any(|placement| {
                     placement.volume == volume_name && base.join(&placement.path) == parent
                 });
                 if !class_folder {
@@ -261,14 +256,14 @@ impl Barge {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Error::io("cannot inspect", &destination, &e)),
         }
-        let source_identity = identity(&source)?;
-        let destination_parent_identity = identity(&identity_parent)?;
+        let source_identity = entry_identity(&source)?;
+        let destination_parent_identity = entry_identity(&identity_parent)?;
         if source_identity.dev != destination_parent_identity.dev {
             return Err(Error::refused(
                 "move crosses a filesystem; copy is not supported",
             ));
         }
-        for (other_class, placement) in &self.layout()?.classes {
+        for (other_class, placement) in &layout_record.classes {
             if placement.volume == volume_name
                 && layout
                     .as_ref()
@@ -367,17 +362,9 @@ impl Barge {
                 area.after.effective_folder()
             ));
         }
-        if source
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("pvm"))
-        {
-            manual_steps.push(format!(
-                "Re-register in Parallels: prlctl unregister, then prlctl register {}",
-                destination.display()
-            ));
-        }
+        manual_steps.extend(crate::tool_steps::for_move(&source, &destination));
         Ok(MovePlan {
-            schema: "barge.move-plan/2".into(),
+            schema: MOVE_PLAN_SCHEMA.into(),
             volume: volume_name.into(),
             volume_spec: volume.spec().clone(),
             class,
@@ -489,29 +476,113 @@ impl Barge {
     /// retarget those links in the same transaction.
     pub fn apply_move(&self, plan: &MovePlan, options: MoveApplyOptions) -> Result<MoveReport> {
         self.core.ensure_writable()?;
-        if plan.schema != "barge.move-plan/2" {
-            return Err(Error::usage("unknown move plan schema"));
+        check_move_request(plan, options)?;
+        let locks = self.lock_move(plan)?;
+        let before_layout = self.layout()?;
+        self.revalidate_move(plan, &before_layout)?;
+        let mut records = crate::bindings::read(&self.core)?;
+        let originals = records.clone();
+        let mut changes = MoveChanges::default();
+        if let Err(error) = self.commit_move(plan, &before_layout, &mut records, &mut changes) {
+            return match self.rollback_move(plan, &before_layout, &originals, &changes, &error) {
+                Ok(detail) => Err(Error::new(
+                    error.kind(),
+                    format!("{}; rollback: {detail}", error.message()),
+                )),
+                Err(rollback) => Err(rollback),
+            };
         }
-        if !plan.consumers.is_empty() && !options.confirm_stopped {
-            return Err(Error::refused(
-                "bound consumers must be stopped; pass --confirm-stopped",
-            ));
+        drop(locks);
+        #[cfg(test)]
+        let doctor_result = if FAIL_DOCTOR.with(|flag| flag.replace(false)) {
+            Err(Error::refused("injected doctor failure"))
+        } else {
+            self.doctor()
+        };
+        #[cfg(not(test))]
+        let doctor_result = self.doctor();
+        let (doctor, doctor_error) = match doctor_result {
+            Ok(report) => (Some(report), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        Ok(MoveReport {
+            plan: plan.clone(),
+            doctor,
+            doctor_error,
+        })
+    }
+}
+
+/// The locks an applied plan holds while it commits: the account state, each
+/// affected root's hold and each affected area's lock. The field order is the
+/// order they are released when the commit ends, so the doctor report that
+/// follows runs with none of them held.
+struct MoveLocks {
+    _state: crate::state::StateLock,
+    _roots: Vec<File>,
+    _areas: Vec<crate::area::AreaLock>,
+}
+
+/// What a commit changed, by reference into the plan it came from, so a
+/// rollback can undo every step in reverse.
+#[derive(Default)]
+struct MoveChanges<'a> {
+    bindings: Vec<&'a MoveBinding>,
+    links: Vec<&'a UnrecordedLink>,
+}
+
+/// The refusals a plan must pass before anything is locked or written.
+fn check_move_request(plan: &MovePlan, options: MoveApplyOptions) -> Result<()> {
+    if plan.schema != MOVE_PLAN_SCHEMA {
+        return Err(Error::usage("unknown move plan schema"));
+    }
+    if !plan.consumers.is_empty() && !options.confirm_stopped {
+        return Err(Error::refused(
+            "bound consumers must be stopped; pass --confirm-stopped",
+        ));
+    }
+    if !plan.unrecorded_links.is_empty() && !options.retarget_unrecorded {
+        return Err(Error::refused(format!(
+            "{} link(s) point into the moved source and no binding records them ({}); \
+             pass --retarget-unrecorded to retarget them in the same move",
+            plan.unrecorded_links.len(),
+            plan.unrecorded_links
+                .iter()
+                .map(|link| link.link.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Test seam: count a link step down and fail when the counter reaches one, so a
+/// rollback test can stop a commit at a known step.
+#[cfg(test)]
+fn fail_injected_binding() -> Result<()> {
+    FAIL_AFTER.with(|count| {
+        let remaining = count.get();
+        if remaining > 0 {
+            count.set(remaining - 1);
         }
-        if !plan.unrecorded_links.is_empty() && !options.retarget_unrecorded {
-            return Err(Error::refused(format!(
-                "{} link(s) point into the moved source and no binding records them ({}); \
-                 pass --retarget-unrecorded to retarget them in the same move",
-                plan.unrecorded_links.len(),
-                plan.unrecorded_links
-                    .iter()
-                    .map(|link| link.link.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-        let _lock = self.core.state.lock()?;
-        // Lock each affected area against new roots, then hold its roots without
-        // waiting. This order avoids deadlock with eviction, which locks a root first.
+    });
+    if FAIL_AFTER.with(|count| count.get() == 1) {
+        return Err(Error::refused("injected binding failure"));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn fail_injected_binding() -> Result<()> {
+    Ok(())
+}
+
+impl Barge {
+    /// Lock the account state, then each affected area against new roots, then
+    /// hold each of their roots without waiting. This order avoids deadlock with
+    /// eviction, which locks a root first.
+    fn lock_move(&self, plan: &MovePlan) -> Result<MoveLocks> {
+        let state = self.core.state.lock()?;
         let mut area_locks = Vec::new();
         let mut root_locks = Vec::new();
         let mut partial_area = false;
@@ -557,6 +628,20 @@ impl Barge {
                 "moving part of an area would orphan its roots",
             ));
         }
+        Ok(MoveLocks {
+            _state: state,
+            _roots: root_locks,
+            _areas: area_locks,
+        })
+    }
+
+    /// Re-plan under the locks and refuse unless the reviewed plan is still
+    /// exactly what the account says.
+    fn revalidate_move(
+        &self,
+        plan: &MovePlan,
+        before_layout: &crate::layout::Layout,
+    ) -> Result<()> {
         let current = self.plan_move(
             &plan.volume,
             plan.class,
@@ -568,220 +653,194 @@ impl Barge {
         if &current != plan {
             return Err(Error::refused("move plan changed since review"));
         }
-        let before_layout = self.layout()?;
-        if let Some(change) = &plan.layout {
-            if before_layout.classes.get(&change.class) != Some(&change.before)
-                || change.before.volume != plan.volume
-                || change.after.volume != plan.volume
-            {
-                return Err(Error::refused("class placement changed since review"));
-            }
-            let volume = self.volume(&plan.volume)?;
-            if canonical(&volume.base().join(&change.before.path))? != plan.source
-                || canonical(&volume.base())?.join(&change.after.path) != plan.destination
-            {
-                return Err(Error::refused("layout change does not match the rename"));
-            }
-            if self.layout_disagrees(&plan.volume)? {
-                return Err(Error::refused("volume layout disagrees with account"));
-            }
+        let Some(change) = &plan.layout else {
+            return Ok(());
+        };
+        if before_layout.classes.get(&change.class) != Some(&change.before)
+            || change.before.volume != plan.volume
+            || change.after.volume != plan.volume
+        {
+            return Err(Error::refused("class placement changed since review"));
         }
+        let volume = self.volume(&plan.volume)?;
+        if canonical(&volume.base().join(&change.before.path))? != plan.source
+            || canonical(&volume.base())?.join(&change.after.path) != plan.destination
+        {
+            return Err(Error::refused("layout change does not match the rename"));
+        }
+        if self.layout_disagrees(&plan.volume)? {
+            return Err(Error::refused("volume layout disagrees with account"));
+        }
+        Ok(())
+    }
+
+    /// Commit the plan: create the class folder, rename the data, then retarget
+    /// every link and write the records. `changes` collects what was done so
+    /// the rollback can undo it in reverse.
+    fn commit_move<'a>(
+        &self,
+        plan: &'a MovePlan,
+        before_layout: &crate::layout::Layout,
+        records: &mut [BindingRecord],
+        changes: &mut MoveChanges<'a>,
+    ) -> Result<()> {
         if let Some(directory) = &plan.create_directory {
             fs::DirBuilder::new()
                 .mode(0o700)
                 .create(directory)
                 .map_err(|e| Error::io("cannot create class folder", directory, &e))?;
         }
-        let mut records = crate::bindings::read(&self.core)?;
-        let original_records = records.clone();
         crate::os::rename_no_replace(&plan.source, &plan.destination)
             .map_err(|e| Error::io("cannot rename", &plan.source, &e))?;
-        let mut changed = Vec::new();
-        let mut retargeted = Vec::new();
-        let operation = (|| -> Result<()> {
+        for binding in &plan.bindings {
+            fail_injected_binding()?;
+            let Observed::Link {
+                destination: before,
+            } = &binding.before
+            else {
+                return Err(Error::unknown_state("move binding is not a link"));
+            };
+            replace_link(&binding.link_after, before, &binding.after)?;
+            changes.bindings.push(binding);
+            let record = records
+                .iter_mut()
+                .find(|record| record.consumer == binding.record.consumer)
+                .ok_or_else(|| Error::unknown_state("binding disappeared"))?;
+            record.applied.value = binding.after.clone();
+            record.target = BindingTarget::Link {
+                path: binding.link_after.clone(),
+            };
+        }
+        for link in &plan.unrecorded_links {
+            fail_injected_binding()?;
+            replace_link(&link.link, &link.before, &link.after)?;
+            changes.links.push(link);
+        }
+        crate::bindings::write(&self.core, records)?;
+        for area in &plan.areas {
+            self.core.state.write_area(&area.after)?;
+        }
+        if let Some(change) = &plan.layout {
+            let mut layout = before_layout.clone();
+            layout.classes.insert(change.class, change.after.clone());
+            let mount = self.volume(&plan.volume)?.require_present()?;
+            crate::layout::write(
+                &mount.join(crate::layout::VOLUME_LAYOUT_FILE),
+                &layout.for_volume(&plan.volume),
+            )?;
+            crate::layout::write(
+                &self.state_dir().join(crate::layout::ACCOUNT_LAYOUT_FILE),
+                &layout,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Undo a failed commit: restore the data first, then the links, then the
+    /// records. No rollback removes data.
+    ///
+    /// Returns the restored detail for the caller's error, or the composed
+    /// error when the data could not be renamed back.
+    fn rollback_move(
+        &self,
+        plan: &MovePlan,
+        before_layout: &crate::layout::Layout,
+        originals: &[BindingRecord],
+        changes: &MoveChanges<'_>,
+        error: &Error,
+    ) -> Result<String> {
+        let mut failures = Vec::new();
+        if let Err(e) = crate::os::rename_no_replace(&plan.destination, &plan.source) {
+            // The source name was occupied or the filesystem refused recovery.
+            // Keep links on the surviving destination when possible rather than
+            // knowingly pointing them at the absent old source.
             for binding in &plan.bindings {
-                #[cfg(test)]
-                FAIL_AFTER.with(|count| {
-                    let remaining = count.get();
-                    if remaining > 0 {
-                        count.set(remaining - 1);
-                    }
-                });
-                #[cfg(test)]
-                if FAIL_AFTER.with(|count| count.get() == 1) {
-                    return Err(Error::refused("injected binding failure"));
+                if changes.bindings.contains(&binding) {
+                    continue;
                 }
                 let Observed::Link {
                     destination: before,
                 } = &binding.before
                 else {
-                    return Err(Error::unknown_state("move binding is not a link"));
+                    failures.push(format!("binding {} is not a link", binding.record.consumer));
+                    continue;
                 };
-                replace_link(&binding.link_after, before, &binding.after)?;
-                changed.push(binding);
-                let record = records
-                    .iter_mut()
-                    .find(|r| r.consumer == binding.record.consumer)
-                    .ok_or_else(|| Error::unknown_state("binding disappeared"))?;
-                record.applied.value = binding.after.clone();
-                record.target = BindingTarget::Link {
-                    path: binding.link_after.clone(),
-                };
+                if let Err(problem) = replace_link(&binding.link_after, before, &binding.after) {
+                    failures.push(format!(
+                        "link {} could not be repaired: {problem}",
+                        binding.link_after.display()
+                    ));
+                }
             }
             for link in &plan.unrecorded_links {
-                #[cfg(test)]
-                FAIL_AFTER.with(|count| {
-                    let remaining = count.get();
-                    if remaining > 0 {
-                        count.set(remaining - 1);
-                    }
-                });
-                #[cfg(test)]
-                if FAIL_AFTER.with(|count| count.get() == 1) {
-                    return Err(Error::refused("injected binding failure"));
+                if changes.links.contains(&link) {
+                    continue;
                 }
-                replace_link(&link.link, &link.before, &link.after)?;
-                retargeted.push(link);
-            }
-            crate::bindings::write(&self.core, &records)?;
-            for area in &plan.areas {
-                self.core.state.write_area(&area.after)?;
-            }
-            if let Some(change) = &plan.layout {
-                let mut layout = before_layout.clone();
-                layout.classes.insert(change.class, change.after.clone());
-                let mount = self.volume(&plan.volume)?.require_present()?;
-                crate::layout::write(
-                    &mount.join(crate::layout::VOLUME_LAYOUT_FILE),
-                    &layout.for_volume(&plan.volume),
-                )?;
-                crate::layout::write(
-                    &self.state_dir().join(crate::layout::ACCOUNT_LAYOUT_FILE),
-                    &layout,
-                )?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = operation {
-            let mut failures = Vec::new();
-            // Restore the data first, then the links. No rollback removes data.
-            if let Err(e) = crate::os::rename_no_replace(&plan.destination, &plan.source) {
-                // The source name was occupied or the filesystem refused recovery.
-                // Keep links on the surviving destination when possible rather
-                // than knowingly pointing them at the absent old source.
-                for binding in &plan.bindings {
-                    if changed.contains(&binding) {
-                        continue;
-                    }
-                    let Observed::Link {
-                        destination: before,
-                    } = &binding.before
-                    else {
-                        failures.push(format!("binding {} is not a link", binding.record.consumer));
-                        continue;
-                    };
-                    if let Err(problem) = replace_link(&binding.link_after, before, &binding.after)
-                    {
-                        failures.push(format!(
-                            "link {} could not be repaired: {problem}",
-                            binding.link_after.display()
-                        ));
-                    }
-                }
-                for link in &plan.unrecorded_links {
-                    if retargeted.contains(&link) {
-                        continue;
-                    }
-                    if let Err(problem) = replace_link(&link.link, &link.before, &link.after) {
-                        failures.push(format!(
-                            "link {} could not be repaired: {problem}",
-                            link.link.display()
-                        ));
-                    }
-                }
-                return Err(Error::new(
-                    error.kind(),
-                    format!(
-                        "{}; rollback rename failed: {e}; data remains at {}; {}",
-                        error.message(),
-                        plan.destination.display(),
-                        failures.join("; ")
-                    ),
-                ));
-            }
-            for binding in changed.iter().rev() {
-                if let Observed::Link { destination } = &binding.before {
-                    if let Err(e) =
-                        replace_link(&binding.record.owned_path(), &binding.after, destination)
-                    {
-                        failures.push(format!(
-                            "link {} could not be restored: {e}",
-                            binding.record.owned_path().display()
-                        ));
-                    }
-                }
-            }
-            for link in retargeted.iter().rev() {
-                if let Err(e) = replace_link(&link.link, &link.after, &link.before) {
+                if let Err(problem) = replace_link(&link.link, &link.before, &link.after) {
                     failures.push(format!(
-                        "link {} could not be restored: {e}",
+                        "link {} could not be repaired: {problem}",
                         link.link.display()
                     ));
                 }
             }
-            if let Err(e) = crate::bindings::write(&self.core, &original_records) {
-                failures.push(format!("binding records could not be restored: {e}"));
-            }
-            for area in &plan.areas {
-                if let Err(e) = self.core.state.write_area(&area.before) {
-                    failures.push(format!("area record could not be restored: {e}"));
-                }
-            }
-            if plan.layout.is_some() {
-                if let Ok(volume) = self.volume(&plan.volume) {
-                    if let Err(e) = crate::layout::write(
-                        &volume.spec().mount.join(crate::layout::VOLUME_LAYOUT_FILE),
-                        &before_layout.for_volume(&plan.volume),
-                    ) {
-                        failures.push(format!("volume layout could not be restored: {e}"));
-                    }
-                }
-                if let Err(e) = crate::layout::write(
-                    &self.state_dir().join(crate::layout::ACCOUNT_LAYOUT_FILE),
-                    &before_layout,
-                ) {
-                    failures.push(format!("account layout could not be restored: {e}"));
-                }
-            }
-            let detail = if failures.is_empty() {
-                "data, links and records restored".to_string()
-            } else {
-                failures.join("; ")
-            };
             return Err(Error::new(
                 error.kind(),
-                format!("{}; rollback: {detail}", error.message()),
+                format!(
+                    "{}; rollback rename failed: {e}; data remains at {}; {}",
+                    error.message(),
+                    plan.destination.display(),
+                    failures.join("; ")
+                ),
             ));
         }
-        drop(_lock);
-        drop(root_locks);
-        drop(area_locks);
-        #[cfg(test)]
-        let doctor_result = if FAIL_DOCTOR.with(|flag| flag.replace(false)) {
-            Err(Error::refused("injected doctor failure"))
+        for binding in changes.bindings.iter().rev() {
+            if let Observed::Link { destination } = &binding.before {
+                if let Err(e) =
+                    replace_link(&binding.record.owned_path(), &binding.after, destination)
+                {
+                    failures.push(format!(
+                        "link {} could not be restored: {e}",
+                        binding.record.owned_path().display()
+                    ));
+                }
+            }
+        }
+        for link in changes.links.iter().rev() {
+            if let Err(e) = replace_link(&link.link, &link.after, &link.before) {
+                failures.push(format!(
+                    "link {} could not be restored: {e}",
+                    link.link.display()
+                ));
+            }
+        }
+        if let Err(e) = crate::bindings::write(&self.core, originals) {
+            failures.push(format!("binding records could not be restored: {e}"));
+        }
+        for area in &plan.areas {
+            if let Err(e) = self.core.state.write_area(&area.before) {
+                failures.push(format!("area record could not be restored: {e}"));
+            }
+        }
+        if plan.layout.is_some() {
+            if let Ok(volume) = self.volume(&plan.volume) {
+                if let Err(e) = crate::layout::write(
+                    &volume.spec().mount.join(crate::layout::VOLUME_LAYOUT_FILE),
+                    &before_layout.for_volume(&plan.volume),
+                ) {
+                    failures.push(format!("volume layout could not be restored: {e}"));
+                }
+            }
+            if let Err(e) = crate::layout::write(
+                &self.state_dir().join(crate::layout::ACCOUNT_LAYOUT_FILE),
+                before_layout,
+            ) {
+                failures.push(format!("account layout could not be restored: {e}"));
+            }
+        }
+        Ok(if failures.is_empty() {
+            "data, links and records restored".to_string()
         } else {
-            self.doctor()
-        };
-        #[cfg(not(test))]
-        let doctor_result = self.doctor();
-        let (doctor, doctor_error) = match doctor_result {
-            Ok(report) => (Some(report), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        Ok(MoveReport {
-            plan: plan.clone(),
-            doctor,
-            doctor_error,
+            failures.join("; ")
         })
     }
 }

@@ -308,7 +308,12 @@ pub(crate) fn tree_bytes_calls() -> usize {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// The bytes a file is charged for, as a measured tree counts them.
+    fn allocated(path: &Path) -> u64 {
+        fs::symlink_metadata(path).unwrap().blocks() * 512
+    }
 
     /// Restores a folder's mode so the fixture can still remove it.
     struct ModeGuard(PathBuf);
@@ -386,7 +391,11 @@ mod tests {
         let _guard = ModeGuard(hidden);
 
         let size = tree_bytes(&root);
-        assert_eq!(size.bytes, 6, "the readable file is still counted");
+        assert_eq!(
+            size.bytes,
+            allocated(&root.join("readable.bin")),
+            "the readable file is still counted"
+        );
         assert!(size.approximate, "an unreadable entry is never zero");
     }
 }

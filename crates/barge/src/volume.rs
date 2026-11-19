@@ -272,9 +272,6 @@ pub struct VolumeStatus {
     pub areas: Vec<AreaStatus>,
 }
 
-/// Every volume, for status output.
-pub type Status = Vec<VolumeStatus>;
-
 impl Barge {
     /// Register a volume, reading its identity at the mount when the caller did
     /// not supply one.
