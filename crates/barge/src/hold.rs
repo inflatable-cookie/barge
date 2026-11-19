@@ -86,6 +86,15 @@ impl Hold {
             .ok_or_else(|| Error::unknown_state("hold has no descriptor"))?;
         crate::os::set_inheritable(file, inheritable)
     }
+
+    /// Consume the hold and leave its descriptor inheritable, so a child that
+    /// keeps it keeps the hold across `exec`.
+    ///
+    /// Oxide's output holds use this to hand selected roots to a child process.
+    pub fn into_inheritable(self) -> Result<Self> {
+        self.set_inheritable(true)?;
+        Ok(self)
+    }
 }
 
 impl Drop for Hold {

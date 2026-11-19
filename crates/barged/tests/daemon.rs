@@ -450,8 +450,10 @@ fn lan_pairing_and_authenticated_requests() {
     let valid = request(now, nonce, body, body);
     assert!(raw(&valid).contains(" 200 "));
     assert!(raw(&valid).contains(" 401 "));
+    // Well outside the 60-second window, so sampling `now` just before a
+    // second boundary cannot turn the off-by-one second into a passing skew.
     assert!(raw(&request(
-        now + 61,
+        now + 300,
         "33332233445566778899aabbccddeeff",
         body,
         body
@@ -462,7 +464,7 @@ fn lan_pairing_and_authenticated_requests() {
     assert!(raw(&signed.replacen("/v1/power/cancel", "/v1/power", 1)).contains(" 401 "));
     assert!(raw(&signed.replacen("POST", "GET", 1)).contains(" 401 "));
     assert!(raw(&request(
-        now - 61,
+        now - 300,
         "11112233445566778899aabbccddeeff",
         body,
         body

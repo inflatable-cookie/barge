@@ -706,8 +706,11 @@ fn a_hold_survives_fork_and_exec_when_its_descriptor_is_inherited() {
     let area = fixture.area("pool");
     let root = area.create_root("slot").unwrap();
 
-    let hold = area.hold(&root.id, Mode::Exclusive).unwrap();
-    hold.set_inheritable(true).unwrap();
+    let hold = area
+        .hold(&root.id, Mode::Exclusive)
+        .unwrap()
+        .into_inheritable()
+        .unwrap();
     // The child blocks on its stdin pipe instead of sleeping, so the test says
     // when the inherited hold ends: closing the pipe releases the child.
     let mut child = Command::new("/bin/sh")
