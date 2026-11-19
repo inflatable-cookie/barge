@@ -4,10 +4,11 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// Where the macOS traffic lights sit: `x` is the inset from the left edge,
 /// `y` the height of the title-bar area above the buttons' own height (wry's
-/// `inset_traffic_lights`). It roughly centres the lights in the renderer's
-/// 40 px top strip (`--chrome-strip` in `style.css`).
+/// `inset_traffic_lights`). At `(18, 22)` this centres the lights in the
+/// renderer's 40 px top strip; keep paired with the title's 90 px margin in
+/// `style.css` (`--chrome-strip`).
 #[cfg(target_os = "macos")]
-const TRAFFIC_LIGHTS: tauri::LogicalPosition<f64> = tauri::LogicalPosition::new(18.0, 20.0);
+const TRAFFIC_LIGHTS: tauri::LogicalPosition<f64> = tauri::LogicalPosition::new(18.0, 22.0);
 
 /// Shows the main window, building it the first time.
 ///

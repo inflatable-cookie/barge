@@ -15,9 +15,10 @@ aside .poodle-sidebar-nav { padding-block: 0; }
 /* The window's drag handle, from edge to edge; nothing interactive sits in it.
    Over the content it takes the canvas colour, so scrolled cards pass under it. */
 .titlebar { position: fixed; inset: 0 0 auto; height: var(--chrome-strip); z-index: 20; display: flex; align-items: center; background: linear-gradient(to right, transparent var(--sidebar), var(--poodle-color-background-canvas) var(--sidebar)); }
-/* The title sits beside the traffic lights, inside the drag region; it takes
-   no pointer events, so the whole strip keeps dragging the window. */
-.titlebar-brand { margin-left: 78px; font-weight: 700; pointer-events: none; user-select: none; -webkit-user-select: none; }
+/* Keep the title margin (90px) paired with TRAFFIC_LIGHTS (18px, 22px) in
+   commands/window.rs. The title takes no pointer events, so the whole strip
+   keeps dragging the window. */
+.titlebar-brand { margin-left: 90px; font-weight: 700; pointer-events: none; user-select: none; -webkit-user-select: none; }
 .heading { display: flex; align-items: baseline; justify-content: space-between; }
 .observed { color: var(--poodle-color-text-secondary); font-size: .85rem; margin: 0 0 12px; }
 .volumes { padding: 0; list-style: none; }
