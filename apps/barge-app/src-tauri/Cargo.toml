@@ -1,5 +1,6 @@
 [package]
 name = "barge-app"
+description = "Barge's menu-bar app: machines and storage over the library, never the CLI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,13 +16,13 @@ serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
 tauri-plugin-autostart.workspace = true
-longhorn-core = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
-longhorn-config = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
-longhorn-settings = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
-longhorn-settings-config = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
-longhorn-tauri-config = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
-longhorn-tauri-settings = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
-longhorn-storage-layout = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
+longhorn-core.workspace = true
+longhorn-config.workspace = true
+longhorn-settings.workspace = true
+longhorn-settings-config.workspace = true
+longhorn-tauri-config.workspace = true
+longhorn-tauri-settings.workspace = true
+longhorn-storage-layout.workspace = true
 
 [dev-dependencies]
 barge = { workspace = true, features = ["testing"] }

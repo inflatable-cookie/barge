@@ -8,6 +8,7 @@ Barge moves heavy, rebuildable developer data (build output, caches, scratch) of
 - [Machines](knowledge/machines.md)
 - [Barge app](knowledge/app.md)
 - [Consumption contract](knowledge/contracts/consumption.md)
+- [Quality gate](knowledge/contracts/quality.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
 - [Install `barged` on Bazzite](install-barged.md)

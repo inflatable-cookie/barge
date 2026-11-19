@@ -11,9 +11,9 @@ binary plus user unit files is enough and survives image updates.
 
 ## 1. Choose a connection
 
-LAN mode works without Tailscale. It authenticates requests but does not hide
-traffic: someone on the LAN can see a power action happened, but cannot forge
-or replay one. Keep both clocks synchronized. Tailscale encrypts traffic and is
+LAN mode works without Tailscale. Its trust model is the LAN half of
+[machines](knowledge/machines.md#protocol-and-trust): requests authenticate but
+traffic is not hidden, and both clocks must agree. Tailscale encrypts traffic and is
 recommended across networks. For Tailscale mode, sign both machines into the
 same tailnet and find the PC address with `tailscale ip -4` and the Mac's
 stable node ID or MagicDNS name with `tailscale status --json`.

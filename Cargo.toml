@@ -51,6 +51,16 @@ tauri = { version = "2.12.7", features = ["tray-icon"] }
 tauri-build = { version = "2.7.6", features = [] }
 tauri-plugin-autostart = "2.7.0"
 
+# The menu-bar app's Longhorn backbone, pinned at one `rev` so every member
+# moves together (docs/knowledge/app.md, "Architecture").
+longhorn-core = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
+longhorn-config = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
+longhorn-settings = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
+longhorn-settings-config = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
+longhorn-tauri-config = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
+longhorn-tauri-settings = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
+longhorn-storage-layout = { git = "https://github.com/inflatable-cookie/longhorn", rev = "a3e627f37b218de8d832e26f3fd84424d1f0096a" }
+
 # logind over D-Bus, Linux only. The macOS workspace checks never build it, so
 # the daemon still compiles (and reports state) on the Mac.
 zbus = "5.19.0"
