@@ -77,7 +77,12 @@ hidden). The native traffic lights float in a 40 px strip along the top, inset
 from the corner over the sidebar, and keep their hover glyphs, full screen and
 accessibility. The whole strip is the drag region (`data-tauri-drag-region`),
 above the sidebar and the content alike; nothing interactive sits in it, and no
-content sits under the lights. Other platforms keep their decorations.
+content sits under the lights. The "Barge" title sits in the strip, vertically
+centred with the traffic lights and just to their right; it is part of the
+drag region and takes no pointer events, so the whole strip keeps dragging.
+The sidebar and the content share one top inset below the strip
+(`--top-inset`), so the first navigation item and the page heading share a top
+line. Other platforms keep their decorations.
 
 ### Native menu
 
@@ -130,10 +135,13 @@ Quit
     waiting state says its progress once the same way.
   - **Beside it:** the name with one `[...]` button at the card's top right, the
     state label, and a muted line with the mode and address
-    (`LAN · bazzite.local`). A stale observation also says when Barge last saw
-    the machine. The `[...]` button opens a menu with the rest of what the
-    state offers — Restart…, Shut down…, Open Moonlight — then a separator and
-    Details…; with nothing else to offer, Details… alone. Both the power button
+    (`LAN · bazzite.local`). An offline machine folds its last observation into
+    the state label (`Offline for 27 s`, `Offline for 5 min`, `Offline for
+    2 h`); the card has no separate last-seen line. The `[...]` button opens
+    a menu with the rest of what the state offers — Restart, Shut down, Open
+    Moonlight — then a separator and Details; with nothing else to offer,
+    Details alone. (The native menu-bar menu keeps its ellipses: Restart…,
+    Shut down…, Details….) Both the power button
     and the menu button have an accessible label and a tooltip.
   - **Height:** the card is the power button and its text, with no row of icons
     along the bottom.
@@ -198,8 +206,8 @@ prune, and machine metrics beyond power state.
 ## Interaction rules
 
 - **Show what was observed, and when.** Never infer a current state. An
-  unreachable machine is "Offline", with when Barge last saw it, never
-  "asleep". Ages read in the past tense ("12 s ago", "now") and appear only
+  unreachable machine reads "Offline for 27 s" from its last observation,
+  never "asleep". Ages read in the past tense ("12 s ago", "now") and appear only
   for a stale observation, not on every line.
 - **The daemon owns countdowns.** On reconnect or reopen, the app reads the
   pending action and its deadline from `barged`; it never restarts a local

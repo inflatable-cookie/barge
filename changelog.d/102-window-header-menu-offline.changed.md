@@ -1,0 +1,1 @@
+Move the Barge title beside the traffic lights with one shared top inset for the sidebar and content, drop the ellipses from the card menu (Restart, Shut down, Details), and fold the last observation into the offline state label (Offline for 27 s).

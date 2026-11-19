@@ -94,7 +94,7 @@ if (params.has("details")) {
     document.querySelector<HTMLButtonElement>('button[aria-label^="Actions for"]')?.click();
     setTimeout(() => {
       [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
-        .find((item) => item.textContent?.trim() === "Details…")
+        .find((item) => item.textContent?.trim() === "Details")
         ?.click();
     }, 150);
   }, 150);
