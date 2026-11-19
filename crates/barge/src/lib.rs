@@ -28,6 +28,7 @@ pub mod root;
 pub mod scratch;
 pub mod space;
 pub mod state;
+mod tool_steps;
 mod trash;
 pub mod volume;
 pub mod workflow;

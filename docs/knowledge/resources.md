@@ -292,6 +292,11 @@ then updates each binding and any moved area declaration and layout, then runs d
 binding and the old data in place, or rolls the rename back. The apply step
 always needs Tom's explicit approval for live data (AGENTS.md guardrail).
 
+A tool that must re-register moved data (Parallels, for a `.pvm` bundle) gets a
+manual step from a fixed data list, not from code in the move: a row in
+`crates/barge/src/tool_steps.rs`, rendered into the plan's manual steps as the
+known-link list is.
+
 The plan also checks the [known link locations](#known-link-locations). A link
 there that points inside the moved source and that no binding records is listed
 with the exact `barge bind adopt` command that records it afterwards. While the
