@@ -48,7 +48,7 @@
       preferences.theme === "dark" ||
       (preferences.theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
     applyThemeAttributes(document.documentElement, {
-      theme: dark ? "graphite" : "iceberg",
+      theme: dark ? "midnight" : "iceberg",
     });
   }
 
