@@ -11,13 +11,14 @@ use std::sync::Arc;
 
 use barged::{Config, Daemon, PowerController, Result, SystemClock};
 
-/// Where a system install puts the config; `--config` overrides it.
+/// Cleared by the SIGTERM handler; `serve` returns once it reads false.
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn stop_on_signal(_: libc::c_int) {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
+/// Where a system install puts the config; `--config` overrides it.
 const DEFAULT_CONFIG: &str = "/etc/barged/config.json";
 
 fn main() -> ExitCode {

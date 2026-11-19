@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use barge::{Barge, Error, ErrorKind, MoveApplyOptions, MovePlan, Result};
+use barge::{Barge, Error, MoveApplyOptions, MovePlan, Result};
 use serde_json::json;
 
 use crate::args::{expect_no_positionals, Options};
@@ -17,7 +17,7 @@ pub(crate) fn move_resource(arguments: &[String], json: bool) -> Result<()> {
         let path = options.required("plan")?;
         let source = if path == "-" {
             std::io::read_to_string(std::io::stdin().lock())
-                .map_err(|e| Error::new(ErrorKind::Io, format!("cannot read plan: {e}")))?
+                .map_err(|e| Error::usage(format!("cannot read the plan from stdin: {e}")))?
         } else {
             std::fs::read_to_string(&path)
                 .map_err(|e| Error::usage(format!("cannot read plan {path}: {e}")))?

@@ -1,9 +1,10 @@
 //! The daemon's configuration: what it binds to, and which tailnet nodes may
 //! ask it to do anything.
 //!
-//! `listen` is a single address, never a wildcard. `barged` refuses to start on
-//! `0.0.0.0` or `::`, because the tailnet address is the first half of the
-//! trust model (docs/knowledge/machines.md, "Protocol and trust").
+//! `listen` is one address. A wildcard (`0.0.0.0` or `::`) is refused unless
+//! `allow_wildcard` is true, the opt-in for a LAN install that listens on every
+//! interface. In Tailscale mode the named tailnet address is the first half of
+//! the trust model (docs/knowledge/machines.md, "Protocol and trust").
 
 use std::fs;
 use std::net::SocketAddr;
@@ -26,6 +27,7 @@ pub struct Config {
     pub mode: AuthMode,
     #[serde(default)]
     pub key_file: Option<PathBuf>,
+    /// Permit a wildcard `listen` address, which binds every interface.
     #[serde(default)]
     pub allow_wildcard: bool,
     /// Tailscale node identities allowed to call. A node matches by stable ID
@@ -68,7 +70,7 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.listen.ip().is_unspecified() && !self.allow_wildcard {
             return Err(Error::new(format!(
-                "listen {} is a wildcard address; bind the machine's Tailscale address instead",
+                "listen {} is a wildcard address; bind one address, or set allow_wildcard to accept every interface",
                 self.listen
             )));
         }

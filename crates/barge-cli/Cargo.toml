@@ -15,6 +15,9 @@ barge = { workspace = true }
 barge-machine = { workspace = true }
 # The JSON envelope: the CLI encodes one document per command.
 serde_json.workspace = true
+# The local time-zone offset for human output and the terminal's echo for
+# `machine pair`: the CLI's only platform calls (src/human.rs, src/console.rs).
+libc.workspace = true
 
 # Tests use the storage library's `testing::TempDir`; the feature stays off in the
 # library the binary links.
