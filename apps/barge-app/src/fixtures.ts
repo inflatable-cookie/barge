@@ -1,5 +1,7 @@
 /**
  * Fixture harness for renderer screenshots: `/fixtures.html?view=machines&scenario=awake&theme=dark`.
+ * `&details` opens the first machine's details; `&chrome=native` drops the
+ * macOS top strip.
  *
  * It mounts the real App against a fake api, so a screenshot shows the same
  * markup and Poodle styles the app renders. Not part of the app build. The
@@ -17,6 +19,7 @@ const params = new URLSearchParams(location.search);
 const view = params.get("view") ?? "machines";
 const scenario = params.get("scenario") ?? "storage";
 const theme = (params.get("theme") ?? "system") as Theme;
+if (params.get("chrome") !== "native") document.documentElement.dataset.chrome = "overlay";
 
 const volumes: VolumeSummary[] = [
   { name: "Builds", presence: "present", free_bytes: 214 * 1024 ** 3 },
@@ -82,4 +85,7 @@ if (scenario === "save-failed") {
   setTimeout(() => {
     document.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Launch at login"]')?.click();
   }, 150);
+}
+if (params.has("details")) {
+  setTimeout(() => document.querySelector<HTMLButtonElement>('button[aria-label="Details"]')?.click(), 150);
 }

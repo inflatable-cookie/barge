@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import MachineCard from "./MachineCard.svelte";
-  import { AlertDialog, Button, Callout, Field, FormDialog, Select, TextInput } from "@inflatable-cookie/poodle-svelte";
+  import ObservedAge from "./ObservedAge.svelte";
+  import { AlertDialog, Button, Callout, DetailItem, Dialog, Field, FormDialog, Select, TextInput } from "@inflatable-cookie/poodle-svelte";
   import { needsConfirmation, offerLabel } from "./machineModel";
   import type { AppApi, MachineView, NewMachine, Offer } from "./types";
 
@@ -16,6 +17,9 @@
   let addOpen = $state(false);
   let pairOpen = $state(false);
   let target = $state("");
+  /** The machine whose details dialog is open, by name, so a poll refreshes it. */
+  let detailsFor = $state<string | null>(null);
+  let details = $derived(machines.find(machine => machine.name === detailsFor) ?? null);
   /** A pending confirmation: `offer` is the action, or null to remove the machine. */
   let confirm = $state<{ name: string; offer: Offer | null } | null>(null);
   let mode = $state("lan");
@@ -84,6 +88,17 @@
     }
   }
 
+  function openPair(machine: string) {
+    detailsFor = null;
+    target = machine; key = ""; error = "";
+    pairOpen = true;
+  }
+
+  function openRemove(machine: string) {
+    detailsFor = null;
+    confirm = { name: machine, offer: null };
+  }
+
   function openAdd() {
     error = "";
     addOpen = true;
@@ -139,13 +154,33 @@
         {now}
         busy={working === machine.name}
         onOffer={(offer) => act(machine, offer)}
-        onPair={() => { target = machine.name; key = ""; error = ""; pairOpen = true; }}
-        onRemove={() => { confirm = { name: machine.name, offer: null }; }}
+        onDetails={() => detailsFor = machine.name}
       />
     {/each}
   </div>
 {/if}
 
+<Dialog open={details !== null} onOpenChange={value => { if (!value) detailsFor = null; }} title={details?.name ?? "Machine"} description="Connection and pairing" width="sm">
+  {#if details}
+    <div class="facts">
+      <DetailItem presentation="simple" label="Connection" value={details.mode === "lan" ? "LAN" : "Tailscale"} />
+      <DetailItem presentation="simple" label="Address" value={details.address} />
+      <DetailItem presentation="simple" label="Port" value={String(details.daemon_port)} />
+      <DetailItem presentation="simple" label="MAC" value={details.mac} />
+      <DetailItem presentation="simple" label="Last observation">{#if details.seen_at_unix_ms !== null}<ObservedAge at={details.seen_at_unix_ms} {now} />{:else}Never{/if}</DetailItem>
+      {#if details.error}<DetailItem presentation="simple" label="Last error" value={details.error} />{/if}
+    </div>
+  {/if}
+  {#snippet footer()}
+    {#if details}
+      {@const name = details.name}
+      <div class="dialog-actions">
+        <Button variant="ghost" tone="danger" disabled={busy} onClick={() => openRemove(name)}>Remove…</Button>
+        <Button variant="secondary" disabled={busy} onClick={() => openPair(name)}>Pair…</Button>
+      </div>
+    {/if}
+  {/snippet}
+</Dialog>
 <FormDialog open={addOpen} onOpenChange={value => addOpen = value} title="Add machine" submitLabel="Add machine" submitting={working === "new"} error={error || null} onSubmit={add}>
   <Field id="machine-name" label="Name" required><TextInput id="machine-name" value={name} onValueChange={value => name = value} /></Field>
   <Field id="machine-host" label="LAN hostname" required><TextInput id="machine-host" value={hostname} onValueChange={value => hostname = value} /></Field>

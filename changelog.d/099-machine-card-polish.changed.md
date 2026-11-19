@@ -1,0 +1,1 @@
+Machines cards: a large round power button in the avatar position, small icon buttons for the other actions, details in a dialog, and a frameless macOS window with floating traffic lights. The last observation no longer reads in the future.

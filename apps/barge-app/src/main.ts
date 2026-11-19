@@ -20,6 +20,8 @@ const api: AppApi = {
   machineAction: (name, operation) => invoke("machines_action", { name, operation }),
   moonlight: () => invoke("open_moonlight"),
 };
+// The window builder marks a frameless macOS window (commands/window.rs).
+if ((window as { __BARGE_CHROME__?: string }).__BARGE_CHROME__ === "overlay") document.documentElement.dataset.chrome = "overlay";
 const target = document.getElementById("app");
 // The menu opens the window on a view by its hash (see commands/window.rs).
 const views = ["machines", "storage", "activity", "settings"];
