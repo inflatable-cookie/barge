@@ -35,7 +35,7 @@ export interface MachineView {
 }
 export interface LocalMachine {
   name: string; state: "awake" | "unknown"; observed_at_unix_ms: number; model: string | null; uptime_seconds: number | null;
-  volumes: VolumeSummary[]; doctor_findings: number | null; storage_error: string | null;
+  volumes: VolumeSummary[]; doctor_findings: number | null; doctor_observed_at_unix_ms?: number | null; storage_error: string | null;
 }
 export interface NewMachine {
   name: string; hostname: string; mac: string; tailscale_name: string | null; key: string | null;

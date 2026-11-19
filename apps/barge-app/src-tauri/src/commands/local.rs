@@ -1,6 +1,32 @@
 //! Read-only information about the machine running Barge.
 
 use serde::Serialize;
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Copy)]
+pub struct DoctorObservation {
+    pub findings: usize,
+    pub observed_at_unix_ms: u64,
+}
+#[derive(Default)]
+pub struct DoctorState(pub Arc<Mutex<Option<DoctorObservation>>>);
+
+pub fn refresh_doctor(state: &DoctorState) -> Result<(), String> {
+    let account = barge::Barge::open_read_only().map_err(|error| error.to_string())?;
+    refresh_doctor_in(&account, state)
+}
+
+fn refresh_doctor_in(account: &barge::Barge, state: &DoctorState) -> Result<(), String> {
+    let report = account.doctor().map_err(|error| error.to_string())?;
+    let observed_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |value| value.as_millis().try_into().unwrap_or(u64::MAX));
+    *state.0.lock().map_err(|error| error.to_string())? = Some(DoctorObservation {
+        findings: report.problems(),
+        observed_at_unix_ms,
+    });
+    Ok(())
+}
 
 #[derive(Serialize)]
 pub struct LocalMachine {
@@ -11,6 +37,7 @@ pub struct LocalMachine {
     pub uptime_seconds: Option<u64>,
     pub volumes: Vec<crate::storage::VolumeSummary>,
     pub doctor_findings: Option<usize>,
+    pub doctor_observed_at_unix_ms: Option<u64>,
     pub storage_error: Option<String>,
 }
 
@@ -77,12 +104,11 @@ fn local_from_account(
     let storage = (|| {
         let account = account?;
         let volumes = crate::storage::volumes(account).map_err(|error| error.to_string())?;
-        let doctor = account.doctor().map_err(|error| error.to_string())?;
-        Ok::<_, String>((volumes, doctor.problems()))
+        Ok::<_, String>(volumes)
     })();
-    let (volumes, doctor_findings, storage_error) = match storage {
-        Ok((volumes, findings)) => (volumes, Some(findings), None),
-        Err(error) => (Vec::new(), None, Some(error)),
+    let (volumes, storage_error) = match storage {
+        Ok(volumes) => (volumes, None),
+        Err(error) => (Vec::new(), Some(error)),
     };
     LocalMachine {
         name,
@@ -91,14 +117,26 @@ fn local_from_account(
         model,
         uptime_seconds,
         volumes,
-        doctor_findings,
+        doctor_findings: None,
+        doctor_observed_at_unix_ms: None,
         storage_error,
     }
 }
 
 #[tauri::command]
-pub async fn local_machine_info() -> Result<LocalMachine, String> {
-    super::blocking(|| Ok(local_machine())).await
+pub async fn local_machine_info(
+    doctor: tauri::State<'_, DoctorState>,
+) -> Result<LocalMachine, String> {
+    let cache = doctor.0.clone();
+    super::blocking(move || {
+        let mut local = local_machine();
+        if let Some(observation) = *cache.lock().map_err(|error| error.to_string())? {
+            local.doctor_findings = Some(observation.findings);
+            local.doctor_observed_at_unix_ms = Some(observation.observed_at_unix_ms);
+        }
+        Ok(local)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -141,5 +179,23 @@ mod tests {
             local_from_account("Test Mac".into(), None, None, Ok(&account)).state,
             "unknown"
         );
+    }
+    #[test]
+    fn local_reads_do_not_run_doctor_but_explicit_refresh_records_it() {
+        let fixture = barge::testing::TempDir::new("app-doctor").unwrap();
+        let state_dir = fixture.child("missing");
+        let account = barge::Barge::open_read_only_with(
+            &state_dir,
+            Arc::new(barge::FakeOs::new()),
+            Arc::new(barge::ManualClock::new(0)),
+        )
+        .unwrap();
+        let doctor = DoctorState::default();
+        let local = local_from_account("Mac".into(), None, Some(1), Ok(&account));
+        assert!(local.doctor_findings.is_none());
+        assert!(doctor.0.lock().unwrap().is_none());
+        refresh_doctor_in(&account, &doctor).unwrap();
+        assert_eq!(doctor.0.lock().unwrap().as_ref().unwrap().findings, 0);
+        assert!(!state_dir.exists());
     }
 }

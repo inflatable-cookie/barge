@@ -31,6 +31,14 @@ async function settingsView() {
 }
 
 describe("window navigation", () => {
+  it("runs the storage read when opening Storage, not when opening Machines", async () => {
+    const api = fixture();
+    render(App, { props: { api } });
+    await screen.findByRole("button", { name: /This Mac/ });
+    expect(api.volumes).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole("button", { name: "Storage" }));
+    await waitFor(() => expect(api.volumes).toHaveBeenCalledOnce());
+  });
   it("shows the machines, storage, activity and settings views", async () => {
     const api = fixture();
     render(App, { props: { api } });

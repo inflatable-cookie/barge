@@ -46,6 +46,7 @@ fn run() -> tauri::Result<()> {
                 .unwrap_or(true);
             app.manage(store);
             app.manage(commands::machines::MachineState::default());
+            app.manage(commands::local::DoctorState::default());
             app.manage(longhorn_tauri_settings::TauriSettingsState::new(
                 std::sync::Arc::new(settings),
             ));

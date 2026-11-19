@@ -23,6 +23,8 @@ struct Snapshot {
     local_state: Option<(&'static str, u64)>,
     poll_error: String,
     action_error: String,
+    doctor_error: String,
+    doctor: Option<local::DoctorObservation>,
 }
 
 impl Snapshot {
@@ -51,6 +53,8 @@ struct Rows {
 
 struct MenuRows {
     names: Vec<String>,
+    menu: Menu<tauri::Wry>,
+    error_visible: bool,
     storage: MenuItem<tauri::Wry>,
     local_state: MenuItem<tauri::Wry>,
     error: MenuItem<tauri::Wry>,
@@ -100,14 +104,16 @@ fn build(app: &AppHandle, names: &[String]) -> tauri::Result<(Menu<tauri::Wry>, 
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     let error = item(app, "error", "", false)?;
     menu.append_items(&[
-        &error,
+        &item(app, "refresh", "Refresh", true)?,
         &item(app, "open", "Open Barge", true)?,
         &item(app, "settings", "Settings…", true)?,
         &item(app, "quit", "Quit", true)?,
     ])?;
     Ok((
-        menu,
+        menu.clone(),
         MenuRows {
+            menu,
+            error_visible: false,
             names: names.to_vec(),
             storage,
             local_state,
@@ -174,18 +180,52 @@ fn present(machine: &MachineView, now: u64) -> MachinePresentation {
     }
 }
 
-fn update(rows: &MenuRows, snapshot: &Snapshot, now: u64) {
-    let _ = rows.storage.set_text(&snapshot.storage);
+fn update(rows: &mut MenuRows, snapshot: &Snapshot, now: u64) {
+    let doctor = snapshot.doctor.map_or_else(
+        || "doctor not checked".to_owned(),
+        |record| {
+            let status = if record.findings == 0 {
+                "doctor OK".to_owned()
+            } else {
+                format!("{} findings", record.findings)
+            };
+            format!(
+                "{status}, {} s ago",
+                now.saturating_sub(record.observed_at_unix_ms) / 1000
+            )
+        },
+    );
+    let _ = rows
+        .storage
+        .set_text(format!("{} · {doctor}", snapshot.storage));
     let _ = rows
         .local_state
         .set_text(local_state_line(snapshot.local_state, now));
-    let _ = rows.error.set_text(
-        [snapshot.poll_error.as_str(), snapshot.action_error.as_str()]
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · "),
-    );
+    let error = [
+        snapshot.poll_error.as_str(),
+        snapshot.action_error.as_str(),
+        snapshot.doctor_error.as_str(),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ");
+    if !error.is_empty() && !rows.error_visible {
+        if let Ok(items) = rows.menu.items() {
+            if rows
+                .menu
+                .insert(&rows.error, items.len().saturating_sub(4))
+                .is_ok()
+            {
+                rows.error_visible = true;
+            }
+        }
+    } else if error.is_empty() && rows.error_visible && rows.menu.remove(&rows.error).is_ok() {
+        rows.error_visible = false;
+    }
+    if rows.error_visible {
+        let _ = rows.error.set_text(error);
+    }
     for (row, machine) in rows.machines.iter().zip(&snapshot.machines) {
         let value = present(machine, now);
         let _ = row.header.set_text(value.header);
@@ -232,12 +272,7 @@ fn storage_summary(local: &local::LocalMachine) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let doctor = match local.doctor_findings {
-        Some(0) => "doctor OK".into(),
-        Some(count) => format!("{count} findings"),
-        None => "doctor unavailable".into(),
-    };
-    format!("{volumes} · {doctor}")
+    volumes
 }
 
 fn confirm(name: &str, operation: &str) -> bool {
@@ -263,6 +298,18 @@ pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Resu
             let id = event.id().as_ref();
             match id {
                 "quit" => app.exit(0),
+                "refresh" => {
+                    let app = app.clone();
+                    let events = events.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let result = local::refresh_doctor(&app.state::<local::DoctorState>());
+                        if let Ok(mut snapshot) = events.lock() {
+                            snapshot.doctor_error = result
+                                .err()
+                                .map_or_else(String::new, |error| format!("Doctor: {error}"));
+                        }
+                    });
+                }
                 "open" | "settings" => {
                     let app = app.clone();
                     let settings = id == "settings";
@@ -318,16 +365,27 @@ pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Resu
             }
         })
         .build(app)?;
-    let poll_app = app.clone();
-    let poll_shared = shared.clone();
+    let local_app = app.clone();
+    let local_shared = shared.clone();
     std::thread::spawn(move || loop {
         let local = local::local_machine();
         let storage = storage_summary(&local);
+        if let Ok(mut snapshot) = local_shared.lock() {
+            snapshot.storage = storage;
+            snapshot.local_state = Some((local.state, local.observed_at_unix_ms));
+        }
+        let interval = local_app
+            .state::<Store>()
+            .get()
+            .map_or(10, |value| value.refresh_interval);
+        std::thread::sleep(Duration::from_secs(interval));
+    });
+    let poll_app = app.clone();
+    let poll_shared = shared.clone();
+    std::thread::spawn(move || loop {
         let observations = poll_app.state::<MachineState>().0.clone();
         let result = machines::poll(&observations);
         if let Ok(mut snapshot) = poll_shared.lock() {
-            snapshot.storage = storage;
-            snapshot.local_state = Some((local.state, local.observed_at_unix_ms));
             snapshot.record_poll(result);
         }
         let interval = poll_app
@@ -338,7 +396,10 @@ pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Resu
     });
     let app = app.clone();
     std::thread::spawn(move || loop {
-        if let Ok(snapshot) = shared.lock() {
+        if let Ok(mut snapshot) = shared.lock() {
+            if let Ok(doctor) = app.state::<local::DoctorState>().0.lock() {
+                snapshot.doctor = *doctor;
+            }
             let names: Vec<_> = snapshot
                 .machines
                 .iter()
@@ -351,7 +412,7 @@ pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Resu
                     }
                 }
             }
-            update(&rows, &snapshot, now_ms());
+            update(&mut rows, &snapshot, now_ms());
         }
         std::thread::sleep(Duration::from_secs(1));
     });
@@ -431,19 +492,20 @@ mod tests {
             uptime_seconds: Some(5),
             volumes: vec![],
             doctor_findings: Some(0),
+            doctor_observed_at_unix_ms: Some(1_000),
             storage_error: None,
         };
         assert_eq!(
             local_state_line(Some((local.state, local.observed_at_unix_ms)), 3_000),
             "Awake · 2 s ago"
         );
-        assert!(storage_summary(&local).contains("doctor OK"));
+        assert_eq!(storage_summary(&local), "No volumes registered");
         local.state = "unknown";
         local.doctor_findings = Some(2);
         assert_eq!(
             local_state_line(Some((local.state, 3_000)), 3_000),
             "Unknown · 0 s ago"
         );
-        assert!(storage_summary(&local).contains("2 findings"));
+        assert_eq!(storage_summary(&local), "No volumes registered");
     }
 }

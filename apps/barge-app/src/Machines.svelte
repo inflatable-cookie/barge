@@ -107,7 +107,7 @@
         {:else if local}
           {#each local.volumes as volume}<DetailItem label={volume.name} value={volume.presence === "present" ? `${((volume.free_bytes ?? 0) / 1024 ** 3).toFixed(1)} GiB free` : volume.presence} />{/each}
           {#if local.volumes.length === 0}<p>No volumes registered</p>{/if}
-          <DetailItem label="Doctor" value={local.doctor_findings === 0 ? "OK" : `${local.doctor_findings} findings`} />
+          <DetailItem label="Doctor" value={local.doctor_findings === null ? "Not checked" : local.doctor_findings === 0 ? "OK" : `${local.doctor_findings} findings`} />
         {/if}
       </DetailSection>
     {:else if current}

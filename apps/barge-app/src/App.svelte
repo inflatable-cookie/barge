@@ -81,6 +81,8 @@
     return `${((volume.free_bytes ?? 0) / 1024 ** 3).toFixed(1)} GiB free`;
   }
 
+  $effect(() => { if (view === "storage") void readStorage(); });
+
   onMount(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const changed = () => applyTheme();
@@ -90,7 +92,6 @@
     void api.preferences()
       .then(value => { preferences = value; saved = value; applyTheme(); })
       .catch(reason => { settingsError = `Could not load settings: ${describe(reason)}`; });
-    void readStorage();
     return () => {
       media.removeEventListener("change", changed);
       unlisten?.();
