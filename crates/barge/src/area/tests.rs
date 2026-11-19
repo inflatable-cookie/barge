@@ -4,9 +4,15 @@
 use super::*;
 use crate::{Barge, ManualClock, VolumeRegistration};
 use std::cell::RefCell;
+use std::os::unix::fs::MetadataExt;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The bytes a file is charged for, as a measured tree counts them.
+fn allocated(path: &std::path::Path) -> u64 {
+    fs::symlink_metadata(path).unwrap().blocks() * 512
+}
 
 fn fixture() -> (crate::testing::TempDir, Barge) {
     fixture_with_space(0, 1)
@@ -63,10 +69,8 @@ fn metadata_listing_matches_full_listing_except_for_bytes() {
     let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
     let root = area.create_root("slot").unwrap();
     fs::write(root.path.join("data"), b"payload").unwrap();
-    let expected_bytes = fs::symlink_metadata(root.path.join(root::MARKER_NAME))
-        .unwrap()
-        .len()
-        + 7;
+    let expected_bytes =
+        allocated(&root.path.join(root::MARKER_NAME)) + allocated(&root.path.join("data"));
     let metadata = area.list_without_bytes().unwrap();
     let full = area.list().unwrap();
     assert_eq!(metadata.stragglers, full.stragglers);
@@ -104,17 +108,39 @@ fn reserve_prune_walks_only_the_root_it_evicts() {
 }
 
 #[test]
+fn a_release_skips_the_size_record_when_the_area_lock_is_busy() {
+    let (_temp, barge) = fixture();
+    let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+    let root = area.create_root("slot").unwrap();
+    fs::write(root.path.join("data"), b"payload").unwrap();
+    let directory = root.path.parent().unwrap().to_path_buf();
+    let held = area.hold(&root.id, Mode::Exclusive).unwrap();
+    let busy = AreaLock::acquire(&directory).unwrap();
+    let started = std::time::Instant::now();
+    drop(held);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a release never waits on the area lock"
+    );
+    drop(busy);
+    let activity = directory.join(BARGE_DIR).join(ACTIVITY_DIR);
+    assert_eq!(
+        hold::read_activity_bytes(&activity, &root.id),
+        None,
+        "a skipped record leaves no size behind"
+    );
+}
+
+#[test]
 fn hold_release_records_root_size_and_soft_cap_reuses_it() {
     let (_temp, barge) = fixture_with_space(10, 1);
     let area = barge
-        .area(AreaSpec::new("test", "roots", "disk").soft_cap_bytes(Some(10_000)))
+        .area(AreaSpec::new("test", "roots", "disk").soft_cap_bytes(Some(20_000)))
         .unwrap();
     let recorded = area.create_root("recorded").unwrap();
     fs::write(recorded.path.join("data"), b"known").unwrap();
-    let recorded_bytes = fs::symlink_metadata(recorded.path.join(root::MARKER_NAME))
-        .unwrap()
-        .len()
-        + 5;
+    let recorded_bytes =
+        allocated(&recorded.path.join(root::MARKER_NAME)) + allocated(&recorded.path.join("data"));
     drop(area.hold(&recorded.id, Mode::Exclusive).unwrap());
     let activity = recorded
         .path
@@ -129,10 +155,8 @@ fn hold_release_records_root_size_and_soft_cap_reuses_it() {
 
     let unknown = area.create_root("unknown").unwrap();
     fs::write(unknown.path.join("data"), b"unknown").unwrap();
-    let unknown_bytes = fs::symlink_metadata(unknown.path.join(root::MARKER_NAME))
-        .unwrap()
-        .len()
-        + 7;
+    let unknown_bytes =
+        allocated(&unknown.path.join(root::MARKER_NAME)) + allocated(&unknown.path.join("data"));
     crate::root::reset_tree_bytes_calls();
     barge.prune("disk", true).unwrap();
     assert_eq!(crate::root::tree_bytes_calls(), 1);
@@ -596,7 +620,9 @@ fn an_incomplete_release_forgets_an_earlier_cached_size() {
 
 #[test]
 fn prune_lists_each_area_once_instead_of_reading_it_per_eviction() {
-    let (_temp, barge) = fixture_with_space(0, 1);
+    // A reserve no measured root reaches keeps every root a candidate, so all
+    // three evictions still come from one listing.
+    let (_temp, barge) = fixture_with_space(0, 1_000_000);
     let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
     for _ in 0..3 {
         let root = area.create_root("slot").unwrap();
