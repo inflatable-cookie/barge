@@ -83,6 +83,13 @@ impl Tree {
         &self.path
     }
 
+    /// Record the name a rename gave this folder, so the removal below removes
+    /// it only while that name still means the folder this walk was opened on.
+    pub(crate) fn rebased(mut self, path: PathBuf) -> Self {
+        self.path = path;
+        self
+    }
+
     /// Remove this folder and its tree.
     pub(crate) fn remove(self) -> Result<Removed> {
         remove_opened(self, &same_device)
