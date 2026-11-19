@@ -1,6 +1,6 @@
 # Barge app
 
-Status: Machines and Storage read views built; Machines reworked on Tom's 2026-11-19 feedback. Moves, Activity and notifications remain planned.
+Status: Machines and Storage read views built; Machines reworked and polished on Tom's 2026-11-19 feedback. Moves, Activity and notifications remain planned.
 
 The Barge app is a macOS menu-bar app for the two things an operator checks
 most often: the machines Barge controls, and the storage it manages. It sits
@@ -34,6 +34,17 @@ Tom ran the app after the machines menu (PR #96) and asked for:
 - a visible waiting state after a power action, not a return to "unavailable"
   until the next poll.
 
+After reviewing those cards (PR #103) the same day, Tom asked for:
+
+- a profile-card layout: Wake and Sleep as a large icon button in the avatar
+  position, everything else to its right, and Restart, Shut down and Moonlight
+  as small icon buttons;
+- details in a modal or a page, not a revealer, which also broke the grid;
+- a roomier grid, so a card isn't squashed;
+- no native title bar: floating traffic lights over a top strip that drags the
+  window;
+- a fix for "Last observation: in 5s".
+
 ## Form
 
 - **Menu-bar icon:** a monochrome template image opens a native menu with the
@@ -49,6 +60,15 @@ Tom ran the app after the machines menu (PR #96) and asked for:
 - **Window on demand:** also opened from the menu. The app shows a Dock icon
   only while the window is open (`ActivationPolicy::Accessory` otherwise).
 - **Launch at login** is a setting, off by default.
+
+### Window
+
+On macOS the window has no title bar (`titleBarStyle: Overlay`, title
+hidden). The native traffic lights float in a 40 px strip along the top, inset
+from the corner over the sidebar, and keep their hover glyphs, full screen and
+accessibility. The whole strip is the drag region (`data-tauri-drag-region`),
+above the sidebar and the content alike; nothing interactive sits in it, and no
+content sits under the lights. Other platforms keep their decorations.
 
 ### Native menu
 
@@ -79,19 +99,34 @@ Quit
 
 ### Machines
 
-- **Cards:** one card per registered machine, with its state from
-  [machines](machines.md#states): Offline, Waking…, Awake, Sleeping in 12 s,
-  Going to sleep…, Shutting down…, Restarting…, Didn't wake, Still on, or
-  Unknown. A spinner shows while it waits.
-  - The card offers only the actions its state offers, the most likely one
-    prominent (Wake when offline, Sleep when awake, Cancel while pending).
-    Restart and Shut down name the machine and ask first.
-  - A muted line gives the mode and address (`LAN · bazzite.local`). A stale
-    observation also says when Barge last saw the machine.
-  - Details (MAC, port, last observation), Pair and Remove sit behind a Details
-    disclosure, not beside the power actions.
-  - Moonlight launch, which the MoonDeck Remote user relies on, is an action
-    the awake card offers.
+- **Cards:** one profile-style card per registered machine, with its state
+  from [machines](machines.md#states): Offline, Waking…, Awake, Sleeping in
+  12 s, Going to sleep…, Shutting down…, Restarting…, Didn't wake, Still on, or
+  Unknown.
+  - **Power button,** in the avatar position: a large round icon button whose
+    ring carries the state colour. Wake (power icon) when offline or after a
+    failed wake, Sleep (moon) when awake or still on, Cancel (✕) while a
+    countdown runs, with the seconds beneath it. While a machine waits
+    (Waking, Going to sleep, Shutting down, Restarting) the button shows that
+    action, an arc runs round the ring, and it can't be pressed.
+  - **Beside it:** the name, the state label, and a muted line with the mode
+    and address (`LAN · bazzite.local`). A stale observation also says when
+    Barge last saw the machine. Beneath, small icon buttons for the other
+    actions the state offers (Restart…, Shut down…, Open Moonlight) and a
+    Details button. Every icon button has an accessible label and a tooltip.
+  - Only the actions the state offers appear. Restart and Shut down name the
+    machine and ask first. Moonlight launch, which the MoonDeck Remote user
+    relies on, is an action the awake card offers.
+- **Grid:** cards are at least 380 px wide, with generous gaps; the grid wraps
+  by width, and one machine fills the row rather than sitting cramped.
+- **Details dialog:** opened from the card's Details button: connection mode,
+  address, port, MAC, last observation and the last error, with Pair… and
+  Remove… (Remove asks first). A dialog rather than a page keeps the window to
+  one level of navigation.
+- **Ages** come from the window's own one-second clock and are never in the
+  future: an observation stamped slightly ahead reads "now". (Poodle's
+  `TimeAgo` keeps a private clock that ticks every 30 s, so a fresh poll read
+  "in 5s".)
 - **Empty:** a short line and the Add machine button.
 - **Waiting:** after an action, a machine is polled every 2 s until the target
   state is observed or its timeout passes, then at the refresh interval (see
@@ -215,8 +250,9 @@ Tauri Rust host (apps/barge-app/src-tauri)
 - **Poodle components,** a first mapping:
   - `SidebarNav` for the window's navigation (Machines, Storage, Activity,
     Settings);
-  - `Card` for a machine, with `Spinner` while it waits;
-  - `StatusIndicator` and `TimeAgo` for observed state;
+  - `Card` for a machine, `IconButton` for its power button and actions, and
+    `Dialog` with `DetailItem` for its details;
+  - `StatusIndicator` for observed state, and `TimeAgo` outside Machines;
   - `ConfirmAction` and `AlertDialog` for confirmations;
   - `Progress` for countdowns and move progress;
   - `MetricTile` and `Meter` for space;
@@ -264,7 +300,8 @@ opens on launch, so the app is usable even when macOS hides its menu-bar item.
   the actions it offers, plus storage's absent volume, mismatch, drift, and
   empty. `apps/barge-app/fixtures.html?view=<view>&scenario=<scenario>&theme=<light|dark>`
   mounts the real renderer against a fake api, so a view's states can be
-  screenshotted without a build.
+  screenshotted without a build. `&details` opens a machine's details;
+  `&chrome=native` drops the macOS top strip.
 - Rust: command tests against the fake OS identity and a loopback `barged`
   stub, as the crates already do.
 - End-to-end through Longhorn's agent-control surface, when it's added.

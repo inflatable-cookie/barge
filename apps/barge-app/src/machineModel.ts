@@ -61,3 +61,58 @@ export function primaryOffer(status: MachineStatus): Offer | null {
 export function needsConfirmation(offer: Offer): boolean {
   return offer === "restart" || offer === "shutdown";
 }
+
+/**
+ * How long ago an observation was, on the app's own clock. A last observation
+ * is never in the future: if the clocks disagree slightly, it reads "now".
+ * (Poodle's `TimeAgo` keeps a private clock that ticks every 30 s, so a fresh
+ * poll read as "in 5s"; this follows the window's one-second clock instead.)
+ */
+export function observedAge(at: number, now: number): string {
+  const seconds = Math.floor(Math.max(0, now - at) / 1000);
+  if (seconds < 5) return "now";
+  if (seconds < 60) return `${seconds} s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
+/** The power button shows an action's icon, even while it waits on one. */
+export type PowerIcon = Exclude<Offer, "moonlight">;
+
+/** The card's large round button, in the avatar position. */
+export interface PowerButton {
+  /** What a press sends, or null while there is nothing to press. */
+  offer: Offer | null;
+  icon: PowerIcon;
+  label: string;
+  tooltip: string;
+}
+
+/**
+ * Wake when offline, Sleep when awake, Cancel while a countdown runs.
+ * Otherwise the machine is waiting (or unknown): the button shows what is
+ * happening and can't be pressed.
+ */
+export function powerButton(status: MachineStatus, now: number): PowerButton {
+  const offer = primaryOffer(status);
+  if (offer === "cancel") {
+    const action = status.action === "restart" ? "restart" : status.action === "shutdown" ? "shutdown" : "sleep";
+    return { offer, icon: "cancel", label: "Cancel", tooltip: `Cancel the ${action === "shutdown" ? "shut down" : action}` };
+  }
+  if (offer === "wake") return { offer, icon: "wake", label: "Wake", tooltip: "Wake" };
+  if (offer === "sleep") return { offer, icon: "sleep", label: "Sleep", tooltip: "Sleep" };
+  const label = stateLabel(status, now);
+  const icon: PowerIcon = status.phase === "restarting" ? "restart"
+    : status.phase === "going_down" ? (status.action === "shutdown" ? "shutdown" : "sleep")
+    : "wake";
+  return { offer: null, icon, label, tooltip: label };
+}
+
+/** The smaller actions beside the power button: everything else the state offers. */
+export function secondaryOffers(status: MachineStatus): Offer[] {
+  const primary = primaryOffer(status);
+  return status.offers.filter(offer => offer !== primary);
+}

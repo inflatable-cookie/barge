@@ -1,57 +1,66 @@
 <script lang="ts">
-  import { Button, Card, DetailItem, Spinner, StatusIndicator, TimeAgo } from "@inflatable-cookie/poodle-svelte";
-  import { offerLabel, primaryOffer, stateLabel, tone } from "./machineModel";
+  import { Card, IconButton, StatusIndicator } from "@inflatable-cookie/poodle-svelte";
+  import ObservedAge from "./ObservedAge.svelte";
+  import { offerIcons } from "./icons";
+  import { countdownSeconds, offerLabel, powerButton, secondaryOffers, stateLabel, tone } from "./machineModel";
   import type { MachineView, Offer } from "./types";
 
-  let { machine, now, busy, onOffer, onPair, onRemove }: {
+  let { machine, now, busy, onOffer, onDetails }: {
     machine: MachineView;
     now: number;
     busy: boolean;
     onOffer: (offer: Offer) => void;
-    onPair: () => void;
-    onRemove: () => void;
+    onDetails: () => void;
   } = $props();
 
   let status = $derived(machine.status);
-  let primary = $derived(primaryOffer(status));
+  let power = $derived(powerButton(status, now));
+  let secondary = $derived(secondaryOffers(status));
+  let countdown = $derived(
+    status.phase === "pending" && status.deadline_unix_ms !== null ? countdownSeconds(status.deadline_unix_ms, now) : null,
+  );
   let unreachablePending = $derived(status.phase === "pending" && !machine.reachable);
 </script>
 
 <Card variant="outlined" ariaLabel={`${machine.name} machine`}>
-  <div class="card-head">
-    <h2>{machine.name}</h2>
-    <span class="state">
+  <div class="machine">
+    <div class="power" data-tone={tone(status)} data-waiting={status.waiting}>
+      <IconButton
+        variant="secondary"
+        icon={offerIcons[power.icon]}
+        ariaLabel={power.label}
+        tooltip={power.tooltip}
+        tooltipPlacement="bottom"
+        disabled={busy || power.offer === null}
+        onClick={() => { if (power.offer) onOffer(power.offer); }}
+      />
+      {#if countdown !== null}<span class="countdown" aria-hidden="true">{countdown} s</span>{/if}
+    </div>
+    <div class="body">
+      <h2>{machine.name}</h2>
       <StatusIndicator status={tone(status)} label={stateLabel(status, now)} />
-      {#if status.waiting}<Spinner size="sm" ariaLabel="Waiting for {machine.name}" />{/if}
-    </span>
+      <p class="muted">{machine.mode === "lan" ? "LAN" : "Tailscale"} · {machine.address}</p>
+      {#if status.last_seen_unix_ms !== null}
+        <p class="muted">Last seen <ObservedAge at={status.last_seen_unix_ms} {now} /></p>
+      {/if}
+      {#if unreachablePending}
+        <p class="note">Can't reach the machine. A cancel can't be confirmed until it answers again.</p>
+      {/if}
+      <div class="tools">
+        {#each secondary as offer (offer)}
+          <IconButton
+            variant="ghost"
+            size="sm"
+            icon={offerIcons[offer]}
+            ariaLabel={offerLabel(offer)}
+            disabled={busy}
+            onClick={() => onOffer(offer)}
+          />
+        {/each}
+        <span class="details">
+          <IconButton variant="ghost" size="sm" icon="info" ariaLabel="Details" tooltip={`${machine.name} details`} onClick={onDetails} />
+        </span>
+      </div>
+    </div>
   </div>
-  <p class="muted">{machine.mode === "lan" ? "LAN" : "Tailscale"} · {machine.address}</p>
-  {#if unreachablePending}
-    <p class="note">Can't reach the machine. A cancel can't be confirmed until it answers again.</p>
-  {/if}
-  {#if status.last_seen_unix_ms !== null}
-    <p class="muted">Last seen <TimeAgo datetime={status.last_seen_unix_ms} live /></p>
-  {/if}
-  {#if status.offers.length > 0}
-    <div class="actions">
-      {#each status.offers as offer (offer)}
-        <Button
-          variant={offer === primary ? "primary" : offer === "moonlight" ? "ghost" : "secondary"}
-          disabled={busy}
-          onClick={() => onOffer(offer)}
-        >{offerLabel(offer)}</Button>
-      {/each}
-    </div>
-  {/if}
-  <details class="more">
-    <summary>Details</summary>
-    <DetailItem label="MAC" value={machine.mac} />
-    <DetailItem label="Port" value={String(machine.daemon_port)} />
-    <DetailItem label="Last observation">{#if machine.seen_at_unix_ms !== null}<TimeAgo datetime={machine.seen_at_unix_ms} live />{:else}Never{/if}</DetailItem>
-    {#if machine.error}<p class="muted">Last error: {machine.error}</p>{/if}
-    <div class="actions">
-      <Button variant="ghost" disabled={busy} onClick={onPair}>Pair</Button>
-      <Button variant="ghost" tone="danger" disabled={busy} onClick={onRemove}>Remove…</Button>
-    </div>
-  </details>
 </Card>

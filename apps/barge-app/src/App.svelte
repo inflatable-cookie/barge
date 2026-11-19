@@ -102,6 +102,7 @@
   });
 </script>
 
+<div class="titlebar" data-tauri-drag-region></div>
 <div class="shell">
   <aside>
     <div class="brand">Barge</div>

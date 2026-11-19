@@ -2,6 +2,13 @@
 
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
+/// Where the macOS traffic lights sit: `x` is the inset from the left edge,
+/// `y` the height of the title-bar area above the buttons' own height (wry's
+/// `inset_traffic_lights`). It roughly centres the lights in the renderer's
+/// 40 px top strip (`--chrome-strip` in `style.css`).
+#[cfg(target_os = "macos")]
+const TRAFFIC_LIGHTS: tauri::LogicalPosition<f64> = tauri::LogicalPosition::new(18.0, 20.0);
+
 /// Shows the main window, building it the first time.
 ///
 /// This is also the launch and reopen path: the window must never depend on the
@@ -29,12 +36,19 @@ pub fn show(app: &tauri::AppHandle, view: Option<&'static str>) -> Result<(), St
             Some(view) => format!("index.html#{view}"),
             None => "index.html".into(),
         };
-        WebviewWindowBuilder::new(app, "main", WebviewUrl::App(url.into()))
+        let builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::App(url.into()))
             .title("Barge")
-            .inner_size(800.0, 560.0)
-            .min_inner_size(580.0, 400.0)
-            .build()
-            .map_err(|error| error.to_string())?;
+            .inner_size(860.0, 580.0)
+            .min_inner_size(600.0, 420.0);
+        // macOS: no title bar, the native traffic lights floating over the
+        // renderer's top strip, which is the drag region (app.md, "Window").
+        #[cfg(target_os = "macos")]
+        let builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .traffic_light_position(TRAFFIC_LIGHTS)
+            .initialization_script("window.__BARGE_CHROME__ = 'overlay';");
+        builder.build().map_err(|error| error.to_string())?;
     }
     Ok(())
 }

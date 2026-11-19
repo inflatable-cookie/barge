@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App.svelte";
+import { observedAge } from "./machineModel";
 import type { AppApi, MachineStatus, MachineView, Preferences, VolumeSummary } from "./types";
 
 const preferences: Preferences = { launch_at_login: false, refresh_interval: 10, theme: "system", show_window_at_launch: true };
@@ -239,15 +240,93 @@ describe("Machines", () => {
     expect(within(region).getByText(/Last seen/)).toBeInTheDocument();
   });
 
-  it("keeps Pair and Remove out of the actions, behind the details disclosure", async () => {
+  it.each([
+    ["offline", machine({ reachable: false, status: status({ phase: "offline", offers: ["wake"] }) }), "Wake", "wake"],
+    ["awake", awake(), "Sleep", "sleep"],
+    ["pending", pendingSleep(), "Cancel", "cancel"],
+    ["didn't wake", machine({ reachable: false, status: status({ phase: "did_not_wake", offers: ["wake"] }) }), "Wake", "wake"],
+    ["still on", machine({ status: status({ phase: "still_on", offers: ["sleep", "restart", "shutdown", "moonlight"] }) }), "Sleep", "sleep"],
+  ])("the power button in %s is %s and sends it", async (_, value, label, offer) => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([value]);
+    render(App, { props: { api } });
+    const region = await card();
+    // The large button comes first in the card, in the avatar position.
+    const power = within(region).getAllByRole("button")[0];
+    expect(power).toHaveAccessibleName(label);
+    expect(power).toBeEnabled();
+    await fireEvent.click(power);
+    await waitFor(() => expect(api.machineAction).toHaveBeenCalledWith("bazzite", offer));
+  });
+
+  it.each([
+    ["waking", machine({ reachable: false, status: status({ phase: "waking", waiting: true }) }), "Waking…"],
+    ["going to sleep", machine({ status: status({ phase: "going_down", action: "sleep", waiting: true }) }), "Going to sleep…"],
+    ["shutting down", machine({ status: status({ phase: "going_down", action: "shutdown", waiting: true }) }), "Shutting down…"],
+    ["restarting", machine({ status: status({ phase: "restarting", action: "restart", waiting: true }) }), "Restarting…"],
+  ])("the power button while %s shows the wait and is disabled", async (_, value, label) => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([value]);
+    render(App, { props: { api } });
+    const region = await card();
+    const power = within(region).getAllByRole("button")[0];
+    expect(power).toHaveAccessibleName(label);
+    expect(power).toBeDisabled();
+    expect(region.querySelector('.power[data-waiting="true"]')).not.toBeNull();
+  });
+
+  it("shows the countdown under the Cancel power button while pending", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([pendingSleep()]);
+    render(App, { props: { api } });
+    const region = await card();
+    expect(region.querySelector(".power .countdown")?.textContent).toMatch(/^\d+ s$/);
+  });
+
+  it("opens the details dialog with the connection, Pair and Remove, and closes it", async () => {
     const api = fixture();
     vi.mocked(api.machines).mockResolvedValue([awake()]);
     render(App, { props: { api } });
     const region = await card();
-    const details = region.querySelector("details");
-    expect(details).not.toBeNull();
-    expect(within(region).queryByRole("button", { name: "Pair" })).not.toBeNull();
-    expect(details?.textContent).toContain("Remove…");
+    expect(region.querySelector("details")).toBeNull();
+    expect(within(region).queryByRole("button", { name: /Pair|Remove/ })).toBeNull();
+    await fireEvent.click(within(region).getByRole("button", { name: "Details" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("00:11:22:33:44:55")).toBeInTheDocument();
+    expect(within(dialog).getByText("9777")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Pair…" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Remove…" })).toBeInTheDocument();
+    await fireEvent.keyDown(document.activeElement ?? dialog, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("asks before removing from the details dialog", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([awake()]);
+    render(App, { props: { api } });
+    await fireEvent.click(within(await card()).getByRole("button", { name: "Details" }));
+    await fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Remove…" }));
+    expect(await screen.findByText("Remove bazzite?")).toBeInTheDocument();
+    expect(api.removeMachine).not.toHaveBeenCalled();
+  });
+
+  it("never shows the last observation in the future, even as polls outrun a slow clock", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    // Each poll stamps its own receipt time, a little ahead of the window's clock.
+    vi.mocked(api.machines).mockImplementation(async () => [
+      machine({ seen_at_unix_ms: Date.now() + 3_000, status: status({ phase: "waking", waiting: true }) }),
+    ]);
+    render(App, { props: { api } });
+    await fireEvent.click(within(await card()).getByRole("button", { name: "Details" }));
+    const dialog = await screen.findByRole("dialog");
+    const age = () => within(dialog).getByText((_, node) => node?.tagName === "TIME").textContent;
+    expect(age()).toBe("now");
+    // The waiting machine polls every 2 s; Poodle's TimeAgo, ticking every 30 s, read "in 10s" here.
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(vi.mocked(api.machines).mock.calls.length).toBeGreaterThan(3));
+    expect(age()).toBe("now");
+    expect(dialog.textContent).not.toMatch(/\bin \d/);
   });
 
   it("polls fast while a machine is waiting, then returns to the refresh interval", async () => {
@@ -291,5 +370,21 @@ describe("Machines", () => {
     await vi.waitFor(() => expect(screen.getByText(/cancel timeout/)).toBeInTheDocument());
     await vi.advanceTimersByTimeAsync(10_000);
     expect(screen.getByText(/cancel timeout/)).toBeInTheDocument();
+  });
+});
+
+describe("observedAge", () => {
+  const now = 1_800_000_000_000;
+  it.each([
+    [now + 5_000, "now"],
+    [now + 3_600_000, "now"],
+    [now, "now"],
+    [now - 4_999, "now"],
+    [now - 12_000, "12 s ago"],
+    [now - 720_000, "12 min ago"],
+    [now - 3 * 3_600_000, "3 h ago"],
+    [now - 2 * 86_400_000, "2 d ago"],
+  ])("reads %d as %s", (at, text) => {
+    expect(observedAge(at, now)).toBe(text);
   });
 });
