@@ -17,6 +17,7 @@
     theme: "system",
     show_window_at_launch: true,
   };
+  const views = ["machines", "storage", "activity", "settings"];
   const groups = [
     {
       id: "main",
@@ -29,6 +30,8 @@
 
   // Only the initial view matters: navigation takes over afterwards.
   let view = $state(untrack(() => initialView));
+  // Bumped on each request from the menu, so Storage re-reads when it is opened.
+  let visit = $state(0);
   // The value the store holds. A failed save falls back to this.
   let saved = $state<Preferences>({ ...savedDefaults });
   let preferences = $state<Preferences>({ ...savedDefaults });
@@ -73,8 +76,11 @@
     media.addEventListener("change", changed);
     let unlisten: (() => void) | undefined;
     if ("__TAURI_INTERNALS__" in window) {
-      void listen("show-settings", () => {
-        view = "settings";
+      void listen<string>("show-view", (event) => {
+        if (views.includes(event.payload)) {
+          view = event.payload;
+          visit += 1;
+        }
       }).then((dispose) => {
         unlisten = dispose;
       });
@@ -105,7 +111,7 @@
     {#if view === "machines"}
       <Machines {api} refreshInterval={preferences.refresh_interval} />
     {:else if view === "storage"}
-      <Storage {api} />
+      {#key visit}<Storage {api} />{/key}
     {:else if view === "activity"}
       <Activity />
     {:else}

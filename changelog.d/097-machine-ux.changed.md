@@ -1,0 +1,1 @@
+The Barge app's Machines view is now a card per machine that offers only the actions its state allows, with waiting states after power actions; the menu lists only clickable items and drops "This Mac" and the Refresh item.

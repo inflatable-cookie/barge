@@ -1,7 +1,7 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App.svelte";
-import type { AppApi, Preferences, VolumeSummary } from "./types";
+import type { AppApi, MachineStatus, MachineView, Preferences, VolumeSummary } from "./types";
 
 const preferences: Preferences = { launch_at_login: false, refresh_interval: 10, theme: "system", show_window_at_launch: true };
 
@@ -22,7 +22,6 @@ function fixture(volumes: VolumeSummary[] = []): AppApi {
     openWindow: vi.fn().mockResolvedValue(undefined),
     quit: vi.fn().mockResolvedValue(undefined),
     machines: vi.fn().mockResolvedValue([]),
-    localMachine: vi.fn().mockResolvedValue({ name: "Mac", state: "awake", observed_at_unix_ms: Date.now(), model: "Mac15,7", uptime_seconds: 100, volumes: [], doctor_findings: 0, storage_error: null }),
     addMachine: vi.fn(), pairMachine: vi.fn(), removeMachine: vi.fn(), machineAction: vi.fn(), moonlight: vi.fn(),
   };
 }
@@ -35,7 +34,7 @@ describe("window navigation", () => {
   it("runs the storage read when opening Storage, not when opening Machines", async () => {
     const api = fixture();
     render(App, { props: { api } });
-    await screen.findByRole("button", { name: /This Mac/ });
+    await screen.findByRole("heading", { name: "Machines" });
     expect(api.volumes).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole("button", { name: "Storage" }));
     await waitFor(() => expect(api.volumes).toHaveBeenCalledOnce());
@@ -43,7 +42,7 @@ describe("window navigation", () => {
   it("shows the machines, storage, activity and settings views", async () => {
     const api = fixture();
     render(App, { props: { api } });
-    expect(await screen.findByRole("button", { name: /This Mac/ })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Machines" })).toBeInTheDocument();
     await fireEvent.click(screen.getByRole("button", { name: "Storage" }));
     expect(await screen.findByText("No volumes registered")).toBeInTheDocument();
     await fireEvent.click(screen.getByRole("button", { name: "Activity" }));
@@ -146,84 +145,8 @@ describe("settings", () => {
   });
 });
 
-describe("Machines", () => {
-  function remote(reachable = true, pending = false) {
-    return { name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan" as const, address: "bazzite.local", reachable, error: reachable ? null : "Connection timed out", observation: { power: "awake" as const, observed_at_unix_ms: Date.now() - 12000, pending: pending ? { action: "sleep" as const, deadline_unix_ms: Date.now() + 12000 } : null } };
-  }
-  it("always lists this Mac with no registered machines", async () => {
-    render(App, { props: { api: fixture() } });
-    expect(await screen.findByRole("button", { name: /This Mac/ })).toBeInTheDocument();
-    expect(await screen.findByText("Mac15,7")).toBeInTheDocument();
-  });
-  it("shows a reachable machine and its controls", async () => {
-    const api = fixture(); vi.mocked(api.machines).mockResolvedValue([remote()]);
-    render(App, { props: { api } });
-    await fireEvent.click(await screen.findByRole("button", { name: /bazzite.*Awake/ }));
-    expect(screen.getByRole("button", { name: "Sleep" })).toBeEnabled();
-    expect(screen.getByText("bazzite.local")).toBeInTheDocument();
-  });
-  it("keeps an unreachable machine's previous observation visible", async () => {
-    const api = fixture(); vi.mocked(api.machines).mockResolvedValue([remote(false)]);
-    render(App, { props: { api } });
-    await fireEvent.click(await screen.findByRole("button", { name: /bazzite.*Unreachable/ }));
-    expect(screen.getByText("Connection timed out")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Sleep" })).toBeDisabled();
-    expect(screen.getByText("Last observation")).toBeInTheDocument();
-  });
-  it("shows pending state and preserves a failed cancel", async () => {
-    const api = fixture(); vi.mocked(api.machines).mockResolvedValue([remote(true, true)]);
-    vi.mocked(api.machineAction).mockRejectedValue(new Error("timeout"));
-    render(App, { props: { api } });
-    await fireEvent.click(await screen.findByRole("button", { name: /bazzite.*Action pending/ }));
-    expect(screen.getByText(/Sleeping in/)).toBeInTheDocument();
-    await fireEvent.click(screen.getByRole("button", { name: "Cancel action" }));
-    expect(await screen.findByText(/Cancel could not be confirmed/)).toBeInTheDocument();
-    expect(screen.getByText(/Sleeping in/)).toBeInTheDocument();
-  });
-  it("clears a recovered refresh error without clearing a cancel failure", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    const api = fixture();
-    vi.mocked(api.machines).mockRejectedValueOnce(new Error("registry unreadable")).mockResolvedValue([remote(true, true)]);
-    vi.mocked(api.machineAction).mockRejectedValue(new Error("cancel timeout"));
-    render(App, { props: { api } });
-    await vi.waitFor(() => expect(screen.getByText(/registry unreadable/)).toBeInTheDocument());
-    await vi.advanceTimersByTimeAsync(10_000);
-    await vi.waitFor(() => expect(screen.queryByText(/registry unreadable/)).not.toBeInTheDocument());
-    await fireEvent.click(screen.getByRole("button", { name: /bazzite.*Action pending/ }));
-    await fireEvent.click(screen.getByRole("button", { name: "Cancel action" }));
-    await vi.waitFor(() => expect(screen.getByText(/cancel timeout/)).toBeInTheDocument());
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(screen.getByText(/cancel timeout/)).toBeInTheDocument();
-  });
-  it("shows an unknown local state when the local observation fails", async () => {
-    const api = fixture();
-    vi.mocked(api.localMachine).mockResolvedValue({ name: "Mac", state: "unknown", observed_at_unix_ms: Date.now(), model: null, uptime_seconds: null, volumes: [], doctor_findings: 0, storage_error: null });
-    render(App, { props: { api } });
-    expect(await screen.findByRole("button", { name: /This Mac.*Unknown/ })).toBeInTheDocument();
-  });
 
-  it("clears a local refresh error after a successful observation", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    const api = fixture();
-    vi.mocked(api.localMachine).mockRejectedValueOnce(new Error("local read failed")).mockResolvedValue({ name: "Mac", state: "awake", observed_at_unix_ms: Date.now(), model: null, uptime_seconds: 2, volumes: [], doctor_findings: 0, storage_error: null });
-    render(App, { props: { api } });
-    await vi.waitFor(() => expect(screen.getByText(/local read failed/)).toBeInTheDocument());
-    await vi.advanceTimersByTimeAsync(10_000);
-    await vi.waitFor(() => expect(screen.queryByText(/local read failed/)).not.toBeInTheDocument());
-  });
-
-  it("shows the last doctor result and failure in Machines, then clears it after recovery", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    const api = fixture();
-    const base = { name: "Mac", state: "awake" as const, observed_at_unix_ms: Date.now(), model: null, uptime_seconds: 2, volumes: [], doctor_findings: 0, doctor_observed_at_unix_ms: Date.now() - 12_000, storage_error: null };
-    vi.mocked(api.localMachine).mockResolvedValueOnce({ ...base, doctor_error: "layout unreadable" }).mockResolvedValue({ ...base, doctor_error: null });
-    render(App, { props: { api } });
-    await vi.waitFor(() => expect(screen.getByText("layout unreadable")).toBeInTheDocument());
-    expect(screen.getByText(/Last doctor result: OK/)).toBeInTheDocument();
-    expect(screen.getByText(/earlier result/)).toBeInTheDocument();
-    await vi.advanceTimersByTimeAsync(10_000);
-    await vi.waitFor(() => expect(screen.queryByText("layout unreadable")).not.toBeInTheDocument());
-  });
+describe("doctor in Storage", () => {
   it("keeps volumes and shows doctor failure and age in Storage, then shows recovery", async () => {
     const api = fixture([{ name: "Builds", presence: "present", free_bytes: 1024 ** 3 }]);
     vi.mocked(api.doctorStatus).mockResolvedValueOnce({ observation: { findings: 0, observed_at_unix_ms: Date.now() - 12_000 }, error: "layout unreadable" }).mockResolvedValue({ observation: { findings: 2, observed_at_unix_ms: Date.now() }, error: null });
@@ -237,5 +160,136 @@ describe("Machines", () => {
     expect(await screen.findByText(/Last doctor result: 2 findings/)).toBeInTheDocument();
     expect(screen.queryByText("layout unreadable")).not.toBeInTheDocument();
   });
+});
 
+describe("Machines", () => {
+  const now = () => Date.now();
+  function status(fields: Partial<MachineStatus> & Pick<MachineStatus, "phase">): MachineStatus {
+    return { action: null, deadline_unix_ms: null, last_seen_unix_ms: null, offers: [], waiting: false, ...fields };
+  }
+  const AWAKE = ["Sleep", "Restart…", "Shut down…", "Open Moonlight"];
+  function machine(fields: Partial<MachineView> & { status: MachineStatus }): MachineView {
+    return {
+      name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", address: "bazzite.local",
+      daemon_port: 9777, reachable: true, error: null, seen_at_unix_ms: now(), ...fields,
+    };
+  }
+  const awake = () => machine({ status: status({ phase: "awake", offers: ["sleep", "restart", "shutdown", "moonlight"] }) });
+  const pendingSleep = (reachable = true) => machine({
+    reachable,
+    error: reachable ? null : "Connection timed out",
+    status: status({ phase: "pending", action: "sleep", deadline_unix_ms: now() + 12_000, offers: ["cancel"], waiting: true }),
+  });
+
+  async function card(name = "bazzite") {
+    return screen.findByLabelText(`${name} machine`);
+  }
+
+  it("shows an empty state with the add button when nothing is registered", async () => {
+    render(App, { props: { api: fixture() } });
+    expect(await screen.findByText(/No machines yet/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add machine" })).toBeInTheDocument();
+    expect(screen.queryByText("This Mac")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["offline", machine({ reachable: false, error: "Connection timed out", status: status({ phase: "offline", offers: ["wake"], last_seen_unix_ms: now() - 720_000 }) }), "Offline", ["Wake"]],
+    ["waking", machine({ reachable: false, status: status({ phase: "waking", waiting: true, last_seen_unix_ms: now() - 720_000 }) }), "Waking…", []],
+    ["awake", awake(), "Awake", AWAKE],
+    ["pending", pendingSleep(), /Sleeping in \d+ s/, ["Cancel"]],
+    ["going down", machine({ status: status({ phase: "going_down", action: "sleep", waiting: true }) }), "Going to sleep…", []],
+    ["restarting", machine({ status: status({ phase: "restarting", action: "restart", waiting: true }) }), "Restarting…", []],
+    ["didn't wake", machine({ reachable: false, status: status({ phase: "did_not_wake", offers: ["wake"] }) }), "Didn't wake", ["Wake"]],
+    ["still on", machine({ status: status({ phase: "still_on", offers: ["sleep", "restart", "shutdown", "moonlight"] }) }), "Still on", AWAKE],
+  ])("a card in %s shows its label and only the actions that state offers", async (_, value, label, offered) => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([value]);
+    render(App, { props: { api } });
+    const region = await card();
+    expect(within(region).getByText(label)).toBeInTheDocument();
+    for (const action of ["Wake", ...AWAKE, "Cancel"]) {
+      expect(!!within(region).queryByRole("button", { name: action }), action).toBe(offered.includes(action));
+    }
+  });
+
+  it("names the machine in a restart confirmation and sends it only after confirming", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([awake()]);
+    render(App, { props: { api } });
+    const region = await card();
+    await fireEvent.click(within(region).getByRole("button", { name: "Restart…" }));
+    expect(await screen.findByText("Restart bazzite?")).toBeInTheDocument();
+    expect(api.machineAction).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole("button", { name: "Restart" }));
+    await waitFor(() => expect(api.machineAction).toHaveBeenCalledWith("bazzite", "restart"));
+  });
+
+  it("explains that a cancel cannot be confirmed while the machine is unreachable", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([pendingSleep(false)]);
+    render(App, { props: { api } });
+    expect(await screen.findByText(/A cancel can't be confirmed until it answers again/)).toBeInTheDocument();
+  });
+
+  it("shows the last seen age only for an unreachable machine", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([machine({ reachable: false, status: status({ phase: "offline", offers: ["wake"], last_seen_unix_ms: now() - 720_000 }) })]);
+    render(App, { props: { api } });
+    const region = await card();
+    expect(within(region).getByText(/Last seen/)).toBeInTheDocument();
+  });
+
+  it("keeps Pair and Remove out of the actions, behind the details disclosure", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([awake()]);
+    render(App, { props: { api } });
+    const region = await card();
+    const details = region.querySelector("details");
+    expect(details).not.toBeNull();
+    expect(within(region).queryByRole("button", { name: "Pair" })).not.toBeNull();
+    expect(details?.textContent).toContain("Remove…");
+  });
+
+  it("polls fast while a machine is waiting, then returns to the refresh interval", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    vi.mocked(api.machines)
+      .mockResolvedValueOnce([machine({ reachable: false, status: status({ phase: "waking", waiting: true }) })])
+      .mockResolvedValue([awake()]);
+    render(App, { props: { api } });
+    await vi.waitFor(() => expect(screen.getByText("Waking…")).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(2000);
+    await vi.waitFor(() => expect(screen.getByText("Awake")).toBeInTheDocument());
+    const polls = vi.mocked(api.machines).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(api.machines).toHaveBeenCalledTimes(polls);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(api.machines).toHaveBeenCalledTimes(polls + 1);
+  });
+
+  it("shows a failed cancel and keeps the countdown visible", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([pendingSleep()]);
+    vi.mocked(api.machineAction).mockRejectedValue(new Error("timeout"));
+    render(App, { props: { api } });
+    const region = await card();
+    await fireEvent.click(within(region).getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText(/Cancel could not be confirmed/)).toBeInTheDocument();
+    expect(within(region).getByText(/Sleeping in/)).toBeInTheDocument();
+  });
+
+  it("clears a recovered refresh error without clearing a cancel failure", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    vi.mocked(api.machines).mockRejectedValueOnce(new Error("registry unreadable")).mockResolvedValue([pendingSleep()]);
+    vi.mocked(api.machineAction).mockRejectedValue(new Error("cancel timeout"));
+    render(App, { props: { api } });
+    await vi.waitFor(() => expect(screen.getByText(/registry unreadable/)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(screen.queryByText(/registry unreadable/)).not.toBeInTheDocument());
+    await fireEvent.click(within(await card()).getByRole("button", { name: "Cancel" }));
+    await vi.waitFor(() => expect(screen.getByText(/cancel timeout/)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(screen.getByText(/cancel timeout/)).toBeInTheDocument();
+  });
 });

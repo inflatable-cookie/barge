@@ -1,7 +1,7 @@
 import { mount } from "svelte";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App.svelte";
-import type { AppApi, Preferences, VolumeSummary, MachineView, LocalMachine, DoctorStatus } from "./types";
+import type { AppApi, Preferences, VolumeSummary, MachineView, DoctorStatus } from "./types";
 import "@inflatable-cookie/poodle-core/tokens/styles.css";
 import "@inflatable-cookie/poodle-core/tokens/themes.css";
 import "./style.css";
@@ -14,7 +14,6 @@ const api: AppApi = {
   openWindow: () => invoke("open_main_window"),
   quit: () => invoke("quit_app"),
   machines: () => invoke<MachineView[]>("machines_list"),
-  localMachine: () => invoke<LocalMachine>("local_machine_info"),
   addMachine: (input) => invoke("machines_add", { input }),
   pairMachine: (name, key) => invoke("machines_pair", { name, key }),
   removeMachine: (name) => invoke("machines_remove", { name }),
@@ -22,4 +21,7 @@ const api: AppApi = {
   moonlight: () => invoke("open_moonlight"),
 };
 const target = document.getElementById("app");
-if (target) mount(App, { target, props: { api, initialView: location.hash === "#settings" ? "settings" : "machines" } });
+// The menu opens the window on a view by its hash (see commands/window.rs).
+const views = ["machines", "storage", "activity", "settings"];
+const hashView = location.hash.slice(1);
+if (target) mount(App, { target, props: { api, initialView: views.includes(hashView) ? hashView : "machines" } });

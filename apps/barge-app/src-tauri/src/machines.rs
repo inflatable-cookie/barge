@@ -1,9 +1,23 @@
 //! Machine observations shared by the window and the native tray menu.
+//!
+//! The store keeps what the last poll saw, when Barge received it, and the last
+//! power action Barge sent to each machine. Both surfaces read the same
+//! [`MachineView`]s, whose state comes from [`machine_state::status`].
 
-use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use barge_machine::{DaemonClient, Machine, Registry, State};
+use barge_machine::{Machine, Registry, State};
 use serde::Serialize;
+
+use crate::machine_state::{self, Input, LastAction, Status};
+
+/// Milliseconds since the Unix epoch on this Mac's clock.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |value| value.as_millis().try_into().unwrap_or(u64::MAX))
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct MachineView {
@@ -12,61 +26,214 @@ pub struct MachineView {
     pub mac: String,
     pub mode: &'static str,
     pub address: String,
+    pub daemon_port: u16,
     pub reachable: bool,
-    pub observation: Option<State>,
     pub error: Option<String>,
+    /// When Barge received the last successful observation, on this Mac's clock.
+    pub seen_at_unix_ms: Option<u64>,
+    pub status: Status,
 }
 
-/// Keep a last successful observation without treating it as current when a
-/// subsequent request fails. The daemon remains the authority for deadlines.
-#[derive(Default)]
-pub struct Observations {
-    last: HashMap<String, State>,
+/// One poll's outcome. `started_at_ms` is when the poll began, so it is compared
+/// with the actions sent before it began rather than with the time it finished.
+pub struct Poll {
+    pub machine: Machine,
+    pub lan: bool,
+    pub started_at_ms: u64,
+    pub result: Result<State, String>,
 }
 
-impl Observations {
-    pub fn update(
-        &mut self,
-        machine: &Machine,
-        lan: bool,
-        result: Result<State, String>,
-    ) -> MachineView {
-        let (reachable, error) = match result {
-            Ok(state) => {
-                self.last.insert(machine.name().to_owned(), state);
-                (true, None)
-            }
-            Err(error) => (false, Some(error)),
-        };
+#[derive(Clone)]
+struct Entry {
+    machine: Machine,
+    lan: bool,
+    reachable: bool,
+    error: Option<String>,
+    state: Option<State>,
+    seen_at: Option<u64>,
+    action: Option<LastAction>,
+}
+
+impl Entry {
+    fn unseen(machine: Machine, lan: bool) -> Self {
+        Self {
+            machine,
+            lan,
+            reachable: false,
+            error: None,
+            state: None,
+            seen_at: None,
+            action: None,
+        }
+    }
+
+    fn view(&self, now: u64) -> MachineView {
+        let machine = &self.machine;
+        let status = machine_state::status(&Input {
+            now_ms: now,
+            reachable: self.reachable,
+            observation: self.state.as_ref(),
+            seen_at_ms: self.seen_at,
+            last_action: self.action,
+        });
         MachineView {
             name: machine.name().to_owned(),
             hostname: machine.hostname().to_owned(),
             mac: machine.mac().to_owned(),
-            mode: if lan { "lan" } else { "tailscale" },
-            address: if lan {
+            mode: if self.lan { "lan" } else { "tailscale" },
+            address: if self.lan {
                 machine.hostname()
             } else {
                 machine.daemon_host()
             }
             .to_owned(),
-            reachable,
-            observation: self.last.get(machine.name()).cloned(),
-            error,
+            daemon_port: machine.daemon_port(),
+            reachable: self.reachable,
+            error: self.error.clone(),
+            seen_at_unix_ms: self.seen_at,
+            status,
+        }
+    }
+}
+
+/// What Barge knows about each registered machine, in registry order.
+#[derive(Default)]
+pub struct Observations {
+    entries: Vec<Entry>,
+}
+
+impl Observations {
+    /// Replace the machines with this poll's, keeping each one's last
+    /// observation and action. A machine that is no longer registered drops out.
+    pub fn apply(&mut self, polls: Vec<Poll>) {
+        let mut previous = std::mem::take(&mut self.entries);
+        for poll in polls {
+            let found = previous
+                .iter()
+                .position(|entry| entry.machine.name() == poll.machine.name());
+            let mut entry = match found {
+                Some(index) => previous.swap_remove(index),
+                None => Entry::unseen(poll.machine.clone(), poll.lan),
+            };
+            entry.machine = poll.machine;
+            entry.lan = poll.lan;
+            match poll.result {
+                Ok(state) => {
+                    entry.reachable = true;
+                    entry.error = None;
+                    entry.state = Some(state);
+                    entry.seen_at = Some(poll.started_at_ms);
+                }
+                Err(error) => {
+                    entry.reachable = false;
+                    entry.error = Some(error);
+                    // A failure after the countdown fired is the machine going down.
+                    if let Some(action) = entry.action.as_mut() {
+                        if poll.started_at_ms >= action.fires_at_ms {
+                            action.dropped = true;
+                        }
+                    }
+                }
+            }
+            if entry.action.is_some_and(|action| {
+                machine_state::completes(
+                    &action,
+                    poll.started_at_ms,
+                    entry.reachable,
+                    entry.state.as_ref(),
+                )
+            }) {
+                entry.action = None;
+            }
+            self.entries.push(entry);
         }
     }
 
-    pub fn retain(&mut self, machines: &[Machine]) {
-        self.last
-            .retain(|name, _| machines.iter().any(|machine| machine.name() == name));
+    /// Record an action the daemon accepted, at the time it was accepted.
+    pub fn sent(&mut self, name: &str, action: LastAction) {
+        if let Some(entry) = self.entry_mut(name) {
+            entry.action = Some(action);
+        }
+    }
+
+    /// The daemon confirmed a cancel, so the cached countdown is gone too.
+    pub fn cancelled(&mut self, name: &str) {
+        if let Some(entry) = self.entry_mut(name) {
+            entry.action = None;
+            if let Some(state) = entry.state.as_mut() {
+                state.pending = None;
+            }
+        }
+    }
+
+    pub fn snapshot(&self, now: u64) -> Vec<MachineView> {
+        self.entries.iter().map(|entry| entry.view(now)).collect()
+    }
+
+    /// Whether any machine is waiting on an action, so it should be polled fast.
+    pub fn any_waiting(&self, now: u64) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.view(now).status.waiting)
+    }
+
+    fn entry_mut(&mut self, name: &str) -> Option<&mut Entry> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.machine.name() == name)
     }
 }
 
 /// Use the CLI's LAN key and the same address selection as the CLI.
-pub fn client(registry: &Registry, machine: &Machine) -> barge_machine::Result<DaemonClient> {
+pub fn client(
+    registry: &Registry,
+    machine: &Machine,
+) -> barge_machine::Result<barge_machine::DaemonClient> {
     match registry.key(machine.name())? {
-        Some(key) => Ok(DaemonClient::for_lan(machine, key)),
-        None => Ok(DaemonClient::for_machine(machine)),
+        Some(key) => Ok(barge_machine::DaemonClient::for_lan(machine, key)),
+        None => Ok(barge_machine::DaemonClient::for_machine(machine)),
     }
+}
+
+/// Read every registered machine and record the results.
+pub fn refresh(observations: &Mutex<Observations>) -> Result<(), String> {
+    let registry = Registry::discover().map_err(|error| error.to_string())?;
+    refresh_registry(&registry, observations)
+}
+
+fn refresh_registry(registry: &Registry, observations: &Mutex<Observations>) -> Result<(), String> {
+    let machines = registry.list().map_err(|error| error.to_string())?;
+    let polls = std::thread::scope(|scope| {
+        let handles: Vec<_> = machines
+            .iter()
+            .map(|machine| {
+                scope.spawn(move || {
+                    let started_at_ms = now_ms();
+                    let key = registry.key(machine.name());
+                    let lan = matches!(&key, Ok(Some(_)));
+                    let result = key
+                        .and_then(|_| client(registry, machine))
+                        .and_then(|client| client.state())
+                        .map_err(|error| error.to_string());
+                    Poll {
+                        machine: machine.clone(),
+                        lan,
+                        started_at_ms,
+                        result,
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().map_err(|_| "Machine check failed".to_owned()))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    observations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .apply(polls);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -74,27 +241,172 @@ mod tests {
     use super::*;
     use barge_machine::{Pending, PowerActionKind, PowerState};
 
+    const T0: u64 = 1_000_000;
+
+    fn pc() -> Machine {
+        Machine::new("pc", "pc.local", "00:11:22:33:44:55").unwrap()
+    }
+
+    fn poll(started_at_ms: u64, result: Result<State, String>) -> Poll {
+        Poll {
+            machine: pc(),
+            lan: true,
+            started_at_ms,
+            result,
+        }
+    }
+
+    fn awake(observed: u64) -> State {
+        State::new(PowerState::Awake, observed)
+    }
+
+    fn sleep_action(sent_at_ms: u64) -> LastAction {
+        LastAction::power(PowerActionKind::Sleep, sent_at_ms, 15)
+    }
+
     #[test]
-    fn failed_read_preserves_last_observation_without_claiming_reachability() {
-        let machine = Machine::new("pc", "pc.local", "00:11:22:33:44:55").unwrap();
-        let state = State::new(PowerState::Awake, 123).with_pending(Some(Pending {
-            action: PowerActionKind::Sleep,
-            deadline_unix_ms: 456,
-        }));
+    fn failed_read_keeps_the_last_observation_and_when_it_was_received() {
         let mut observations = Observations::default();
-        assert!(
-            observations
-                .update(&machine, true, Ok(state.clone()))
-                .reachable
+        observations.apply(vec![poll(T0, Ok(awake(T0)))]);
+        observations.apply(vec![poll(T0 + 600_000, Err("connection timed out".into()))]);
+        let view = &observations.snapshot(T0 + 600_000)[0];
+        assert!(!view.reachable);
+        assert_eq!(view.error.as_deref(), Some("connection timed out"));
+        assert_eq!(view.seen_at_unix_ms, Some(T0));
+        assert_eq!(view.status.phase, machine_state::Phase::Offline);
+        assert_eq!(view.status.last_seen_unix_ms, Some(T0));
+    }
+
+    #[test]
+    fn a_poll_that_began_before_a_send_does_not_settle_its_countdown() {
+        let mut observations = Observations::default();
+        observations.apply(vec![poll(T0 - 500, Ok(awake(T0 - 500)))]);
+        observations.sent("pc", sleep_action(T0));
+        // This poll began before the send and finished after it.
+        observations.apply(vec![poll(T0 - 100, Ok(awake(T0 - 100)))]);
+        let view = &observations.snapshot(T0 + 100)[0];
+        assert_eq!(view.status.phase, machine_state::Phase::Pending);
+        assert!(view.status.waiting);
+    }
+
+    #[test]
+    fn a_failed_poll_after_the_fire_drops_a_restart_and_recovery_completes_it() {
+        let mut observations = Observations::default();
+        observations.apply(vec![poll(T0, Ok(awake(T0)))]);
+        observations.sent("pc", LastAction::power(PowerActionKind::Restart, T0, 15));
+        observations.apply(vec![poll(T0 + 16_000, Err("refused".into()))]);
+        assert_eq!(
+            observations.snapshot(T0 + 16_000)[0].status.phase,
+            machine_state::Phase::Restarting
         );
-        let failed = observations.update(&machine, true, Err("connection timed out".into()));
-        assert!(!failed.reachable);
-        assert_eq!(failed.observation, Some(state));
-        assert_eq!(failed.error.as_deref(), Some("connection timed out"));
-        observations.retain(&[]);
-        assert!(observations
-            .update(&machine, true, Err("offline".into()))
-            .observation
-            .is_none());
+        observations.apply(vec![poll(T0 + 90_000, Ok(awake(T0 + 90_000)))]);
+        let view = &observations.snapshot(T0 + 90_000)[0];
+        assert_eq!(view.status.phase, machine_state::Phase::Awake);
+        assert!(!view.status.waiting);
+    }
+
+    #[test]
+    fn a_failed_poll_during_the_countdown_is_not_a_drop() {
+        let mut observations = Observations::default();
+        observations.apply(vec![poll(T0, Ok(awake(T0)))]);
+        observations.sent("pc", LastAction::power(PowerActionKind::Restart, T0, 15));
+        observations.apply(vec![poll(T0 + 5_000, Err("timeout".into()))]);
+        observations.apply(vec![poll(T0 + 16_000, Ok(awake(T0 + 16_000)))]);
+        // The poll failed before the restart fired, so the machine did not
+        // drop during it. After the fire, a reachable, awake machine is still
+        // restarting until it has been seen to drop.
+        assert_eq!(
+            observations.snapshot(T0 + 16_000)[0].status.phase,
+            machine_state::Phase::Restarting
+        );
+    }
+
+    #[test]
+    fn cancel_clears_the_cached_countdown_at_once() {
+        let mut observations = Observations::default();
+        let state = awake(T0).with_pending(Some(Pending {
+            action: PowerActionKind::Sleep,
+            deadline_unix_ms: T0 + 12_000,
+        }));
+        observations.apply(vec![poll(T0, Ok(state))]);
+        assert_eq!(
+            observations.snapshot(T0)[0].status.phase,
+            machine_state::Phase::Pending
+        );
+        observations.cancelled("pc");
+        assert_eq!(
+            observations.snapshot(T0)[0].status.phase,
+            machine_state::Phase::Awake
+        );
+    }
+
+    #[test]
+    fn waiting_is_reported_for_the_store_so_the_poller_can_go_fast() {
+        let mut observations = Observations::default();
+        observations.apply(vec![poll(T0, Ok(awake(T0)))]);
+        assert!(!observations.any_waiting(T0));
+        observations.sent("pc", LastAction::wake(T0));
+        // Reachable and awake already: the wake has landed, so nothing waits.
+        observations.apply(vec![poll(T0 + 1_000, Ok(awake(T0 + 1_000)))]);
+        assert!(!observations.any_waiting(T0 + 1_000));
+        observations.sent("pc", LastAction::wake(T0 + 2_000));
+        observations.apply(vec![poll(T0 + 3_000, Err("timeout".into()))]);
+        assert!(observations.any_waiting(T0 + 3_000));
+    }
+
+    #[test]
+    fn machines_no_longer_registered_drop_out() {
+        let mut observations = Observations::default();
+        observations.apply(vec![poll(T0, Ok(awake(T0)))]);
+        observations.apply(Vec::new());
+        assert!(observations.snapshot(T0).is_empty());
+    }
+
+    #[test]
+    fn empty_and_registered_machines_use_only_the_fixture_registry() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let temp = barge::testing::TempDir::new("app-machine-poll").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        let observations = Mutex::new(Observations::default());
+        refresh_registry(&registry, &observations).unwrap();
+        assert!(observations.lock().unwrap().snapshot(T0).is_empty());
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        registry
+            .add(
+                Machine::new("pc", "127.0.0.1", "00:11:22:33:44:55")
+                    .unwrap()
+                    .with_daemon_port(port)
+                    .unwrap(),
+            )
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"schema":"barge.machine-state/1","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        refresh_registry(&registry, &observations).unwrap();
+        let first = observations.lock().unwrap().snapshot(now_ms());
+        assert_eq!(first.len(), 1);
+        assert!(first[0].reachable);
+        assert_eq!(first[0].status.phase, machine_state::Phase::Pending);
+        assert_eq!(first[0].daemon_port, port);
+        server.join().unwrap();
+
+        refresh_registry(&registry, &observations).unwrap();
+        let failed = observations.lock().unwrap().snapshot(now_ms());
+        assert!(!failed[0].reachable);
+        assert_eq!(failed[0].seen_at_unix_ms, first[0].seen_at_unix_ms);
     }
 }

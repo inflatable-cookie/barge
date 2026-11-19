@@ -1,12 +1,14 @@
 /**
- * Fixture harness for renderer screenshots: `/fixtures.html?view=storage&scenario=stale`.
+ * Fixture harness for renderer screenshots: `/fixtures.html?view=machines&scenario=awake&theme=dark`.
  *
  * It mounts the real App against a fake api, so a screenshot shows the same
- * markup and Poodle styles the app renders. Not part of the app build.
+ * markup and Poodle styles the app renders. Not part of the app build. The
+ * machine states are fixed here; the Rust state model is what produces them in
+ * the app, and its tests cover each one.
  */
 import { mount } from "svelte";
 import App from "./App.svelte";
-import type { AppApi, Preferences, VolumeSummary } from "./types";
+import type { AppApi, MachineStatus, MachineView, Preferences, Theme, VolumeSummary } from "./types";
 import "@inflatable-cookie/poodle-core/tokens/styles.css";
 import "@inflatable-cookie/poodle-core/tokens/themes.css";
 import "./style.css";
@@ -14,13 +16,40 @@ import "./style.css";
 const params = new URLSearchParams(location.search);
 const view = params.get("view") ?? "machines";
 const scenario = params.get("scenario") ?? "storage";
+const theme = (params.get("theme") ?? "system") as Theme;
 
 const volumes: VolumeSummary[] = [
   { name: "Builds", presence: "present", free_bytes: 214 * 1024 ** 3 },
   { name: "Archive", presence: "absent", free_bytes: null },
   { name: "Media", presence: "mismatch", free_bytes: null },
 ];
-const preferences: Preferences = { launch_at_login: true, refresh_interval: 10, theme: "system", show_window_at_launch: true };
+const preferences: Preferences = { launch_at_login: true, refresh_interval: 10, theme, show_window_at_launch: true };
+
+const now = Date.now();
+const awakeOffers: MachineStatus["offers"] = ["sleep", "restart", "shutdown", "moonlight"];
+const status = (fields: Partial<MachineStatus> & Pick<MachineStatus, "phase">): MachineStatus => ({
+  action: null, deadline_unix_ms: null, last_seen_unix_ms: null, offers: [], waiting: false, ...fields,
+});
+const bazzite = (fields: Partial<MachineView> & Pick<MachineView, "status">): MachineView => ({
+  name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", address: "bazzite.local",
+  daemon_port: 9777, reachable: true, error: null, seen_at_unix_ms: now, ...fields,
+});
+
+/** The machine each Machines scenario shows. */
+const machineFor: Record<string, MachineView[]> = {
+  offline: [bazzite({
+    reachable: false, error: "Connection timed out", seen_at_unix_ms: now - 12 * 60_000,
+    status: status({ phase: "offline", offers: ["wake"], last_seen_unix_ms: now - 12 * 60_000 }),
+  })],
+  waking: [bazzite({
+    reachable: false, error: "Connection timed out", seen_at_unix_ms: now - 12 * 60_000,
+    status: status({ phase: "waking", waiting: true, last_seen_unix_ms: now - 12 * 60_000 }),
+  })],
+  awake: [bazzite({ status: status({ phase: "awake", offers: awakeOffers }) })],
+  pending: [bazzite({
+    status: status({ phase: "pending", action: "sleep", deadline_unix_ms: now + 12_000, offers: ["cancel"], waiting: true }),
+  })],
+};
 
 let reads = 0;
 const api: AppApi = {
@@ -38,27 +67,19 @@ const api: AppApi = {
   },
   openWindow: async () => {},
   quit: async () => {},
-  localMachine: async () => ({ name: "Tom’s Mac", state: "awake", observed_at_unix_ms: Date.now(), model: "Mac15,7", uptime_seconds: 54000, volumes, doctor_findings: 0, storage_error: null }),
-  machines: async () => scenario === "empty" ? [] : [{ name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", address: "bazzite.local", reachable: scenario !== "unreachable", error: scenario === "unreachable" ? "Connection timed out" : null, observation: { power: "awake", observed_at_unix_ms: Date.now() - 12000, pending: scenario === "pending" ? { action: "sleep", deadline_unix_ms: Date.now() + 12000 } : null } }],
+  machines: async () => machineFor[scenario] ?? [],
   addMachine: async () => {}, pairMachine: async () => {}, removeMachine: async () => {}, machineAction: async () => {}, moonlight: async () => {},
 };
 
 const target = document.getElementById("app");
 if (target) mount(App, { target, props: { api, initialView: view } });
 
-function press(label: string) {
-  const button = [...document.querySelectorAll("button")].find(node => node.textContent?.trim().startsWith(label));
-  button?.click();
-}
-
 // Reach the states a screenshot needs to show.
 if (scenario === "stale") {
-  setTimeout(() => press("Refresh"), 150);
+  setTimeout(() => [...document.querySelectorAll("button")].find(node => node.textContent?.trim() === "Refresh")?.click(), 150);
 }
 if (scenario === "save-failed") {
   setTimeout(() => {
     document.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Launch at login"]')?.click();
   }, 150);
 }
-
-if (["awake", "unreachable", "pending"].includes(scenario)) setTimeout(() => press(`bazzite · LAN · ${scenario === "unreachable" ? "Unreachable" : scenario === "pending" ? "Action pending" : "Awake"}`), 150);

@@ -1,6 +1,6 @@
 # Barge app
 
-Status: Machines built; the remaining first-release capabilities below are planned.
+Status: Machines and Storage read views built; Machines reworked on Tom's 2026-11-19 feedback. Moves, Activity and notifications remain planned.
 
 The Barge app is a macOS menu-bar app for the two things an operator checks
 most often: the machines Barge controls, and the storage it manages. It sits
@@ -22,11 +22,24 @@ also do, and both go through the same library code.
 The first design pass (barge PR #81) contributed the interaction rules below.
 Its visual system is replaced by Poodle.
 
+## Decisions (Tom, 2026-11-19)
+
+Tom ran the app after the machines menu (PR #96) and asked for:
+
+- a menu that shows only what the operator can click now, not disabled
+  entries for every action;
+- no "This Mac" in the menu or the window, and no awake line for this Mac;
+- a card per machine in the window, with the actions that apply at that
+  moment, in the style of MoonDeck Remote;
+- a visible waiting state after a power action, not a return to "unavailable"
+  until the next poll.
+
 ## Form
 
-- **Menu-bar icon:** a monochrome template image opens a native menu with this
-  Mac's state and storage summary, registered machines and their power actions,
-  Moonlight, Open Barge, Settings and Quit. The menu updates while Barge runs.
+- **Menu-bar icon:** a monochrome template image opens a native menu with the
+  storage volumes, each registered machine with only the actions its state
+  offers, Open Barge, Settings and Quit. The menu updates while Barge runs.
+  Its contents are described under [Native menu](#native-menu).
 - **The app is never reachable only through the menu bar.** macOS parks menu-bar
   items off-screen when the space beside the notch is full, so:
   - the window opens when the app launches, controlled by the "Show window at
@@ -37,17 +50,52 @@ Its visual system is replaced by Poodle.
   only while the window is open (`ActivationPolicy::Accessory` otherwise).
 - **Launch at login** is a setting, off by default.
 
+### Native menu
+
+Only clickable items, plus a disabled header per machine. Items appear and
+disappear as state changes; the countdown text updates every second.
+
+```
+Stash · 2,284 GiB free        → opens the Storage view
+─────────
+bazzite — Awake               (disabled header)
+  Sleep
+  Restart…
+  Shut down…
+  Open Moonlight
+─────────
+Open Barge
+Settings…
+Quit
+```
+
+- Each registered volume is one storage line that opens the Storage view.
+  "· N issues" is added only when the last doctor result has findings.
+- Offline: the header reads "bazzite — Offline" with Wake beneath it only.
+  Waiting states show the header only. Pending shows its countdown and Cancel.
+- The error row shows only when there is an error.
+
 ## First release scope
 
 ### Machines
 
-- **List:** this Mac always appears first without registration, followed by each registered machine, with its observed state and age: online,
-  checking, waking, unreachable, or pending an action.
-- **Detail:**
-  - connection: LAN or Tailscale mode, address, MAC;
-  - the last observation;
-  - power controls and any pending action with its countdown and Cancel;
-  - Moonlight launch, which the MoonDeck Remote user relies on.
+- **Cards:** one card per registered machine, with its state from
+  [machines](machines.md#states): Offline, Waking…, Awake, Sleeping in 12 s,
+  Going to sleep…, Shutting down…, Restarting…, Didn't wake, Still on, or
+  Unknown. A spinner shows while it waits.
+  - The card offers only the actions its state offers, the most likely one
+    prominent (Wake when offline, Sleep when awake, Cancel while pending).
+    Restart and Shut down name the machine and ask first.
+  - A muted line gives the mode and address (`LAN · bazzite.local`). A stale
+    observation also says when Barge last saw the machine.
+  - Details (MAC, port, last observation), Pair and Remove sit behind a Details
+    disclosure, not beside the power actions.
+  - Moonlight launch, which the MoonDeck Remote user relies on, is an action
+    the awake card offers.
+- **Empty:** a short line and the Add machine button.
+- **Waiting:** after an action, a machine is polled every 2 s until the target
+  state is observed or its timeout passes, then at the refresh interval (see
+  [machines](machines.md#states)).
 - **Add, pair and remove a machine:**
   - LAN mode: paste the key that `barged pair` printed;
   - Tailscale mode: enter the tailnet name.
@@ -92,8 +140,9 @@ prune, and machine metrics beyond power state.
 ## Interaction rules
 
 - **Show what was observed, and when.** Never infer a current state. An
-  unreachable daemon is "unreachable", with the last observation and its age,
-  never "asleep".
+  unreachable machine is "Offline", with when Barge last saw it, never
+  "asleep". Ages read in the past tense ("12 s ago", "now") and appear only
+  for a stale observation, not on every line.
 - **The daemon owns countdowns.** On reconnect or reopen, the app reads the
   pending action and its deadline from `barged`; it never restarts a local
   timer. While an action is pending, a second action is unavailable and
@@ -129,12 +178,14 @@ Tauri Rust host (apps/barge-app/src-tauri)
   when the action ends. The app holds no Barge locks or holds while idle.
 - **Refresh:**
   - machine state is polled while the app runs, at the refresh interval
-    (default 10 s), and once on open;
-  - the menu's local storage summary refreshes at that interval; the Storage
-    view reads on open and on Refresh;
+    (default 10 s), every 2 s while a machine is waiting on an action, and once
+    on open;
+  - the menu's local storage summary refreshes at the refresh interval; the
+    Storage view reads on open and on Refresh;
   - survey sizes and doctor's binding checks run on request, never in the
-    background. The menu shows the last doctor result and its age; its Refresh
-    item runs doctor.
+    background. Opening the Storage view runs doctor. The menu shows the issue
+    count from the last doctor result and nothing else about doctor; it has no
+    Refresh item.
 - **Longhorn crates** (the "minimal" shape plus services):
   - `longhorn-core`, `longhorn-config`, `longhorn-settings`,
     `longhorn-settings-config`, `longhorn-tauri-config` and
@@ -164,6 +215,7 @@ Tauri Rust host (apps/barge-app/src-tauri)
 - **Poodle components,** a first mapping:
   - `SidebarNav` for the window's navigation (Machines, Storage, Activity,
     Settings);
+  - `Card` for a machine, with `Spinner` while it waits;
   - `StatusIndicator` and `TimeAgo` for observed state;
   - `ConfirmAction` and `AlertDialog` for confirmations;
   - `Progress` for countdowns and move progress;
@@ -204,11 +256,15 @@ opens on launch, so the app is usable even when macOS hides its menu-bar item.
 
 ## Testing
 
-- Renderer: Vitest and Svelte Testing Library over every view's states:
-  online, unreachable, pending, absent volume, mismatch, drift, and empty.
-  `apps/barge-app/fixtures.html?view=<view>&scenario=<scenario>` mounts the real
-  renderer against a fake api, so a view's states can be screenshotted without a
-  build.
+- Rust: the state model is a pure function (`machine_state.rs`), tested row by
+  row against the states table, each timeout, restart passing through
+  unreachable, cancel, and a stale observation. The menu's item set per state
+  is tested in `menu_plan.rs`.
+- Renderer: Vitest and Svelte Testing Library over each machine card state and
+  the actions it offers, plus storage's absent volume, mismatch, drift, and
+  empty. `apps/barge-app/fixtures.html?view=<view>&scenario=<scenario>&theme=<light|dark>`
+  mounts the real renderer against a fake api, so a view's states can be
+  screenshotted without a build.
 - Rust: command tests against the fake OS identity and a loopback `barged`
   stub, as the crates already do.
 - End-to-end through Longhorn's agent-control surface, when it's added.
@@ -218,8 +274,8 @@ opens on launch, so the app is usable even when macOS hides its menu-bar item.
 1. **Scaffold (built):** Tauri, the Longhorn minimal shape and Poodle; tray icon,
    window; settings; an empty Machines view with real navigation.
    Tom reviews it running.
-2. **Machines (built):** list, detail, power with countdown and cancel, pairing,
-   Moonlight and the native tray menu.
+2. **Machines (built, reworked 2026-11-19):** cards, power with countdown and
+   cancel, waiting states, pairing, Moonlight and the native tray menu.
 3. **Storage, read views:** volumes, layout, bindings with doctor, and survey.
 4. **Moves:** plan from survey, review, apply with confirmation, and progress
    through `longhorn-operation`.

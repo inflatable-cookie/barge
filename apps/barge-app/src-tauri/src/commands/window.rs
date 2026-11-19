@@ -8,30 +8,26 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 /// menu-bar item being reachable, because macOS parks that item off-screen when
 /// the menu bar beside the notch is full.
 pub fn show_main(app: &tauri::AppHandle) -> Result<(), String> {
-    show(app, false)
+    show(app, None)
 }
 
-pub fn show_settings(app: &tauri::AppHandle) -> Result<(), String> {
-    show(app, true)
-}
-
-fn show(app: &tauri::AppHandle, settings: bool) -> Result<(), String> {
+/// Shows the window on one of its views, such as `storage` or `settings`.
+pub fn show(app: &tauri::AppHandle, view: Option<&'static str>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Regular)
         .map_err(|error| error.to_string())?;
     if let Some(window) = app.get_webview_window("main") {
-        if settings {
+        if let Some(view) = view {
             window
-                .emit("show-settings", ())
+                .emit("show-view", view)
                 .map_err(|error| error.to_string())?;
         }
         window.show().map_err(|error| error.to_string())?;
         window.set_focus().map_err(|error| error.to_string())?;
     } else {
-        let url = if settings {
-            "index.html#settings"
-        } else {
-            "index.html"
+        let url = match view {
+            Some(view) => format!("index.html#{view}"),
+            None => "index.html".into(),
         };
         WebviewWindowBuilder::new(app, "main", WebviewUrl::App(url.into()))
             .title("Barge")
