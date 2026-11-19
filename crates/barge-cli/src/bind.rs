@@ -1,4 +1,4 @@
-use barge::{ApplyOptions, Barge, Binding, Class, Error, ErrorKind, LinkPlan, Observed, Result};
+use barge::{ApplyOptions, Barge, Binding, Class, Error, LinkPlan, Observed, Result};
 use serde_json::{json, Value};
 
 use crate::args::{expect_no_positionals, Options};
@@ -162,12 +162,8 @@ pub(crate) fn binding_for_plan(plan: &LinkPlan) -> Result<Binding> {
 /// `-` for standard input. A document with another schema is refused.
 pub(crate) fn read_plan(path: &str) -> Result<LinkPlan> {
     let source = if path == "-" {
-        std::io::read_to_string(std::io::stdin().lock()).map_err(|source| {
-            Error::new(
-                ErrorKind::Io,
-                format!("cannot read the plan from stdin: {source}"),
-            )
-        })?
+        std::io::read_to_string(std::io::stdin().lock())
+            .map_err(|source| Error::usage(format!("cannot read the plan from stdin: {source}")))?
     } else {
         std::fs::read_to_string(path)
             .map_err(|source| Error::usage(format!("cannot read plan {path}: {source}")))?

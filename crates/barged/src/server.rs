@@ -117,11 +117,6 @@ impl Daemon {
     }
 
     fn route(&self, request: &Request, peer: Option<SocketAddr>) -> Answer {
-        let tailnet_caller = if self.lan {
-            None
-        } else {
-            Some(self.authorize(peer)?)
-        };
         let body = &request.body;
         let caller = if self.lan {
             let key = self
@@ -136,8 +131,7 @@ impl Daemon {
             self.authorize_lan(request, &key, body.as_bytes())?;
             PeerNode::new("lan", "LAN client")
         } else {
-            tailnet_caller
-                .ok_or_else(|| (403, failure("not_authorized", "authentication failed")))?
+            self.authorize(peer)?
         };
         let url = request.url.to_string();
         let path = url.split(['?', '#']).next().unwrap_or("").to_string();

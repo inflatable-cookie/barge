@@ -286,11 +286,15 @@ fn machine_power_confirms_restart_and_shutdown_unless_yes_is_given() {
 
     let confirmed = run_with_stdin(&fixture, &["machine", "shutdown", "pc"], "yes\n");
     assert_eq!(confirmed.status.code(), Some(0), "{}", stderr(&confirmed));
+    // The human line shows the deadline in local time, which depends on the
+    // machine's zone, so the test checks its shape and not a fixed clock.
+    let line = stdout(&confirmed);
     assert!(
-        stdout(&confirmed).contains("shutdown of pc will fire at 15000 (in 15s)"),
-        "{}",
-        stdout(&confirmed)
+        line.starts_with("shutdown of pc will fire at ")
+            && line.contains(" local (in 15s); cancel with `barge machine cancel pc`"),
+        "{line}"
     );
+    assert!(!line.contains("15000"), "{line}");
     assert_eq!(requests.lock().unwrap().len(), 1);
     let sent = requests.lock().unwrap()[0].clone();
     assert!(sent.starts_with("POST /v1/power "), "{sent}");

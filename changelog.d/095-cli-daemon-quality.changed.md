@@ -1,0 +1,1 @@
+Finish the CLI and daemon quality pass: the machine verbs are one function each, human machine output shows ages and local times instead of Unix milliseconds, `machine pair` reads its key without echo on a terminal, an unreadable plan or key is a usage error everywhere, and barged's config and routing comments match the code.

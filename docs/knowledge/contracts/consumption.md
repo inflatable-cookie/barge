@@ -89,7 +89,9 @@ A failing command writes `{"schema": "barge.error/1", "error": {"kind": "...",
 is one of `refused`, `not_found`, `usage`, `io`, `unknown_state`. Exit codes:
 0 success, 1 refused or not found (nothing changed), 2 usage error, 3 internal
 error. `--json` precedes the command and selects the document form. `env` emits
-shell assignments and refuses `--json`.
+shell assignments and refuses `--json`. A move or bind plan is read from a file
+or from standard input (`-`). The key for `machine pair` is read from standard
+input only. Input that cannot be read is `usage`.
 
 ## Shapes
 
