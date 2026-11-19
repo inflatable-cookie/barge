@@ -508,6 +508,7 @@ mod tests {
             volumes: vec![],
             doctor_findings: Some(0),
             doctor_observed_at_unix_ms: Some(1_000),
+            doctor_error: None,
             storage_error: None,
         };
         assert_eq!(

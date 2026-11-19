@@ -1,13 +1,14 @@
 import { mount } from "svelte";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App.svelte";
-import type { AppApi, Preferences, VolumeSummary, MachineView, LocalMachine } from "./types";
+import type { AppApi, Preferences, VolumeSummary, MachineView, LocalMachine, DoctorStatus } from "./types";
 import "@inflatable-cookie/poodle-core/tokens/styles.css";
 import "@inflatable-cookie/poodle-core/tokens/themes.css";
 import "./style.css";
 
 const api: AppApi = {
   volumes: () => invoke<VolumeSummary[]>("storage_volumes"),
+  doctorStatus: () => invoke<DoctorStatus>("doctor_status"),
   preferences: () => invoke<Preferences>("preferences_get"),
   savePreferences: (preferences) => invoke<Preferences>("preferences_set", { preferences }),
   openWindow: () => invoke("open_main_window"),

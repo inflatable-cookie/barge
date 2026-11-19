@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import DoctorStatusView from "./DoctorStatus.svelte";
   import { AlertDialog, Button, Callout, DetailItem, DetailSection, Field, FormDialog, Select, StatusIndicator, TextInput, TimeAgo } from "@inflatable-cookie/poodle-svelte";
   import type { AppApi, LocalMachine, MachineView, NewMachine } from "./types";
 
@@ -107,8 +108,8 @@
         {:else if local}
           {#each local.volumes as volume}<DetailItem label={volume.name} value={volume.presence === "present" ? `${((volume.free_bytes ?? 0) / 1024 ** 3).toFixed(1)} GiB free` : volume.presence} />{/each}
           {#if local.volumes.length === 0}<p>No volumes registered</p>{/if}
-          <DetailItem label="Doctor" value={local.doctor_findings === null ? "Not checked" : local.doctor_findings === 0 ? "OK" : `${local.doctor_findings} findings`} />
         {/if}
+        {#if local}<DoctorStatusView status={{ observation: local.doctor_findings !== null && local.doctor_observed_at_unix_ms != null ? { findings: local.doctor_findings, observed_at_unix_ms: local.doctor_observed_at_unix_ms } : null, error: local.doctor_error ?? null }} />{/if}
       </DetailSection>
     {:else if current}
       <h2>{current.name}</h2>

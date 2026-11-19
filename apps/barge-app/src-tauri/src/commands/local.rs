@@ -3,12 +3,12 @@
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize)]
 pub struct DoctorObservation {
     pub findings: usize,
     pub observed_at_unix_ms: u64,
 }
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize)]
 pub struct DoctorStatus {
     pub observation: Option<DoctorObservation>,
     pub error: Option<String>,
@@ -64,6 +64,7 @@ pub struct LocalMachine {
     pub volumes: Vec<crate::storage::VolumeSummary>,
     pub doctor_findings: Option<usize>,
     pub doctor_observed_at_unix_ms: Option<u64>,
+    pub doctor_error: Option<String>,
     pub storage_error: Option<String>,
 }
 
@@ -145,6 +146,7 @@ fn local_from_account(
         volumes,
         doctor_findings: None,
         doctor_observed_at_unix_ms: None,
+        doctor_error: None,
         storage_error,
     }
 }
@@ -156,13 +158,24 @@ pub async fn local_machine_info(
     let cache = doctor.0.clone();
     super::blocking(move || {
         let mut local = local_machine();
-        if let Some(observation) = cache.lock().map_err(|error| error.to_string())?.observation {
+        let status = cache.lock().map_err(|error| error.to_string())?;
+        if let Some(observation) = status.observation {
             local.doctor_findings = Some(observation.findings);
             local.doctor_observed_at_unix_ms = Some(observation.observed_at_unix_ms);
         }
+        local.doctor_error = status.error.clone();
         Ok(local)
     })
     .await
+}
+
+#[tauri::command]
+pub fn doctor_status(doctor: tauri::State<'_, DoctorState>) -> Result<DoctorStatus, String> {
+    doctor
+        .0
+        .lock()
+        .map(|status| status.clone())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -223,5 +236,29 @@ mod tests {
         doctor.refresh_in(&account).unwrap();
         assert_eq!(doctor.0.lock().unwrap().observation.unwrap().findings, 0);
         assert!(!state_dir.exists());
+    }
+    #[test]
+    fn doctor_error_preserves_last_observation_and_clears_on_recovery() {
+        let state = DoctorState::default();
+        state
+            .record(Ok(DoctorObservation {
+                findings: 0,
+                observed_at_unix_ms: 42,
+            }))
+            .unwrap();
+        assert!(state.record(Err("layout unreadable".into())).is_err());
+        let status = state.0.lock().unwrap().clone();
+        let json = serde_json::to_value(status).unwrap();
+        assert_eq!(json["error"], "layout unreadable");
+        assert_eq!(json["observation"]["observed_at_unix_ms"], 42);
+        state
+            .record(Ok(DoctorObservation {
+                findings: 2,
+                observed_at_unix_ms: 100,
+            }))
+            .unwrap();
+        let status = state.0.lock().unwrap();
+        assert!(status.error.is_none());
+        assert_eq!(status.observation.unwrap().findings, 2);
     }
 }

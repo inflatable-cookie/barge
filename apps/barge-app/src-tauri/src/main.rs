@@ -77,6 +77,7 @@ fn run() -> tauri::Result<()> {
         })
         .invoke_handler(tauri::generate_handler![
             commands::local::local_machine_info,
+            commands::local::doctor_status,
             commands::local::open_moonlight,
             commands::machines::machines_list,
             commands::machines::machines_add,

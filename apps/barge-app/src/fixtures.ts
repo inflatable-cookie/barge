@@ -30,6 +30,7 @@ const api: AppApi = {
     if (scenario === "failed") throw new Error("the account state is unreadable");
     return scenario === "empty" ? [] : volumes;
   },
+  doctorStatus: async () => ({ observation: { findings: 0, observed_at_unix_ms: Date.now() - 12000 }, error: null }),
   preferences: async () => preferences,
   savePreferences: async (next: Preferences) => {
     if (scenario === "save-failed") throw new Error("the config store is read-only");

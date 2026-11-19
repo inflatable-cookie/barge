@@ -16,6 +16,7 @@ afterEach(() => {
 function fixture(volumes: VolumeSummary[] = []): AppApi {
   return {
     volumes: vi.fn().mockResolvedValue(volumes),
+    doctorStatus: vi.fn().mockResolvedValue({ observation: null, error: null }),
     preferences: vi.fn().mockResolvedValue({ ...preferences }),
     savePreferences: vi.fn(async (next: Preferences) => next),
     openWindow: vi.fn().mockResolvedValue(undefined),
@@ -209,6 +210,32 @@ describe("Machines", () => {
     await vi.waitFor(() => expect(screen.getByText(/local read failed/)).toBeInTheDocument());
     await vi.advanceTimersByTimeAsync(10_000);
     await vi.waitFor(() => expect(screen.queryByText(/local read failed/)).not.toBeInTheDocument());
+  });
+
+  it("shows the last doctor result and failure in Machines, then clears it after recovery", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    const base = { name: "Mac", state: "awake" as const, observed_at_unix_ms: Date.now(), model: null, uptime_seconds: 2, volumes: [], doctor_findings: 0, doctor_observed_at_unix_ms: Date.now() - 12_000, storage_error: null };
+    vi.mocked(api.localMachine).mockResolvedValueOnce({ ...base, doctor_error: "layout unreadable" }).mockResolvedValue({ ...base, doctor_error: null });
+    render(App, { props: { api } });
+    await vi.waitFor(() => expect(screen.getByText("layout unreadable")).toBeInTheDocument());
+    expect(screen.getByText(/Last doctor result: OK/)).toBeInTheDocument();
+    expect(screen.getByText(/earlier result/)).toBeInTheDocument();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(screen.queryByText("layout unreadable")).not.toBeInTheDocument());
+  });
+  it("keeps volumes and shows doctor failure and age in Storage, then shows recovery", async () => {
+    const api = fixture([{ name: "Builds", presence: "present", free_bytes: 1024 ** 3 }]);
+    vi.mocked(api.doctorStatus).mockResolvedValueOnce({ observation: { findings: 0, observed_at_unix_ms: Date.now() - 12_000 }, error: "layout unreadable" }).mockResolvedValue({ observation: { findings: 2, observed_at_unix_ms: Date.now() }, error: null });
+    render(App, { props: { api, initialView: "storage" } });
+    expect(await screen.findByText("layout unreadable")).toBeInTheDocument();
+    expect(screen.getByText("1.0 GiB free")).toBeInTheDocument();
+    expect(screen.getByText(/Last doctor result: OK/)).toBeInTheDocument();
+    expect(screen.getByText(/earlier result/)).toBeInTheDocument();
+    expect(document.querySelector("time[datetime]")).not.toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText(/Last doctor result: 2 findings/)).toBeInTheDocument();
+    expect(screen.queryByText("layout unreadable")).not.toBeInTheDocument();
   });
 
 });

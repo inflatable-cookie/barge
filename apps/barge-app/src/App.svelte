@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import Machines from "./Machines.svelte";
+  import DoctorStatusView from "./DoctorStatus.svelte";
   import { listen } from "@tauri-apps/api/event";
   import { SidebarNav, EmptyState, Button, Callout, Select, Switch, TimeAgo } from "@inflatable-cookie/poodle-svelte";
   import { applyThemeAttributes } from "@inflatable-cookie/poodle-core/tokens/runtime";
-  import type { AppApi, Preferences, Theme, VolumeSummary } from "./types";
+  import type { AppApi, Preferences, Theme, VolumeSummary, DoctorStatus } from "./types";
 
   let { api, initialView = "machines" }: { api: AppApi; initialView?: string } = $props();
 
@@ -20,6 +21,7 @@
   // Only the initial view matters: navigation takes over afterwards.
   let view = $state(untrack(() => initialView));
   let volumes = $state<VolumeSummary[]>([]);
+  let doctor = $state<DoctorStatus | null>(null);
   // The value the store holds. A failed save falls back to this.
   let saved = $state<Preferences>({ ...savedDefaults });
   let preferences = $state<Preferences>({ ...savedDefaults });
@@ -46,6 +48,8 @@
   async function readStorage() {
     try {
       volumes = await api.volumes();
+      try { doctor = await api.doctorStatus(); }
+      catch (reason) { doctor = { observation: doctor?.observation ?? null, error: describe(reason) }; }
       observedAt = Date.now();
       storageError = "";
     } catch (reason) {
@@ -117,6 +121,7 @@
         {#if loading}<p>Checking storage…</p>
         {:else}
           {@render storageErrorNote()}
+          <DoctorStatusView status={doctor} />
           {#if observedAt !== null}
             {@render observed(observedAt)}
             {#if volumes.length === 0}
