@@ -8,13 +8,21 @@
 //!
 //! Eviction itself lives in [`crate::area`], next to the locks whose ordering it
 //! depends on; this module is the deletion it performs and the trash sweep.
+//!
+//! A sweep claims what it will delete under the area lock and deletes it after
+//! releasing the lock, so a large deletion never stalls holds. A claim renames
+//! the entry to [`CLAIM_PREFIX`] plus its name and keeps the exclusive lock on
+//! the folder it opened, so a later sweep finishes a claim an interrupted sweep
+//! left behind and never walks a tree another deletion is walking.
 
-use std::ffi::OsStr;
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::area::{Area, AreaLock, TRASH_DIR};
 use crate::error::{Error, Result};
+use crate::hold::Mode;
 use crate::os::{Removed, Tree};
 use crate::root::{read_marker_in, MarkerRead, MARKER_NAME};
 use crate::space::{SkippedRoot, SweepReport, SweptRoot};
@@ -94,6 +102,15 @@ fn remove_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Removed> {
     }
 }
 
+/// A trash entry a sweep has claimed for deletion: opened, its marker read
+/// through the descriptor the deletion walks, and locked so no second deletion
+/// walks it too.
+struct Claimed {
+    tree: Tree,
+    /// Where the entry was before it was claimed, which is what the report says.
+    path: PathBuf,
+}
+
 /// Delete a root Barge created and could not finish writing a marker into.
 ///
 /// Only a folder holding nothing but Barge's own marker is removed, and the walk
@@ -135,70 +152,41 @@ thread_local! {
     pub(crate) static FAIL_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OPEN_TREE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static SWEEP_DELETE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 impl Area {
     /// Delete every owned trash entry of this area.
     ///
-    /// The area lock is taken before the listing: an eviction renames its root
-    /// into the trash under that same lock, so a sweep never deletes an entry
-    /// whose rename it has not seen finish.
+    /// The area lock is taken to list the trash and to claim what this pass will
+    /// delete: an eviction renames its root into the trash under that same lock,
+    /// so a sweep never deletes an entry whose rename it has not seen finish. The
+    /// lock is released before any tree is deleted, so holds and other area
+    /// operations continue while a large tree goes.
     pub fn sweep_trash(&self) -> Result<SweepReport> {
         self.core.ensure_writable()?;
         let key = self.key().label();
         let mut report = SweepReport::default();
         for (directory, _) in self.search_dirs()? {
             self.ensure_layout(&directory)?;
-            let _lock = AreaLock::acquire(&directory)?;
             let trash = directory.join(TRASH_DIR);
-            let entries = match fs::read_dir(&trash) {
-                Ok(entries) => entries,
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(source) => return Err(Error::io("cannot list the trash at", &trash, &source)),
-            };
-            for entry in entries {
-                #[cfg(test)]
-                let entry = if FAIL_READ.with(|flag| flag.replace(false)) {
-                    Err(std::io::Error::other("injected readdir failure"))
-                } else {
-                    entry
+            // A pass claims and deletes a bounded batch, so a large trash never
+            // holds one descriptor per entry; the next pass takes the rest. An
+            // entry a pass leaves in place is reported once, not per pass.
+            let mut reported_kept = HashSet::new();
+            let mut first = true;
+            loop {
+                let claimed = {
+                    let _lock = AreaLock::acquire(&directory)?;
+                    claim_trash(&trash, &key, &mut report, &mut reported_kept, first)?
                 };
-                let entry = entry
-                    .map_err(|source| Error::io("cannot read a trash entry at", &trash, &source))?;
-                let path = entry.path();
-                let metadata = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
-                };
-                if metadata.file_type().is_symlink() {
-                    report.kept.push(SkippedRoot {
-                        path,
-                        reason: "a symbolic link, never followed".to_string(),
-                    });
-                    continue;
+                first = false;
+                if claimed.is_empty() {
+                    break;
                 }
-                if !metadata.is_dir() {
-                    report.kept.push(SkippedRoot {
-                        path,
-                        reason: "not a folder".to_string(),
-                    });
-                    continue;
-                }
-                match open_owned(&path, &key, None)? {
-                    Opened::Owned(tree) => match tree.remove() {
-                        Ok(removed) => report.deleted.push(SweptRoot {
-                            path,
-                            bytes: removed.bytes,
-                        }),
-                        Err(error) => {
-                            return Err(Error::new(
-                                error.kind(),
-                                format!("{}; trash remains at {}", error.message(), path.display()),
-                            ))
-                        }
-                    },
-                    Opened::Refused(reason) => report.kept.push(SkippedRoot { path, reason }),
+                for claim in claimed {
+                    delete_claimed(claim, &mut report)?;
                 }
             }
         }
@@ -206,10 +194,178 @@ impl Area {
     }
 }
 
+/// The name a sweep gives a trash entry while it deletes it. Eviction never
+/// makes a name with this prefix, so a leftover claim is recognised as one.
+const CLAIM_PREFIX: &str = ".barge-claim-";
+
+/// How many trash entries one claim pass opens at once.
+const CLAIM_BATCH: usize = 16;
+
+/// List the trash under the area lock and claim the entries this pass will
+/// delete. Each claimed entry is opened and its marker read through the
+/// descriptor the deletion walks, and its exclusive lock is taken so a second
+/// sweep or eviction leaves it alone; the pass stops claiming once
+/// [`CLAIM_BATCH`] descriptors are held.
+///
+/// `first` is true for the pass that opens the directory: only then is an entry
+/// that already carries a claim name taken, because a claim still there after
+/// its own pass holds part of a tree this sweep could not remove.
+fn claim_trash(
+    trash: &Path,
+    area: &str,
+    report: &mut SweepReport,
+    reported_kept: &mut HashSet<PathBuf>,
+    first: bool,
+) -> Result<Vec<Claimed>> {
+    let entries = match fs::read_dir(trash) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(Error::io("cannot list the trash at", trash, &source)),
+    };
+    let mut claimed = Vec::new();
+    for entry in entries {
+        #[cfg(test)]
+        let entry = if FAIL_READ.with(|flag| flag.replace(false)) {
+            Err(std::io::Error::other("injected readdir failure"))
+        } else {
+            entry
+        };
+        let entry =
+            entry.map_err(|source| Error::io("cannot read a trash entry at", trash, &source))?;
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
+        };
+        if metadata.file_type().is_symlink() {
+            kept(
+                report,
+                reported_kept,
+                path,
+                "a symbolic link, never followed",
+            );
+            continue;
+        }
+        if !metadata.is_dir() {
+            kept(report, reported_kept, path, "not a folder");
+            continue;
+        }
+        if claimed.len() >= CLAIM_BATCH {
+            // The next pass lists it again, after this batch is deleted.
+            continue;
+        }
+        if !first && is_claim(&path) {
+            // A claim this sweep left behind holds what it could not remove; it
+            // was reported when it was claimed, and the next sweep takes it.
+            continue;
+        }
+        match open_owned(&path, area, None)? {
+            Opened::Owned(tree) => {
+                if !crate::os::flock(tree.directory(), Mode::Exclusive, false)? {
+                    kept(report, reported_kept, path, "another sweep is deleting it");
+                    continue;
+                }
+                claimed.push(Claimed {
+                    tree: claim(tree, &path, trash)?,
+                    path,
+                });
+            }
+            Opened::Refused(reason) => kept(report, reported_kept, path, &reason),
+        }
+    }
+    Ok(claimed)
+}
+
+/// Record an entry a pass did not claim, once per sweep.
+fn kept(
+    report: &mut SweepReport,
+    reported_kept: &mut HashSet<PathBuf>,
+    path: PathBuf,
+    reason: &str,
+) {
+    if reported_kept.insert(path.clone()) {
+        report.kept.push(SkippedRoot {
+            path,
+            reason: reason.to_string(),
+        });
+    }
+}
+
+/// Rename a trash entry to its claim name, keeping the descriptor its marker was
+/// read through, so the deletion walks the folder whose marker it saw. A claim
+/// an earlier sweep left behind already carries the name.
+fn claim(tree: Tree, path: &Path, trash: &Path) -> Result<Tree> {
+    if is_claim(path) {
+        return Ok(tree);
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::unknown_state(format!("{} has no name to claim", path.display())))?;
+    let mut base = OsString::from(CLAIM_PREFIX);
+    base.push(name);
+    let mut counter = 0_u64;
+    loop {
+        let candidate = if counter == 0 {
+            trash.join(&base)
+        } else {
+            let mut claimed = base.clone();
+            claimed.push(format!(".{counter}"));
+            trash.join(claimed)
+        };
+        counter += 1;
+        match crate::os::rename_no_replace(path, &candidate) {
+            Ok(()) => return Ok(tree.rebased(candidate)),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(Error::io("cannot claim the trash entry", path, &source)),
+        }
+    }
+}
+
+fn is_claim(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with(CLAIM_PREFIX))
+}
+
+/// Delete a claimed tree, outside the area lock, and report it against the name
+/// it had in the trash.
+fn delete_claimed(claim: Claimed, report: &mut SweepReport) -> Result<()> {
+    #[cfg(test)]
+    SWEEP_DELETE_HOOK.with(|hook| {
+        let callback = hook.borrow_mut().take();
+        if let Some(hook) = callback {
+            hook();
+        }
+    });
+    let Claimed { tree, path } = claim;
+    let claimed_path = tree.path().to_path_buf();
+    match tree.remove() {
+        Ok(removed) => {
+            report.deleted.push(SweptRoot {
+                path,
+                bytes: removed.bytes,
+            });
+            Ok(())
+        }
+        Err(error) => Err(Error::new(
+            error.kind(),
+            format!(
+                "{}; trash remains at {}",
+                error.message(),
+                claimed_path.display()
+            ),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
+    use std::rc::Rc;
+    use std::sync::{mpsc, Arc};
 
     fn marker(id: &str) -> crate::root::RootMarker {
         crate::root::RootMarker {
@@ -221,6 +377,166 @@ mod tests {
             expires_unix_ms: None,
             folder: None,
         }
+    }
+
+    /// An area on a fake volume, which keeps every file it touches real.
+    fn fixture(name: &str) -> (crate::testing::TempDir, Area) {
+        let temp = crate::testing::TempDir::new(name).unwrap();
+        let mount = temp.folder("mount").unwrap();
+        let state = temp.folder("state").unwrap();
+        let os = Arc::new(crate::FakeOs::with_volume(
+            &mount,
+            "11111111-2222-3333-4444-555555555555",
+            100,
+        ));
+        let barge =
+            crate::Barge::open_with(state, os, Arc::new(crate::ManualClock::new(1))).unwrap();
+        barge
+            .register_volume(crate::VolumeRegistration::new("disk", &mount).floor_bytes(0))
+            .unwrap();
+        let area = barge
+            .area(crate::AreaSpec::new("test", "area", "disk"))
+            .unwrap();
+        (temp, area)
+    }
+
+    /// A root this area owns, moved into the trash as a crash after eviction's
+    /// rename would leave it.
+    fn trashed(area: &Area, label: &str) -> PathBuf {
+        let root = area.create_root(label).unwrap();
+        let trash = root.path.parent().unwrap().join(TRASH_DIR);
+        fs::create_dir_all(&trash).unwrap();
+        let path = trash.join(&root.folder);
+        fs::rename(&root.path, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_hold_can_be_taken_while_a_sweep_deletes() {
+        let (_temp, area) = fixture("trash-hold");
+        let doomed = trashed(&area, "old");
+        let survivor = area.create_root("new").unwrap();
+        let directory = survivor.path.parent().unwrap().to_path_buf();
+        let other = area.clone();
+        let survivor_id = survivor.id.clone();
+        let held = Rc::new(RefCell::new(None));
+        let taken = held.clone();
+        SWEEP_DELETE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // The sweep deletes outside the area lock, so a hold taken here
+                // never waits for the tree to be gone. Waiting for zero says so
+                // without risking a hang in the regression this covers.
+                assert!(
+                    AreaLock::acquire_within(&directory, std::time::Duration::ZERO)
+                        .unwrap()
+                        .is_some(),
+                    "the sweep holds the area lock while it deletes"
+                );
+                *taken.borrow_mut() = Some(other.hold(&survivor_id, Mode::Exclusive).unwrap());
+            }))
+        });
+
+        let report = area.sweep_trash().unwrap();
+
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, doomed);
+        assert!(!doomed.exists(), "the tree was deleted after the hold");
+        assert!(
+            held.borrow().is_some(),
+            "the hold was taken during the delete"
+        );
+    }
+
+    #[test]
+    fn two_sweeps_never_delete_the_same_tree() {
+        let (_temp, area) = fixture("trash-race");
+        let leaves = [trashed(&area, "one"), trashed(&area, "two")];
+        let (claimed_tx, claimed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let first_area = area.clone();
+        let first = std::thread::spawn(move || {
+            SWEEP_DELETE_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    claimed_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }))
+            });
+            first_area.sweep_trash()
+        });
+        // The first sweep holds both claims and is inside the first deletion.
+        claimed_rx.recv().unwrap();
+
+        // A second sweep must leave those claims alone, and still delete an
+        // entry that arrives meanwhile without erroring on the claims.
+        let late = trashed(&area, "three");
+        let second = area.sweep_trash().unwrap();
+        resume_tx.send(()).unwrap();
+        let first = first.join().unwrap().unwrap();
+
+        assert_eq!(second.deleted.len(), 1);
+        assert_eq!(second.deleted[0].path, late);
+        assert_eq!(second.kept.len(), 2, "{:?}", second.kept);
+        assert!(second
+            .kept
+            .iter()
+            .all(|kept| kept.reason.contains("another sweep")));
+        assert_eq!(first.deleted.len(), 2);
+        let mut deleted: Vec<PathBuf> = first
+            .deleted
+            .iter()
+            .chain(&second.deleted)
+            .map(|swept| swept.path.clone())
+            .collect();
+        deleted.sort();
+        deleted.dedup();
+        assert_eq!(deleted.len(), 3, "no tree is counted twice: {deleted:?}");
+        assert!(leaves.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn a_claim_left_by_an_interrupted_sweep_is_swept() {
+        let (_temp, area) = fixture("trash-leftover");
+        let entry = trashed(&area, "old");
+        let name = entry.file_name().unwrap().to_owned();
+        let mut claim_name = std::ffi::OsString::from(CLAIM_PREFIX);
+        claim_name.push(name);
+        let leftover = entry.parent().unwrap().join(claim_name);
+        fs::rename(&entry, &leftover).unwrap();
+
+        let report = area.sweep_trash().unwrap();
+
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, leftover);
+        assert!(!leftover.exists());
+    }
+
+    #[test]
+    fn a_kept_entry_is_reported_once_and_a_large_trash_is_cleared() {
+        let (_temp, area) = fixture("trash-batches");
+        let trash = trashed(&area, "doomed").parent().unwrap().to_path_buf();
+        // A folder in the trash whose marker names another area stays, however
+        // many passes the rest of the trash takes.
+        let foreign = trash.join("slot-0123456789abcdef");
+        fs::create_dir(&foreign).unwrap();
+        crate::root::write_marker(
+            &foreign,
+            &crate::root::RootMarker {
+                area: "other/area".to_string(),
+                ..marker("0123456789abcdef")
+            },
+        )
+        .unwrap();
+        for index in 0..CLAIM_BATCH + 2 {
+            trashed(&area, &format!("slot-{index}"));
+        }
+
+        let report = area.sweep_trash().unwrap();
+
+        assert_eq!(report.deleted.len(), CLAIM_BATCH + 3);
+        assert_eq!(report.kept.len(), 1, "reported once, not once per pass");
+        assert_eq!(report.kept[0].path, foreign);
+        assert!(foreign.is_dir());
+        assert_eq!(fs::read_dir(&trash).unwrap().count(), 1);
     }
 
     #[test]

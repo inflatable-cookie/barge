@@ -1,0 +1,1 @@
+`sweep_trash` now claims each trash entry under the area lock and releases the lock before deleting the tree, so a recovery sweep no longer stalls `hold`/`try_hold` for the length of a large delete. A claim carries a `.barge-claim-` name and an exclusive lock on the folder it opened: a crash leaves it for the next sweep, and a live deletion cannot be walked twice.
