@@ -26,6 +26,8 @@ longhorn-storage-layout.workspace = true
 
 [dev-dependencies]
 barge = { workspace = true, features = ["testing"] }
+# Unlocks tauri::test (mock app and runtime) for the command-level tests below.
+tauri = { workspace = true, features = ["test"] }
 
 [lints]
 workspace = true

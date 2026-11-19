@@ -71,6 +71,7 @@ const api: AppApi = {
   openWindow: async () => {},
   quit: async () => {},
   machines: async () => machineFor[scenario] ?? [],
+  refreshMachines: async () => machineFor[scenario] ?? [],
   addMachine: async () => {}, pairMachine: async () => {}, removeMachine: async () => {},
   beginMachineAction: async () => machineFor[scenario] ?? [], machineAction: async () => {}, moonlight: async () => {},
 };

@@ -14,6 +14,7 @@ const api: AppApi = {
   openWindow: () => invoke("open_main_window"),
   quit: () => invoke("quit_app"),
   machines: () => invoke<MachineView[]>("machines_list"),
+  refreshMachines: () => invoke<MachineView[]>("machines_refresh"),
   addMachine: (input) => invoke("machines_add", { input }),
   pairMachine: (name, key) => invoke("machines_pair", { name, key }),
   removeMachine: (name) => invoke("machines_remove", { name }),

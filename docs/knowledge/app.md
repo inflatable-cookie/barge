@@ -240,9 +240,11 @@ Tauri Rust host (apps/barge-app/src-tauri)
   inside an action the operator started (pair, move apply), and is released
   when the action ends. The app holds no Barge locks or holds while idle.
 - **Refresh:**
-  - machine state is polled while the app runs, at the refresh interval
-    (default 10 s), every 2 s while a machine is waiting on an action, and once
-    on open;
+  - opening the window first shows what the registry names with the shared
+    observations (no network; a machine with no observation yet reads
+    Checking…), then polls once on open; while the app runs, machine state is
+    polled at the refresh interval (default 10 s), every 2 s while a machine
+    is waiting on an action;
   - the menu's local storage summary refreshes at the refresh interval; the
     Storage view reads on open and on Refresh;
   - survey sizes and doctor's binding checks run on request, never in the

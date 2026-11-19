@@ -9,8 +9,26 @@ use barge_machine::{Machine, PowerActionKind, Registry, UdpSender, DEFAULT_POWER
 #[derive(Default)]
 pub struct MachineState(pub Arc<Mutex<Observations>>);
 
+/// What the registry names, with the shared observations, without touching
+/// the network. The tray's poll thread fills the same observations, so the
+/// snapshot is usually current; a machine with no observation yet reads as
+/// Checking. The window shows this at once, then asks for a refresh.
 #[tauri::command]
 pub async fn machines_list(
+    state: tauri::State<'_, MachineState>,
+) -> Result<Vec<MachineView>, String> {
+    let observations = Arc::clone(&state.0);
+    super::blocking(move || {
+        machines::ensure_registered(&observations)?;
+        snapshot(&observations)
+    })
+    .await
+}
+
+/// Poll every daemon at once and return the machines as they now stand. One
+/// slow machine holds only its own poll, never the whole list.
+#[tauri::command]
+pub async fn machines_refresh(
     state: tauri::State<'_, MachineState>,
 ) -> Result<Vec<MachineView>, String> {
     let observations = Arc::clone(&state.0);
@@ -263,6 +281,45 @@ mod tests {
         // A cancel settles at once, and an unknown action is never recorded.
         assert_eq!(clicked("cancel", T0), None);
         assert_eq!(clicked("hibernate", T0), None);
+    }
+
+    #[test]
+    fn machines_list_returns_registered_machines_without_touching_the_network() {
+        use tauri::Manager;
+
+        // A daemon address nothing answers on: any poll would hang until the
+        // request timeout and record its failure, so a clean Checking
+        // snapshot proves the command never touched the network.
+        let temp = barge::testing::TempDir::new("app-machine-list").unwrap();
+        let state_dir = temp.child("state");
+        Registry::open(&state_dir)
+            .unwrap()
+            .add(Machine::new("pc", "192.0.2.1", "00:11:22:33:44:55").unwrap())
+            .unwrap();
+
+        let previous = std::env::var_os("BARGE_STATE_DIR");
+        std::env::set_var("BARGE_STATE_DIR", &state_dir);
+        let views = {
+            let app = tauri::test::mock_app();
+            app.manage(MachineState::default());
+            let state = app.state::<MachineState>();
+            tauri::async_runtime::block_on(machines_list(state))
+        };
+        match previous {
+            Some(value) => std::env::set_var("BARGE_STATE_DIR", value),
+            None => std::env::remove_var("BARGE_STATE_DIR"),
+        }
+
+        let views = views.unwrap();
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view.name, "pc");
+        assert!(!view.reachable);
+        // A poll would have recorded its failure here.
+        assert_eq!(view.error, None);
+        assert_eq!(view.seen_at_unix_ms, None);
+        assert_eq!(view.status.phase, crate::machine_state::Phase::Checking);
+        assert_eq!(view.status.offers, vec![crate::machine_state::Offer::Wake]);
     }
 
     #[test]

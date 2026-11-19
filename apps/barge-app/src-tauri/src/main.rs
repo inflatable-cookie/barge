@@ -73,6 +73,7 @@ fn run() -> tauri::Result<()> {
             commands::local::doctor_status,
             commands::local::open_moonlight,
             commands::machines::machines_list,
+            commands::machines::machines_refresh,
             commands::machines::machines_add,
             commands::machines::machines_pair,
             commands::machines::machines_remove,
