@@ -78,6 +78,7 @@ pub struct Input<'a> {
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Offline,
+    Checking,
     Waking,
     Awake,
     Pending,
@@ -213,6 +214,7 @@ pub fn completes(
 pub fn label(status: &Status, now_ms: u64) -> String {
     match status.phase {
         Phase::Offline => "Offline".into(),
+        Phase::Checking => "Checking…".into(),
         Phase::Waking => "Waking…".into(),
         Phase::Awake => "Awake".into(),
         Phase::Unknown => "Unknown".into(),
@@ -248,6 +250,11 @@ fn is_awake(observation: Option<&State>) -> bool {
 
 fn settled(input: &Input) -> Status {
     if !input.reachable {
+        // Never observed, and nothing sent: the registry names the machine but
+        // no poll has reported back yet. It offers Wake, which needs no daemon.
+        if input.observation.is_none() && input.last_action.is_none() {
+            return plain(Phase::Checking, vec![Offer::Wake], input);
+        }
         plain(Phase::Offline, vec![Offer::Wake], input)
     } else if is_awake(input.observation) {
         plain(Phase::Awake, AWAKE_OFFERS.to_vec(), input)
@@ -357,9 +364,11 @@ mod tests {
             seen_at_ms: None,
             last_action: None,
         });
-        assert_eq!(status.phase, Phase::Offline);
+        assert_eq!(status.phase, Phase::Checking);
         assert_eq!(status.offers, vec![Offer::Wake]);
         assert_eq!(status.last_seen_unix_ms, None);
+        assert_eq!(label(&status, T0), "Checking…");
+        assert!(!status.waiting);
     }
 
     #[test]
@@ -692,7 +701,7 @@ mod tests {
         }
         assert_eq!(
             phase(&status(&input(T0, false, None, None))),
-            Phase::Offline
+            Phase::Checking
         );
     }
 }

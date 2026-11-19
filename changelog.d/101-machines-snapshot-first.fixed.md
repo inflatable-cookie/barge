@@ -1,0 +1,1 @@
+The Machines view shows every registered machine at once from the registry snapshot, with a new Checking… state before the first observation, then refreshes by polling daemons; the empty state appears only when the registry really is empty.

@@ -13,6 +13,7 @@ export function countdownSeconds(deadline: number, now: number): number {
 export function stateLabel(status: MachineStatus, now: number): string {
   switch (status.phase) {
     case "offline": return "Offline";
+    case "checking": return "Checking…";
     case "waking": return "Waking…";
     case "awake": return "Awake";
     case "unknown": return "Unknown";

@@ -33,6 +33,8 @@ for visual design:
 - A pending power action can be cancelled until it fires.
 - An unreachable daemon is shown as Offline, never as asleep. State shown is
   what was observed; an unreachable machine also shows when Barge last saw it.
+  A registered machine no poll has reported back on yet is Checking…, never
+  an empty registry.
 - Wake works while the daemon is down, using the stored MAC and broadcast
   address.
 - Launching Moonlight against the PC is a convenience action in the UI.
@@ -47,6 +49,7 @@ sent. Each state shows what was observed and offers only the actions below.
 | State | Shown as | Offers |
 | --- | --- | --- |
 | Offline (unreachable, no recent action) | Offline | Wake |
+| Checking (registered, no observation yet) | Checking… | Wake |
 | Waking (Wake sent, not yet reachable) | Waking… | none |
 | Awake | Awake | Sleep, Restart…, Shut down…, Open Moonlight |
 | Pending (daemon reports a countdown) | Sleeping in 12 s (or Restarting, Shutting down) | Cancel |

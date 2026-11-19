@@ -23,11 +23,14 @@ function fixture(volumes: VolumeSummary[] = []): AppApi {
     openWindow: vi.fn().mockResolvedValue(undefined),
     quit: vi.fn().mockResolvedValue(undefined),
     machines: vi.fn().mockResolvedValue([]),
+    refreshMachines: vi.fn(),
     addMachine: vi.fn(), pairMachine: vi.fn(), removeMachine: vi.fn(), beginMachineAction: vi.fn(), machineAction: vi.fn(), moonlight: vi.fn(),
   };
   // A recorded click answers with the machines as they stand; a test that wants
-  // a different answer stubs it.
+  // a different answer stubs it. Polls delegate to the snapshot unless a test
+  // stubs the refresh itself.
   vi.mocked(api.beginMachineAction).mockImplementation(async () => api.machines());
+  vi.mocked(api.refreshMachines).mockImplementation(async () => api.machines());
   return api;
 }
 
@@ -184,6 +187,10 @@ describe("Machines", () => {
     reachable: false, error: "Connection timed out",
     status: status({ phase: "offline", offers: ["wake"], last_seen_unix_ms: now() - 720_000 }),
   });
+  const checking = () => machine({
+    reachable: false, error: null, seen_at_unix_ms: null,
+    status: status({ phase: "checking", offers: ["wake"] }),
+  });
   const waking = () => machine({
     reachable: false, error: "Connection timed out",
     status: status({ phase: "waking", waiting: true, last_seen_unix_ms: now() - 720_000 }),
@@ -238,6 +245,7 @@ describe("Machines", () => {
   });
 
   it.each([
+    ["checking", checking(), "Checking…", "Wake", ["Details…"]],
     ["offline", offline(), "Offline", "Wake", ["Details…"]],
     ["waking", waking(), "Waking…", "Waking…", ["Details…"]],
     ["awake", awake(), "Awake", "Sleep", AWAKE],
@@ -413,18 +421,49 @@ describe("Machines", () => {
   it("polls fast while a machine is waiting, then returns to the refresh interval", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const api = fixture();
-    vi.mocked(api.machines)
+    vi.mocked(api.machines).mockResolvedValue([waking()]);
+    vi.mocked(api.refreshMachines)
       .mockResolvedValueOnce([waking()])
       .mockResolvedValue([awake()]);
     render(App, { props: { api } });
     await vi.waitFor(() => expect(screen.getByText("Waking…")).toBeInTheDocument());
     await vi.advanceTimersByTimeAsync(2000);
     await vi.waitFor(() => expect(screen.getByText("Awake")).toBeInTheDocument());
-    const polls = vi.mocked(api.machines).mock.calls.length;
+    const polls = vi.mocked(api.refreshMachines).mock.calls.length;
     await vi.advanceTimersByTimeAsync(9000);
-    expect(api.machines).toHaveBeenCalledTimes(polls);
+    expect(api.refreshMachines).toHaveBeenCalledTimes(polls);
     await vi.advanceTimersByTimeAsync(1000);
-    expect(api.machines).toHaveBeenCalledTimes(polls + 1);
+    expect(api.refreshMachines).toHaveBeenCalledTimes(polls + 1);
+  });
+
+  it("shows the registered machines from the snapshot before the refresh lands", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([checking()]);
+    const refresh = deferred<MachineView[]>();
+    vi.mocked(api.refreshMachines).mockReturnValue(refresh.promise);
+    render(App, { props: { api } });
+    // The card shows from the local snapshot while the poll is still in flight.
+    const region = await card();
+    expect(within(region).getByText("Checking…")).toBeInTheDocument();
+    expect(within(region).getByRole("button", { name: "Wake" })).toBeEnabled();
+    expect(screen.queryByText(/No machines yet/)).not.toBeInTheDocument();
+    refresh.finish([offline()]);
+    expect(await within(region).findByText("Offline")).toBeInTheDocument();
+  });
+
+  it("never shows the empty state while the first snapshot is loading", async () => {
+    const api = fixture();
+    const snapshot = deferred<MachineView[]>();
+    vi.mocked(api.machines).mockReturnValue(snapshot.promise);
+    render(App, { props: { api } });
+    await waitFor(() => expect(api.machines).toHaveBeenCalled());
+    // Loading: neither cards nor the empty state.
+    expect(screen.queryByText(/No machines yet/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add machine" })).not.toBeInTheDocument();
+    snapshot.finish([]);
+    // An actually empty registry does show it.
+    expect(await screen.findByText(/No machines yet/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add machine" })).toBeInTheDocument();
   });
 
   it("shows a failed cancel and keeps the countdown visible", async () => {
@@ -441,7 +480,10 @@ describe("Machines", () => {
   it("clears a recovered refresh error without clearing a cancel failure", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const api = fixture();
-    vi.mocked(api.machines).mockRejectedValueOnce(new Error("registry unreadable")).mockResolvedValue([pendingSleep()]);
+    vi.mocked(api.machines).mockResolvedValue([pendingSleep()]);
+    vi.mocked(api.refreshMachines)
+      .mockRejectedValueOnce(new Error("registry unreadable"))
+      .mockImplementation(async () => api.machines());
     vi.mocked(api.machineAction).mockRejectedValue(new Error("cancel timeout"));
     render(App, { props: { api } });
     await vi.waitFor(() => expect(screen.getByText(/registry unreadable/)).toBeInTheDocument());

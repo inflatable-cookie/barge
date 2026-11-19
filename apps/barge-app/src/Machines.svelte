@@ -11,6 +11,8 @@
 
   let { api, refreshInterval }: { api: AppApi; refreshInterval: number } = $props();
   let machines = $state<MachineView[]>([]);
+  /** False until the first registry snapshot returns: never the empty state. */
+  let loaded = $state(false);
   let pollError = $state("");
   let error = $state("");
   let working = $state("");
@@ -35,8 +37,16 @@
   let timer: ReturnType<typeof setTimeout> | undefined;
   let mounted = true;
 
+  /** What the registry names, without touching the network: shows at once. */
+  async function snapshot() {
+    try { machines = await api.machines(); }
+    catch (reason) { pollError = `Could not read machines: ${describe(reason)}`; }
+    finally { loaded = true; }
+  }
+
+  /** Poll every daemon and show what it says; a slow one holds only itself. */
   async function refresh() {
-    try { machines = await api.machines(); pollError = ""; }
+    try { machines = await api.refreshMachines(); pollError = ""; }
     catch (reason) { pollError = `Could not read machines: ${describe(reason)}`; }
     schedule();
   }
@@ -129,7 +139,9 @@
   }
 
   onMount(() => {
-    void refresh();
+    // The snapshot is local and fast, so the registered machines show before
+    // the first poll lands; the refresh updates them when it does.
+    void snapshot().then(() => { if (mounted) void refresh(); });
     const clock = setInterval(() => now = Date.now(), 1000);
     return () => {
       mounted = false;
@@ -146,7 +158,9 @@
 {#if pollError}<Callout tone="danger" title="Machine refresh error" message={pollError} />{/if}
 {#if error}<Callout tone="danger" title="Machine error" message={error} />{/if}
 
-{#if machines.length === 0}
+{#if !loaded}
+  <!-- The registry has not answered yet: never the empty state. -->
+{:else if machines.length === 0}
   <div class="empty">
     <p>No machines yet. Add one to wake it and manage its power from here.</p>
     <Button onClick={openAdd}>Add machine</Button>

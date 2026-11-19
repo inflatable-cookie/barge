@@ -16,6 +16,8 @@ export interface AppApi {
   openWindow(): Promise<void>;
   quit(): Promise<void>;
   machines(): Promise<MachineView[]>;
+  /** Polls every daemon and returns the machines as they now stand. */
+  refreshMachines(): Promise<MachineView[]>;
   addMachine(input: NewMachine): Promise<void>;
   pairMachine(name: string, key: string): Promise<void>;
   removeMachine(name: string): Promise<void>;
@@ -30,6 +32,7 @@ export type PowerAction = "sleep" | "restart" | "shutdown";
 /** The states `machine_state.rs` returns; the window words them, the menu words them the same way. */
 export type Phase =
   | "offline"
+  | "checking"
   | "waking"
   | "awake"
   | "pending"

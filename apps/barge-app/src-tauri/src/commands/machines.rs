@@ -9,8 +9,26 @@ use barge_machine::{Machine, PowerActionKind, Registry, UdpSender, DEFAULT_POWER
 #[derive(Default)]
 pub struct MachineState(pub Arc<Mutex<Observations>>);
 
+/// What the registry names, with the shared observations, without touching
+/// the network. The tray's poll thread fills the same observations, so the
+/// snapshot is usually current; a machine with no observation yet reads as
+/// Checking. The window shows this at once, then asks for a refresh.
 #[tauri::command]
 pub async fn machines_list(
+    state: tauri::State<'_, MachineState>,
+) -> Result<Vec<MachineView>, String> {
+    let observations = Arc::clone(&state.0);
+    super::blocking(move || {
+        machines::ensure_registered(&observations)?;
+        snapshot(&observations)
+    })
+    .await
+}
+
+/// Poll every daemon at once and return the machines as they now stand. One
+/// slow machine holds only its own poll, never the whole list.
+#[tauri::command]
+pub async fn machines_refresh(
     state: tauri::State<'_, MachineState>,
 ) -> Result<Vec<MachineView>, String> {
     let observations = Arc::clone(&state.0);

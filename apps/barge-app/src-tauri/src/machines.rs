@@ -109,6 +109,26 @@ pub struct Observations {
 }
 
 impl Observations {
+    /// List what the registry names without touching the network, so the
+    /// window can show every registered machine at once. Entries keep their
+    /// last observation and action; a machine the tray has not polled yet
+    /// reads as Checking. A machine that is no longer registered drops out.
+    pub fn sync_registry(&mut self, machines: Vec<(Machine, bool)>) {
+        let mut previous = std::mem::take(&mut self.entries);
+        for (machine, lan) in machines {
+            let found = previous
+                .iter()
+                .position(|entry| entry.machine.name() == machine.name());
+            let mut entry = match found {
+                Some(index) => previous.swap_remove(index),
+                None => Entry::unseen(machine.clone(), lan),
+            };
+            entry.machine = machine;
+            entry.lan = lan;
+            self.entries.push(entry);
+        }
+    }
+
     /// Replace the machines with this poll's, keeping each one's last
     /// observation and action. A machine that is no longer registered drops out.
     pub fn apply(&mut self, polls: Vec<Poll>) {
@@ -225,6 +245,29 @@ pub fn client(
         Some(key) => Ok(barge_machine::DaemonClient::for_lan(machine, key)),
         None => Ok(barge_machine::DaemonClient::for_machine(machine)),
     }
+}
+
+/// List what the registry names without touching the network, so the window
+/// shows every registered machine at once. A refresh fills the observations.
+pub fn ensure_registered(observations: &Mutex<Observations>) -> Result<(), String> {
+    let registry = Registry::discover().map_err(|error| error.to_string())?;
+    ensure_registry(&registry, observations)
+}
+
+fn ensure_registry(registry: &Registry, observations: &Mutex<Observations>) -> Result<(), String> {
+    let machines = registry.list().map_err(|error| error.to_string())?;
+    let keyed = machines
+        .into_iter()
+        .map(|machine| {
+            let lan = matches!(registry.key(machine.name()), Ok(Some(_)));
+            (machine, lan)
+        })
+        .collect();
+    observations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .sync_registry(keyed);
+    Ok(())
 }
 
 /// Read every registered machine and record the results.
@@ -470,6 +513,55 @@ mod tests {
         let view = &observations.snapshot(T0 + 2_000)[0];
         assert_eq!(view.status.phase, machine_state::Phase::Awake);
         assert!(!view.status.waiting);
+    }
+
+    #[test]
+    fn sync_lists_registered_machines_without_touching_the_network() {
+        let temp = barge::testing::TempDir::new("app-machine-sync").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        // The daemon address is closed: any poll would fail, so a snapshot
+        // that answers proves no network was touched.
+        registry
+            .add(
+                Machine::new("pc", "127.0.0.1", "00:11:22:33:44:55")
+                    .unwrap()
+                    .with_daemon_port(1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let observations = Mutex::new(Observations::default());
+        ensure_registry(&registry, &observations).unwrap();
+        let view = &observations.lock().unwrap().snapshot(now_ms())[0];
+        assert_eq!(view.name, "pc");
+        assert_eq!(view.status.phase, machine_state::Phase::Checking);
+        assert_eq!(view.status.offers, vec![machine_state::Offer::Wake]);
+        assert_eq!(view.seen_at_unix_ms, None);
+    }
+
+    #[test]
+    fn sync_keeps_observations_and_drops_removed_machines() {
+        let temp = barge::testing::TempDir::new("app-machine-resync").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        registry.add(pc()).unwrap();
+        let observations = Mutex::new(Observations::default());
+        ensure_registry(&registry, &observations).unwrap();
+        observations
+            .lock()
+            .unwrap()
+            .apply(vec![poll(T0, Ok(awake(T0)))]);
+        assert_eq!(
+            observations.lock().unwrap().snapshot(T0)[0].status.phase,
+            machine_state::Phase::Awake
+        );
+        // A second sync keeps the observation; removing the machine drops it.
+        ensure_registry(&registry, &observations).unwrap();
+        assert_eq!(
+            observations.lock().unwrap().snapshot(T0)[0].status.phase,
+            machine_state::Phase::Awake
+        );
+        registry.remove("pc").unwrap();
+        ensure_registry(&registry, &observations).unwrap();
+        assert!(observations.lock().unwrap().snapshot(T0).is_empty());
     }
 
     #[test]
