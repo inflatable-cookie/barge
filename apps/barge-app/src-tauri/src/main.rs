@@ -1,7 +1,7 @@
 //! The Barge app's Tauri host.
 //!
 //! The renderer talks to typed commands; the host composes Barge's library, one
-//! preferences store and Longhorn's settings and notification surfaces.
+//! preferences store and Longhorn's settings surface.
 
 mod commands;
 mod machines;
@@ -19,14 +19,11 @@ fn main() {
     }
 }
 
-/// The menu-bar template icon: black with alpha, which macOS tints to match the
-/// menu bar. A 2x asset keeps it sharp on Retina.
-fn tray_icon(scale: f64) -> tauri::image::Image<'static> {
-    if scale >= 2.0 {
-        tauri::include_image!("icons/tray-template@2x.png")
-    } else {
-        tauri::include_image!("icons/tray-template.png")
-    }
+/// The menu-bar template icon: black with alpha, marked as a template so macOS
+/// tints it to match the menu bar. One 2x asset serves every display: macOS
+/// downscales it cleanly on 1x, so there is no per-display scale to track.
+fn tray_icon() -> tauri::image::Image<'static> {
+    tauri::include_image!("icons/tray-template@2x.png")
 }
 
 fn run() -> tauri::Result<()> {
@@ -52,12 +49,7 @@ fn run() -> tauri::Result<()> {
             ));
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            let scale = app
-                .primary_monitor()
-                .ok()
-                .flatten()
-                .map_or(1.0, |monitor| monitor.scale_factor());
-            tray::start(app.handle(), tray_icon(scale))?;
+            tray::start(app.handle(), tray_icon())?;
             // macOS can park the menu-bar item off-screen, so the window opens
             // on launch unless the operator turned that off.
             if show_window {

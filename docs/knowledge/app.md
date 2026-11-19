@@ -146,13 +146,21 @@ Tauri Rust host (apps/barge-app/src-tauri)
   - `longhorn-credential-keyring` if keys move to the Keychain (see
     [Keys](#keys)).
 
-  Rust crates are taken by git tag; TypeScript packages are pinned in
+  Rust crates are pinned by `rev` to an exact commit; TypeScript packages are pinned in
   `apps/barge-app/bun.lock`, which bun installs and the Effigy selectors use.
   The scaffold's renderer talks to its own typed commands, so it does not import
   Longhorn's TypeScript packages yet; they return when the Longhorn settings
   surface or agent control is rendered.
-- **The menu bar** uses Tauri's tray API. Longhorn has no menu-bar system
-  today.
+- **Preferences keep the full Longhorn shape now.** Four settings still go
+  through Longhorn's config store, settings registry and apply unit rather
+  than a plain JSON file, because the registry is already the second writer:
+  the settings surface and agent control render through it next, and the
+  store gives one atomic handle both writers share, with validation and a
+  rollback for the OS login item. A plain file would duplicate that under a
+  second authority and need replacing when the settings surface lands.
+- **The menu bar** uses Tauri's tray API with one template image: it is
+  marked `icon_as_template`, so macOS tints and scales it for any display.
+  Longhorn has no menu-bar system today.
 - **Poodle components,** a first mapping:
   - `SidebarNav` for the window's navigation (Machines, Storage, Activity,
     Settings);

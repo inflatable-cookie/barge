@@ -86,9 +86,9 @@ below read `_name`, `_key` and `_state`.
 
 A failing command writes `{"schema": "barge.error/1", "error": {"kind": "...",
 "message": "..."}}` to **stderr** in `--json` mode, and nothing to stdout. Human mode prints a plain error to stderr. `kind`
-is one of `refused`, `not_found`, `usage`, `io`, `unknown_state`. Exit codes:
-0 success, 1 refused or not found (nothing changed), 2 usage error, 3 internal
-error. `--json` precedes the command and selects the document form. `env` emits
+is one of `refused`, `not_found`, `usage`, `io`, `unknown_state`,
+`unsupported`. [Architecture](../architecture.md#cli) owns the exit codes each
+kind maps to. `--json` precedes the command and selects the document form. `env` emits
 shell assignments and refuses `--json`. A move or bind plan is read from a file
 or from standard input (`-`). The key for `machine pair` is read from standard
 input only. Input that cannot be read is `usage`.
