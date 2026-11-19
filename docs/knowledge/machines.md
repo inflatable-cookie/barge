@@ -31,11 +31,41 @@ for visual design:
 - Sleep starts a cancellable countdown, 15 seconds by default.
 - Restart and shutdown need explicit confirmation, then the same countdown.
 - A pending power action can be cancelled until it fires.
-- An unreachable daemon is shown as unreachable, never as asleep. State shown
-  is what was observed, with its age.
+- An unreachable daemon is shown as Offline, never as asleep. State shown is
+  what was observed; an unreachable machine also shows when Barge last saw it.
 - Wake works while the daemon is down, using the stored MAC and broadcast
   address.
 - Launching Moonlight against the PC is a convenience action in the UI.
+
+## States
+
+One state model, in the app's `machine_state.rs`, is shared by the window and
+the native menu. It is a pure function of the last observation, when Barge
+received it, whether the daemon answers now, and the last power action Barge
+sent. Each state shows what was observed and offers only the actions below.
+
+| State | Shown as | Offers |
+| --- | --- | --- |
+| Offline (unreachable, no recent action) | Offline | Wake |
+| Waking (Wake sent, not yet reachable) | Waking… | none |
+| Awake | Awake | Sleep, Restart…, Shut down…, Open Moonlight |
+| Pending (daemon reports a countdown) | Sleeping in 12 s (or Restarting, Shutting down) | Cancel |
+| Going down (fired, still reachable) | Going to sleep… / Shutting down… | none |
+| Restarting (restart fired) | Restarting… | none |
+| Didn't wake (a wake timed out) | Didn't wake | Wake |
+| Still on (a sleep, shutdown or restart timed out) | Still on | the awake set |
+
+- A waiting state ends at its target or its timeout, measured from when the
+  action was sent: Wake 120 s, Restart 180 s, sleep or shutdown 60 s. Restart
+  passes through unreachable and finishes when the daemon answers again.
+- A machine waiting on an action is polled every 2 s until the state settles,
+  then at the refresh interval.
+- A countdown's end is placed on the Mac's clock from the daemon's own
+  observation time, so a skewed PC clock does not move it.
+- Labels are worded the same in the window and the menu.
+
+Tom's feedback on 2026-11-19 is the reason: the menu showed every action all
+the time, and a wake returned to "unavailable" until the next poll.
 
 ## VM disks
 

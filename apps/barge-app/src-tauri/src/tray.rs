@@ -1,286 +1,262 @@
-//! Native tray menu; network reads and actions never run on the event loop.
+//! The native menu-bar item. Its contents come from [`menu_plan`]; this module
+//! applies the plan and runs polls and actions off the event loop.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::{
     commands::{
-        local,
+        local::{self, DoctorState},
         machines::{self, MachineState},
+        window,
     },
-    machines::MachineView,
+    machine_state::FAST_POLL_MS,
+    machines::now_ms,
+    menu_plan::{self, Entry, Storage},
     preferences::Store,
+    storage,
 };
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
-    AppHandle, Manager,
+    tray::TrayIcon,
+    AppHandle, Manager, Wry,
 };
 
+/// What the background loops last saw. The menu reads it each second.
 #[derive(Default)]
-struct Snapshot {
-    machines: Vec<MachineView>,
-    storage: String,
-    local_state: Option<(&'static str, u64)>,
+struct Shared {
+    storage: Storage,
     poll_error: String,
     action_error: String,
-    doctor_error: String,
-    doctor: Option<local::DoctorObservation>,
 }
 
-impl Snapshot {
-    fn record_poll(&mut self, result: Result<Vec<MachineView>, String>) {
-        match result {
-            Ok(machines) => {
-                self.machines = machines;
-                self.poll_error.clear();
-            }
-            Err(error) => self.poll_error = format!("Could not read machines: {error}"),
-        }
-    }
+type SharedState = Arc<Mutex<Shared>>;
+
+/// The menu as last built. It is rebuilt only when its items change; a
+/// countdown or a count of issues only updates the labels in place.
+#[derive(Default)]
+struct Rendered {
+    keys: Vec<String>,
+    items: HashMap<String, MenuItem<Wry>>,
 }
 
-type Shared = Arc<Mutex<Snapshot>>;
-
-struct Rows {
-    header: MenuItem<tauri::Wry>,
-    pending: MenuItem<tauri::Wry>,
-    wake: MenuItem<tauri::Wry>,
-    sleep: MenuItem<tauri::Wry>,
-    restart: MenuItem<tauri::Wry>,
-    shutdown: MenuItem<tauri::Wry>,
-    cancel: MenuItem<tauri::Wry>,
+fn refresh_interval(app: &AppHandle) -> u64 {
+    app.state::<Store>()
+        .get()
+        .map_or(10, |value| value.refresh_interval)
 }
 
-struct MenuRows {
-    names: Vec<String>,
-    menu: Menu<tauri::Wry>,
-    error_visible: bool,
-    storage: MenuItem<tauri::Wry>,
-    local_state: MenuItem<tauri::Wry>,
-    error: MenuItem<tauri::Wry>,
-    machines: Vec<Rows>,
+/// Joins the errors that should show in the menu's error row.
+pub fn error_text(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
-fn item(
-    app: &AppHandle,
-    id: &str,
-    label: &str,
-    enabled: bool,
-) -> tauri::Result<MenuItem<tauri::Wry>> {
-    MenuItem::with_id(app, id, label, enabled, None::<&str>)
-}
-
-fn build(app: &AppHandle, names: &[String]) -> tauri::Result<(Menu<tauri::Wry>, MenuRows)> {
-    let menu = Menu::new(app)?;
-    menu.append(&item(app, "local", "This Mac", false)?)?;
-    let local_state = item(app, "local-state", "Checking…", false)?;
-    menu.append(&local_state)?;
-    let storage = item(app, "storage", "Checking storage…", false)?;
-    menu.append(&storage)?;
-    let mut machines = Vec::new();
-    for name in names {
-        menu.append(&PredefinedMenuItem::separator(app)?)?;
-        let header = item(app, &format!("header:{name}"), name, false)?;
-        let pending = item(app, &format!("pending:{name}"), "No pending action", false)?;
-        let wake = item(app, &format!("wake:{name}"), "Wake", true)?;
-        let sleep = item(app, &format!("sleep:{name}"), "Sleep", false)?;
-        let restart = item(app, &format!("restart:{name}"), "Restart…", false)?;
-        let shutdown = item(app, &format!("shutdown:{name}"), "Shut down…", false)?;
-        let cancel = item(app, &format!("cancel:{name}"), "Cancel", false)?;
-        let moonlight = item(app, &format!("moonlight:{name}"), "Open Moonlight", true)?;
-        menu.append_items(&[
-            &header, &pending, &wake, &sleep, &restart, &shutdown, &cancel, &moonlight,
-        ])?;
-        machines.push(Rows {
-            header,
-            pending,
-            wake,
-            sleep,
-            restart,
-            shutdown,
-            cancel,
-        });
-    }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    let error = item(app, "error", "", false)?;
-    menu.append_items(&[
-        &item(app, "refresh", "Refresh", true)?,
-        &item(app, "open", "Open Barge", true)?,
-        &item(app, "settings", "Settings…", true)?,
-        &item(app, "quit", "Quit", true)?,
-    ])?;
-    Ok((
-        menu.clone(),
-        MenuRows {
-            menu,
-            error_visible: false,
-            names: names.to_vec(),
-            storage,
-            local_state,
-            error,
-            machines,
-        },
-    ))
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |value| value.as_millis().try_into().unwrap_or(u64::MAX))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct MachinePresentation {
-    header: String,
-    pending: String,
-    wake: bool,
-    power: bool,
-    cancel: bool,
-}
-
-fn present(machine: &MachineView, now: u64) -> MachinePresentation {
-    let observation = machine.observation.as_ref();
-    let pending = observation.and_then(|value| value.pending);
-    let state = if !machine.reachable {
-        "unreachable"
-    } else if observation.is_some_and(|value| value.power == barge_machine::PowerState::Awake) {
-        "awake"
-    } else if observation.is_some_and(|value| value.power == barge_machine::PowerState::Asleep) {
-        "asleep"
-    } else {
-        "unknown"
-    };
-    let age = observation
-        .map(|value| {
-            format!(
-                ", {} s ago",
-                now.saturating_sub(value.observed_at_unix_ms) / 1000
-            )
+pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Result<()> {
+    let shared: SharedState = SharedState::default();
+    let click_shared = shared.clone();
+    let tray = tauri::tray::TrayIconBuilder::new()
+        .icon(icon)
+        .icon_as_template(true)
+        .tooltip("Barge")
+        .show_menu_on_left_click(true)
+        .on_menu_event(move |app, event| {
+            handle(app, event.id().as_ref(), &click_shared);
         })
-        .unwrap_or_default();
-    let text = pending
-        .map(|value| {
-            let verb = match value.action {
-                barge_machine::PowerActionKind::Sleep => "Sleeping",
-                barge_machine::PowerActionKind::Restart => "Restarting",
-                barge_machine::PowerActionKind::Shutdown => "Shutting down",
-            };
-            format!(
-                "{verb} in {} s",
-                value.deadline_unix_ms.saturating_sub(now).div_ceil(1000)
-            )
-        })
-        .unwrap_or_else(|| "No pending action".into());
-    MachinePresentation {
-        header: format!("{} · {state}{age}", machine.name),
-        pending: text,
-        wake: pending.is_none(),
-        power: machine.reachable && state == "awake" && pending.is_none(),
-        cancel: machine.reachable && pending.is_some(),
-    }
-}
+        .build(app)?;
 
-fn update(rows: &mut MenuRows, snapshot: &Snapshot, now: u64) {
-    let doctor = doctor_line(snapshot.doctor, now);
-    let _ = rows
-        .storage
-        .set_text(format!("{} · {doctor}", snapshot.storage));
-    let _ = rows
-        .local_state
-        .set_text(local_state_line(snapshot.local_state, now));
-    let error = error_line(snapshot);
-    if !error.is_empty() && !rows.error_visible {
-        if let Ok(items) = rows.menu.items() {
-            if rows
-                .menu
-                .insert(&rows.error, items.len().saturating_sub(4))
-                .is_ok()
-            {
-                rows.error_visible = true;
-            }
+    let storage_app = app.clone();
+    let storage_shared = shared.clone();
+    std::thread::spawn(move || loop {
+        let storage = read_storage();
+        if let Ok(mut state) = storage_shared.lock() {
+            state.storage = storage;
         }
-    } else if error.is_empty() && rows.error_visible && rows.menu.remove(&rows.error).is_ok() {
-        rows.error_visible = false;
-    }
-    if rows.error_visible {
-        let _ = rows.error.set_text(error);
-    }
-    for (row, machine) in rows.machines.iter().zip(&snapshot.machines) {
-        let value = present(machine, now);
-        let _ = row.header.set_text(value.header);
-        let _ = row.pending.set_text(value.pending);
-        let _ = row.wake.set_enabled(value.wake);
-        let _ = row.sleep.set_enabled(value.power);
-        let _ = row.restart.set_enabled(value.power);
-        let _ = row.shutdown.set_enabled(value.power);
-        let _ = row.cancel.set_enabled(value.cancel);
-    }
-}
+        std::thread::sleep(Duration::from_secs(refresh_interval(&storage_app)));
+    });
 
-fn doctor_line(observation: Option<local::DoctorObservation>, now: u64) -> String {
-    observation.map_or_else(
-        || "doctor not checked".to_owned(),
-        |record| {
-            let status = if record.findings == 0 {
-                "doctor OK".to_owned()
+    let poll_app = app.clone();
+    let poll_shared = shared.clone();
+    std::thread::spawn(move || {
+        let observations = poll_app.state::<MachineState>().0.clone();
+        loop {
+            let result = crate::machines::refresh(&observations);
+            if let Ok(mut state) = poll_shared.lock() {
+                state.poll_error = result.err().map_or_else(String::new, |error| {
+                    format!("Could not read machines: {error}")
+                });
+            }
+            let waiting = observations
+                .lock()
+                .is_ok_and(|store| store.any_waiting(now_ms()));
+            let interval = if waiting {
+                Duration::from_millis(FAST_POLL_MS)
             } else {
-                format!("{} findings", record.findings)
+                Duration::from_secs(refresh_interval(&poll_app))
             };
-            format!(
-                "{status}, {} s ago",
-                now.saturating_sub(record.observed_at_unix_ms) / 1000
-            )
-        },
-    )
+            std::thread::sleep(interval);
+        }
+    });
+
+    let render_app = app.clone();
+    std::thread::spawn(move || {
+        let mut rendered = Rendered::default();
+        loop {
+            let entries = plan(&render_app, &shared);
+            if let Err(error) = render(&render_app, &tray, &mut rendered, &entries) {
+                eprintln!("Barge could not update its menu: {error}");
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+    Ok(())
 }
 
-fn error_line(snapshot: &Snapshot) -> String {
-    [
-        snapshot.poll_error.as_str(),
-        snapshot.action_error.as_str(),
-        snapshot.doctor_error.as_str(),
-    ]
-    .into_iter()
-    .filter(|value| !value.is_empty())
-    .collect::<Vec<_>>()
-    .join(" · ")
+fn read_storage() -> Storage {
+    barge::Barge::open_read_only()
+        .map_err(|error| error.to_string())
+        .and_then(|account| storage::volumes(&account).map_err(|error| error.to_string()))
+        .map_or_else(Storage::Unavailable, Storage::Volumes)
 }
 
-fn local_state_line(state: Option<(&str, u64)>, now: u64) -> String {
-    state.map_or_else(
-        || "Checking…".into(),
-        |(state, observed)| {
-            format!(
-                "{} · {} s ago",
-                if state == "awake" { "Awake" } else { "Unknown" },
-                now.saturating_sub(observed) / 1000
-            )
-        },
-    )
-}
-
-fn storage_summary(local: &local::LocalMachine) -> String {
-    if let Some(error) = &local.storage_error {
-        return format!("Storage unavailable: {error}");
-    }
-    let volumes = if local.volumes.is_empty() {
-        "No volumes registered".to_owned()
-    } else {
-        local
-            .volumes
-            .iter()
-            .map(|volume| match volume.free_bytes {
-                Some(bytes) => format!(
-                    "{}: {:.1} GiB free",
-                    volume.name,
-                    bytes as f64 / 1024_f64.powi(3)
-                ),
-                None => format!("{}: {:?}", volume.name, volume.presence),
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+/// The menu as it stands now: machines are read at the current time, so a
+/// countdown or a timeout moves without waiting for the next poll.
+fn plan(app: &AppHandle, shared: &SharedState) -> Vec<Entry> {
+    let now = now_ms();
+    let (storage, poll_error, action_error) = match shared.lock() {
+        Ok(state) => (
+            state.storage.clone(),
+            state.poll_error.clone(),
+            state.action_error.clone(),
+        ),
+        Err(_) => (Storage::Checking, String::new(), String::new()),
     };
-    volumes
+    let doctor = app
+        .state::<DoctorState>()
+        .0
+        .lock()
+        .ok()
+        .map(|status| status.clone());
+    let findings = doctor
+        .as_ref()
+        .and_then(|status| status.observation.map(|value| value.findings));
+    let doctor_error = doctor
+        .and_then(|status| status.error)
+        .map(|error| format!("Doctor: {error}"))
+        .unwrap_or_default();
+    let machines = app
+        .state::<MachineState>()
+        .0
+        .lock()
+        .map(|store| store.snapshot(now))
+        .unwrap_or_default();
+    let error = error_text(&[
+        poll_error.as_str(),
+        action_error.as_str(),
+        doctor_error.as_str(),
+    ]);
+    menu_plan::plan(&menu_plan::Input {
+        storage: &storage,
+        findings,
+        machines: &machines,
+        error: &error,
+        now_ms: now,
+    })
+}
+
+fn render(
+    app: &AppHandle,
+    tray: &TrayIcon,
+    rendered: &mut Rendered,
+    entries: &[Entry],
+) -> tauri::Result<()> {
+    let keys: Vec<String> = entries
+        .iter()
+        .map(|entry| match entry {
+            Entry::Item(item) => item.id.clone(),
+            Entry::Separator => "-".into(),
+        })
+        .collect();
+    if rendered.keys == keys {
+        for entry in entries {
+            if let Entry::Item(item) = entry {
+                if let Some(menu_item) = rendered.items.get(&item.id) {
+                    menu_item.set_text(&item.label)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+    let menu = Menu::new(app)?;
+    let mut items = HashMap::new();
+    for entry in entries {
+        match entry {
+            Entry::Separator => menu.append(&PredefinedMenuItem::separator(app)?)?,
+            Entry::Item(item) => {
+                let menu_item =
+                    MenuItem::with_id(app, &item.id, &item.label, item.enabled, None::<&str>)?;
+                menu.append(&menu_item)?;
+                items.insert(item.id.clone(), menu_item);
+            }
+        }
+    }
+    tray.set_menu(Some(menu))?;
+    *rendered = Rendered { keys, items };
+    Ok(())
+}
+
+fn handle(app: &AppHandle, id: &str, shared: &SharedState) {
+    match id {
+        "quit" => app.exit(0),
+        "open" => show_view(app, None),
+        "settings" => show_view(app, Some("settings")),
+        "storage" => show_view(app, Some("storage")),
+        _ if id.starts_with("storage:") => show_view(app, Some("storage")),
+        _ => {
+            if let Some((action, name)) = id.split_once(':') {
+                run_action(app, action, name, shared);
+            }
+        }
+    }
+}
+
+fn show_view(app: &AppHandle, view: Option<&'static str>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = window::show(&app, view);
+    });
+}
+
+fn run_action(app: &AppHandle, action: &str, name: &str, shared: &SharedState) {
+    let app = app.clone();
+    let action = action.to_owned();
+    let name = name.to_owned();
+    let shared = shared.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let label = match action.as_str() {
+            "restart" => Some("Restart"),
+            "shutdown" => Some("Shut down"),
+            _ => None,
+        };
+        if label.is_some_and(|label| !confirm(&name, label)) {
+            return;
+        }
+        let result = if action == "moonlight" {
+            local::launch_moonlight()
+        } else {
+            machines::action(&app.state::<MachineState>().0, &name, &action)
+        };
+        if let Ok(mut state) = shared.lock() {
+            state.action_error = result
+                .err()
+                .map_or_else(String::new, |error| format!("{name}: {error}"));
+        }
+    });
 }
 
 fn confirm(name: &str, operation: &str) -> bool {
@@ -292,261 +268,13 @@ fn confirm(name: &str, operation: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Result<()> {
-    let shared: Shared = Arc::default();
-    let (menu, mut rows) = build(app, &[])?;
-    let events = shared.clone();
-    let tray = tauri::tray::TrayIconBuilder::new()
-        .icon(icon)
-        .icon_as_template(true)
-        .tooltip("Barge")
-        .menu(&menu)
-        .show_menu_on_left_click(true)
-        .on_menu_event(move |app, event| {
-            let id = event.id().as_ref();
-            match id {
-                "quit" => app.exit(0),
-                "refresh" => {
-                    let app = app.clone();
-                    let events = events.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        let result = local::refresh_doctor(&app.state::<local::DoctorState>());
-                        if let Ok(mut snapshot) = events.lock() {
-                            snapshot.doctor_error = result
-                                .err()
-                                .map_or_else(String::new, |error| format!("Doctor: {error}"));
-                        }
-                    });
-                }
-                "open" | "settings" => {
-                    let app = app.clone();
-                    let settings = id == "settings";
-                    tauri::async_runtime::spawn_blocking(move || {
-                        let _ = if settings {
-                            crate::commands::window::show_settings(&app)
-                        } else {
-                            crate::commands::window::show_main(&app)
-                        };
-                    });
-                }
-                _ => {
-                    if let Some((action, name)) = id.split_once(':') {
-                        let action = action.to_owned();
-                        let name = name.to_owned();
-                        let events = events.clone();
-                        tauri::async_runtime::spawn_blocking(move || {
-                            if matches!(action.as_str(), "restart" | "shutdown")
-                                && !confirm(
-                                    &name,
-                                    if action == "restart" {
-                                        "Restart"
-                                    } else {
-                                        "Shut down"
-                                    },
-                                )
-                            {
-                                return;
-                            }
-                            let result = if action == "moonlight" {
-                                std::process::Command::new("open")
-                                    .args(["-a", "Moonlight"])
-                                    .status()
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|status| {
-                                        if status.success() {
-                                            Ok(())
-                                        } else {
-                                            Err("Could not open Moonlight".into())
-                                        }
-                                    })
-                            } else {
-                                machines::action(&name, &action)
-                            };
-                            if let Ok(mut snapshot) = events.lock() {
-                                snapshot.action_error = result
-                                    .err()
-                                    .map_or_else(String::new, |error| format!("{name}: {error}"));
-                            }
-                        });
-                    }
-                }
-            }
-        })
-        .build(app)?;
-    let local_app = app.clone();
-    let local_shared = shared.clone();
-    std::thread::spawn(move || loop {
-        let local = local::local_machine();
-        let storage = storage_summary(&local);
-        if let Ok(mut snapshot) = local_shared.lock() {
-            snapshot.storage = storage;
-            snapshot.local_state = Some((local.state, local.observed_at_unix_ms));
-        }
-        let interval = local_app
-            .state::<Store>()
-            .get()
-            .map_or(10, |value| value.refresh_interval);
-        std::thread::sleep(Duration::from_secs(interval));
-    });
-    let poll_app = app.clone();
-    let poll_shared = shared.clone();
-    std::thread::spawn(move || loop {
-        let observations = poll_app.state::<MachineState>().0.clone();
-        let result = machines::poll(&observations);
-        if let Ok(mut snapshot) = poll_shared.lock() {
-            snapshot.record_poll(result);
-        }
-        let interval = poll_app
-            .state::<Store>()
-            .get()
-            .map_or(10, |value| value.refresh_interval);
-        std::thread::sleep(Duration::from_secs(interval));
-    });
-    let app = app.clone();
-    std::thread::spawn(move || loop {
-        if let Ok(mut snapshot) = shared.lock() {
-            if let Ok(doctor) = app.state::<local::DoctorState>().0.lock() {
-                snapshot.doctor = doctor.observation;
-                snapshot.doctor_error = doctor
-                    .error
-                    .as_ref()
-                    .map_or_else(String::new, |error| format!("Doctor: {error}"));
-            }
-            let names: Vec<_> = snapshot
-                .machines
-                .iter()
-                .map(|machine| machine.name.clone())
-                .collect();
-            if needs_rebuild(&rows.names, &names) {
-                if let Ok((menu, replacement)) = build(&app, &names) {
-                    if tray.set_menu(Some(menu)).is_ok() {
-                        rows = replacement;
-                    }
-                }
-            }
-            update(&mut rows, &snapshot, now_ms());
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    });
-    Ok(())
-}
-
-fn needs_rebuild(current: &[String], next: &[String]) -> bool {
-    current != next
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        doctor_line, error_line, local_state_line, needs_rebuild, present, storage_summary,
-        Snapshot,
-    };
-    use crate::machines::MachineView;
-    use barge_machine::{Pending, PowerActionKind, PowerState, State};
+    use super::error_text;
 
     #[test]
-    fn state_changes_keep_existing_items_and_registry_changes_rebuild() {
-        let current = vec!["pc".to_owned()];
-        assert!(!needs_rebuild(&current, &["pc".to_owned()]));
-        assert!(needs_rebuild(
-            &current,
-            &["pc".to_owned(), "other".to_owned()]
-        ));
-        assert!(needs_rebuild(&current, &[]));
-    }
-    #[test]
-    fn same_machine_updates_its_menu_presentation_without_rebuild() {
-        let names = vec!["pc".to_owned()];
-        let mut machine = MachineView {
-            name: "pc".into(),
-            hostname: "pc.local".into(),
-            mac: "00:11:22:33:44:55".into(),
-            mode: "lan",
-            address: "pc.local".into(),
-            reachable: true,
-            observation: Some(State::new(PowerState::Awake, 1_000)),
-            error: None,
-        };
-        let awake = present(&machine, 2_000);
-        assert_eq!(awake.header, "pc · awake, 1 s ago");
-        assert!(awake.power);
-        machine.observation.as_mut().unwrap().pending = Some(Pending {
-            action: PowerActionKind::Sleep,
-            deadline_unix_ms: 14_000,
-        });
-        let pending = present(&machine, 2_000);
-        assert!(!needs_rebuild(&names, &[machine.name.clone()]));
-        assert_eq!(pending.pending, "Sleeping in 12 s");
-        assert!(pending.cancel);
-        assert!(!pending.power);
-        machine.reachable = false;
-        let offline = present(&machine, 3_000);
-        assert!(offline.header.contains("unreachable"));
-        assert!(!offline.cancel);
-        assert_eq!(offline.pending, "Sleeping in 11 s");
-    }
-    #[test]
-    fn recovered_poll_clears_only_poll_error() {
-        let mut snapshot = Snapshot {
-            action_error: "Cancel could not be confirmed".into(),
-            ..Snapshot::default()
-        };
-        snapshot.record_poll(Err("offline".into()));
-        assert!(snapshot.poll_error.contains("offline"));
-        snapshot.record_poll(Ok(Vec::new()));
-        assert!(snapshot.poll_error.is_empty());
-        assert_eq!(snapshot.action_error, "Cancel could not be confirmed");
-    }
-    #[test]
-    fn local_state_and_storage_follow_fresh_observations() {
-        let mut local = crate::commands::local::LocalMachine {
-            name: "Mac".into(),
-            state: "awake",
-            observed_at_unix_ms: 1_000,
-            model: None,
-            uptime_seconds: Some(5),
-            volumes: vec![],
-            doctor_findings: Some(0),
-            doctor_observed_at_unix_ms: Some(1_000),
-            doctor_error: None,
-            storage_error: None,
-        };
-        assert_eq!(
-            local_state_line(Some((local.state, local.observed_at_unix_ms)), 3_000),
-            "Awake · 2 s ago"
-        );
-        assert_eq!(storage_summary(&local), "No volumes registered");
-        local.state = "unknown";
-        local.volumes.push(crate::storage::VolumeSummary {
-            name: "Builds".into(),
-            presence: crate::storage::Presence::Absent,
-            free_bytes: None,
-        });
-        assert_eq!(
-            local_state_line(Some((local.state, 3_000)), 3_000),
-            "Unknown · 0 s ago"
-        );
-        assert_eq!(storage_summary(&local), "Builds: Absent");
-    }
-
-    #[test]
-    fn doctor_line_and_errors_follow_cached_status() {
-        assert_eq!(doctor_line(None, 10_000), "doctor not checked");
-        let mut observation = crate::commands::local::DoctorObservation {
-            findings: 0,
-            observed_at_unix_ms: 1_000,
-        };
-        assert_eq!(doctor_line(Some(observation), 10_000), "doctor OK, 9 s ago");
-        observation.findings = 2;
-        assert_eq!(
-            doctor_line(Some(observation), 10_000),
-            "2 findings, 9 s ago"
-        );
-        let mut snapshot = Snapshot::default();
-        assert!(error_line(&snapshot).is_empty());
-        snapshot.doctor_error = "Doctor: unreadable".into();
-        assert_eq!(error_line(&snapshot), "Doctor: unreadable");
-        snapshot.doctor_error.clear();
-        assert!(error_line(&snapshot).is_empty());
+    fn error_row_joins_only_the_errors_that_exist() {
+        assert_eq!(error_text(&["", "", ""]), "");
+        assert_eq!(error_text(&["poll", "", "doctor"]), "poll · doctor");
     }
 }

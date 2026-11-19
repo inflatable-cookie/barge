@@ -4,7 +4,9 @@
 //! preferences store and Longhorn's settings surface.
 
 mod commands;
+mod machine_state;
 mod machines;
+mod menu_plan;
 mod preferences;
 mod settings;
 mod storage;
@@ -68,7 +70,6 @@ fn run() -> tauri::Result<()> {
             let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
-            commands::local::local_machine_info,
             commands::local::doctor_status,
             commands::local::open_moonlight,
             commands::machines::machines_list,

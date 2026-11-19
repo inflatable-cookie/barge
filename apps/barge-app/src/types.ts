@@ -16,7 +16,6 @@ export interface AppApi {
   openWindow(): Promise<void>;
   quit(): Promise<void>;
   machines(): Promise<MachineView[]>;
-  localMachine(): Promise<LocalMachine>;
   addMachine(input: NewMachine): Promise<void>;
   pairMachine(name: string, key: string): Promise<void>;
   removeMachine(name: string): Promise<void>;
@@ -26,18 +25,34 @@ export interface AppApi {
 
 export interface DoctorStatus { observation: { findings: number; observed_at_unix_ms: number } | null; error: string | null }
 export type PowerAction = "sleep" | "restart" | "shutdown";
-export interface Observation {
-  power: "awake" | "asleep" | "unknown";
-  observed_at_unix_ms: number;
-  pending?: { action: PowerAction; deadline_unix_ms: number } | null;
+/** The states `machine_state.rs` returns; the window words them, the menu words them the same way. */
+export type Phase =
+  | "offline"
+  | "waking"
+  | "awake"
+  | "pending"
+  | "going_down"
+  | "restarting"
+  | "did_not_wake"
+  | "still_on"
+  | "unknown";
+/** The actions a state offers. Anything not listed is not offered at all. */
+export type Offer = "wake" | "sleep" | "restart" | "shutdown" | "cancel" | "moonlight";
+export interface MachineStatus {
+  phase: Phase;
+  action: PowerAction | null;
+  /** A countdown's end, on this Mac's clock. */
+  deadline_unix_ms: number | null;
+  /** When Barge last saw the machine; set only while it is unreachable. */
+  last_seen_unix_ms: number | null;
+  offers: Offer[];
+  /** Whether Barge polls this machine fast until the state settles. */
+  waiting: boolean;
 }
 export interface MachineView {
   name: string; hostname: string; mac: string; mode: "lan" | "tailscale";
-  address: string; reachable: boolean; observation: Observation | null; error: string | null;
-}
-export interface LocalMachine {
-  name: string; state: "awake" | "unknown"; observed_at_unix_ms: number; model: string | null; uptime_seconds: number | null;
-  volumes: VolumeSummary[]; doctor_findings: number | null; doctor_observed_at_unix_ms?: number | null; doctor_error?: string | null; storage_error: string | null;
+  address: string; daemon_port: number; reachable: boolean; error: string | null;
+  seen_at_unix_ms: number | null; status: MachineStatus;
 }
 export interface NewMachine {
   name: string; hostname: string; mac: string; tailscale_name: string | null; key: string | null;
