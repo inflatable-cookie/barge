@@ -8,24 +8,50 @@ pub struct DoctorObservation {
     pub findings: usize,
     pub observed_at_unix_ms: u64,
 }
+#[derive(Default, Clone)]
+pub struct DoctorStatus {
+    pub observation: Option<DoctorObservation>,
+    pub error: Option<String>,
+}
 #[derive(Default)]
-pub struct DoctorState(pub Arc<Mutex<Option<DoctorObservation>>>);
+pub struct DoctorState(pub Arc<Mutex<DoctorStatus>>);
 
 pub fn refresh_doctor(state: &DoctorState) -> Result<(), String> {
-    let account = barge::Barge::open_read_only().map_err(|error| error.to_string())?;
-    refresh_doctor_in(&account, state)
+    let result = barge::Barge::open_read_only()
+        .map_err(|error| error.to_string())
+        .and_then(|account| doctor_in(&account));
+    state.record(result)
 }
 
-fn refresh_doctor_in(account: &barge::Barge, state: &DoctorState) -> Result<(), String> {
+fn doctor_in(account: &barge::Barge) -> Result<DoctorObservation, String> {
     let report = account.doctor().map_err(|error| error.to_string())?;
     let observed_at_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |value| value.as_millis().try_into().unwrap_or(u64::MAX));
-    *state.0.lock().map_err(|error| error.to_string())? = Some(DoctorObservation {
+    Ok(DoctorObservation {
         findings: report.problems(),
         observed_at_unix_ms,
-    });
-    Ok(())
+    })
+}
+
+impl DoctorState {
+    fn record(&self, result: Result<DoctorObservation, String>) -> Result<(), String> {
+        let mut status = self.0.lock().map_err(|error| error.to_string())?;
+        match result {
+            Ok(observation) => {
+                status.observation = Some(observation);
+                status.error = None;
+                Ok(())
+            }
+            Err(error) => {
+                status.error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+    pub fn refresh_in(&self, account: &barge::Barge) -> Result<(), String> {
+        self.record(doctor_in(account))
+    }
 }
 
 #[derive(Serialize)]
@@ -130,7 +156,7 @@ pub async fn local_machine_info(
     let cache = doctor.0.clone();
     super::blocking(move || {
         let mut local = local_machine();
-        if let Some(observation) = *cache.lock().map_err(|error| error.to_string())? {
+        if let Some(observation) = cache.lock().map_err(|error| error.to_string())?.observation {
             local.doctor_findings = Some(observation.findings);
             local.doctor_observed_at_unix_ms = Some(observation.observed_at_unix_ms);
         }
@@ -193,9 +219,9 @@ mod tests {
         let doctor = DoctorState::default();
         let local = local_from_account("Mac".into(), None, Some(1), Ok(&account));
         assert!(local.doctor_findings.is_none());
-        assert!(doctor.0.lock().unwrap().is_none());
-        refresh_doctor_in(&account, &doctor).unwrap();
-        assert_eq!(doctor.0.lock().unwrap().as_ref().unwrap().findings, 0);
+        assert!(doctor.0.lock().unwrap().observation.is_none());
+        doctor.refresh_in(&account).unwrap();
+        assert_eq!(doctor.0.lock().unwrap().observation.unwrap().findings, 0);
         assert!(!state_dir.exists());
     }
 }

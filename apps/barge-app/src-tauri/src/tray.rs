@@ -181,35 +181,14 @@ fn present(machine: &MachineView, now: u64) -> MachinePresentation {
 }
 
 fn update(rows: &mut MenuRows, snapshot: &Snapshot, now: u64) {
-    let doctor = snapshot.doctor.map_or_else(
-        || "doctor not checked".to_owned(),
-        |record| {
-            let status = if record.findings == 0 {
-                "doctor OK".to_owned()
-            } else {
-                format!("{} findings", record.findings)
-            };
-            format!(
-                "{status}, {} s ago",
-                now.saturating_sub(record.observed_at_unix_ms) / 1000
-            )
-        },
-    );
+    let doctor = doctor_line(snapshot.doctor, now);
     let _ = rows
         .storage
         .set_text(format!("{} · {doctor}", snapshot.storage));
     let _ = rows
         .local_state
         .set_text(local_state_line(snapshot.local_state, now));
-    let error = [
-        snapshot.poll_error.as_str(),
-        snapshot.action_error.as_str(),
-        snapshot.doctor_error.as_str(),
-    ]
-    .into_iter()
-    .filter(|value| !value.is_empty())
-    .collect::<Vec<_>>()
-    .join(" · ");
+    let error = error_line(snapshot);
     if !error.is_empty() && !rows.error_visible {
         if let Ok(items) = rows.menu.items() {
             if rows
@@ -236,6 +215,35 @@ fn update(rows: &mut MenuRows, snapshot: &Snapshot, now: u64) {
         let _ = row.shutdown.set_enabled(value.power);
         let _ = row.cancel.set_enabled(value.cancel);
     }
+}
+
+fn doctor_line(observation: Option<local::DoctorObservation>, now: u64) -> String {
+    observation.map_or_else(
+        || "doctor not checked".to_owned(),
+        |record| {
+            let status = if record.findings == 0 {
+                "doctor OK".to_owned()
+            } else {
+                format!("{} findings", record.findings)
+            };
+            format!(
+                "{status}, {} s ago",
+                now.saturating_sub(record.observed_at_unix_ms) / 1000
+            )
+        },
+    )
+}
+
+fn error_line(snapshot: &Snapshot) -> String {
+    [
+        snapshot.poll_error.as_str(),
+        snapshot.action_error.as_str(),
+        snapshot.doctor_error.as_str(),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 fn local_state_line(state: Option<(&str, u64)>, now: u64) -> String {
@@ -398,7 +406,11 @@ pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Resu
     std::thread::spawn(move || loop {
         if let Ok(mut snapshot) = shared.lock() {
             if let Ok(doctor) = app.state::<local::DoctorState>().0.lock() {
-                snapshot.doctor = *doctor;
+                snapshot.doctor = doctor.observation;
+                snapshot.doctor_error = doctor
+                    .error
+                    .as_ref()
+                    .map_or_else(String::new, |error| format!("Doctor: {error}"));
             }
             let names: Vec<_> = snapshot
                 .machines
@@ -425,7 +437,10 @@ fn needs_rebuild(current: &[String], next: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_state_line, needs_rebuild, present, storage_summary, Snapshot};
+    use super::{
+        doctor_line, error_line, local_state_line, needs_rebuild, present, storage_summary,
+        Snapshot,
+    };
     use crate::machines::MachineView;
     use barge_machine::{Pending, PowerActionKind, PowerState, State};
 
@@ -501,11 +516,36 @@ mod tests {
         );
         assert_eq!(storage_summary(&local), "No volumes registered");
         local.state = "unknown";
-        local.doctor_findings = Some(2);
+        local.volumes.push(crate::storage::VolumeSummary {
+            name: "Builds".into(),
+            presence: crate::storage::Presence::Absent,
+            free_bytes: None,
+        });
         assert_eq!(
             local_state_line(Some((local.state, 3_000)), 3_000),
             "Unknown · 0 s ago"
         );
-        assert_eq!(storage_summary(&local), "No volumes registered");
+        assert_eq!(storage_summary(&local), "Builds: Absent");
+    }
+
+    #[test]
+    fn doctor_line_and_errors_follow_cached_status() {
+        assert_eq!(doctor_line(None, 10_000), "doctor not checked");
+        let mut observation = crate::commands::local::DoctorObservation {
+            findings: 0,
+            observed_at_unix_ms: 1_000,
+        };
+        assert_eq!(doctor_line(Some(observation), 10_000), "doctor OK, 9 s ago");
+        observation.findings = 2;
+        assert_eq!(
+            doctor_line(Some(observation), 10_000),
+            "2 findings, 9 s ago"
+        );
+        let mut snapshot = Snapshot::default();
+        assert!(error_line(&snapshot).is_empty());
+        snapshot.doctor_error = "Doctor: unreadable".into();
+        assert_eq!(error_line(&snapshot), "Doctor: unreadable");
+        snapshot.doctor_error.clear();
+        assert!(error_line(&snapshot).is_empty());
     }
 }
