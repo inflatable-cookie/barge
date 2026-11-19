@@ -745,3 +745,33 @@ fn adoption_rechecks_permissions_under_lock() {
     });
     assert!(area.adopt_root("adopted", "slot", "id").is_err());
 }
+
+#[test]
+fn eviction_retries_a_transient_lock_probe_but_respects_a_holder() {
+    let (_temp, barge) = fixture();
+    let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+    let root = area.create_root("slot").unwrap();
+    let lock_path = hold_lock_path(root.path.parent().unwrap(), &root.id);
+    let probe = crate::os::open_lock(&lock_path, "cannot open test lock").unwrap();
+    assert!(crate::os::flock(&probe, Mode::Exclusive, false).unwrap());
+    let probe = Rc::new(RefCell::new(Some(probe)));
+    let release = probe.clone();
+    EVICT_PROBE_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            drop(release.borrow_mut().take());
+        }))
+    });
+    area.evict(&root.id).unwrap();
+    assert!(probe.borrow().is_none());
+    assert!(!root.path.exists());
+
+    let held_root = area.create_root("held").unwrap();
+    let hold = area.hold(&held_root.id, Mode::Exclusive).unwrap();
+    assert!(area
+        .evict(&held_root.id)
+        .unwrap_err()
+        .message()
+        .contains("held"));
+    assert!(held_root.path.exists());
+    drop(hold);
+}

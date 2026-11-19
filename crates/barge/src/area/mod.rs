@@ -605,7 +605,21 @@ impl Area {
         });
         let directory = self.hold_directory(&root)?;
         let lock_path = hold_lock_path(&directory, &id);
-        let Some(hold_lock) = lock_root_try(&lock_path, Mode::Exclusive)? else {
+        let mut hold_lock = None;
+        for _ in 0..2 {
+            hold_lock = lock_root_try(&lock_path, Mode::Exclusive)?;
+            if hold_lock.is_some() {
+                break;
+            }
+            // A listing can briefly hold the lock for its own probe.
+            #[cfg(test)]
+            EVICT_PROBE_HOOK.with(|hook| {
+                if let Some(callback) = hook.borrow_mut().take() {
+                    callback();
+                }
+            });
+        }
+        let Some(hold_lock) = hold_lock else {
             return Err(Error::refused(format!(
                 "root {id} is held; refusing to evict it"
             )));
@@ -1016,6 +1030,7 @@ fn lock_is_current(file: &File, path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 thread_local! {
+    static EVICT_PROBE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     pub(crate) static EVICT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     pub(crate) static PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static ADOPT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
