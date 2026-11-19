@@ -102,7 +102,8 @@ impl FakeOs {
 impl Os for FakeOs {
     fn volume_identity(&self, mount: &Path) -> Result<Option<String>> {
         match self.lookup(mount) {
-            Some(volume) => Ok(volume.uuid),
+            Some(volume) if volume.mount == mount => Ok(volume.uuid),
+            Some(_) => Ok(None),
             None => Ok(None),
         }
     }

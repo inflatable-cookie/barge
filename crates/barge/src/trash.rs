@@ -67,7 +67,23 @@ pub(crate) fn remove_evicted_tree(path: &Path, area: &str, id: &str) -> Result<R
     if FAIL_DELETE.with(|flag| flag.replace(false)) {
         return Err(Error::io_message("injected deletion failure"));
     }
-    remove_owned(path, area, Some(id))
+    #[cfg(test)]
+    DELETE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    match remove_owned(path, area, Some(id)) {
+        Err(error) if matches!(fs::symlink_metadata(path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let _ = error;
+            Ok(Removed {
+                removed: true,
+                ..Removed::default()
+            })
+        }
+        other => other,
+    }
 }
 
 fn remove_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Removed> {
@@ -97,6 +113,8 @@ pub(crate) fn stayed_reason(removed: &Removed) -> String {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static DELETE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static FAIL_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static FAIL_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OPEN_TREE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
@@ -121,7 +139,15 @@ impl Area {
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(source) => return Err(Error::io("cannot list the trash at", &trash, &source)),
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                #[cfg(test)]
+                let entry = if FAIL_READ.with(|flag| flag.replace(false)) {
+                    Err(std::io::Error::other("injected readdir failure"))
+                } else {
+                    entry
+                };
+                let entry = entry
+                    .map_err(|source| Error::io("cannot read a trash entry at", &trash, &source))?;
                 let path = entry.path();
                 let metadata = match fs::symlink_metadata(&path) {
                     Ok(metadata) => metadata,
@@ -148,10 +174,12 @@ impl Area {
                             path,
                             bytes: removed.bytes,
                         }),
-                        Err(error) => report.kept.push(SkippedRoot {
-                            path,
-                            reason: error.message().to_string(),
-                        }),
+                        Err(error) => {
+                            return Err(Error::new(
+                                error.kind(),
+                                format!("{}; trash remains at {}", error.message(), path.display()),
+                            ))
+                        }
                     },
                     Opened::Refused(reason) => report.kept.push(SkippedRoot { path, reason }),
                 }
@@ -176,6 +204,34 @@ mod tests {
             expires_unix_ms: None,
             folder: None,
         }
+    }
+
+    #[test]
+    fn readdir_failure_is_reported() {
+        use std::sync::Arc;
+        let temp = crate::testing::TempDir::new("trash-read").unwrap();
+        let mount = temp.folder("mount").unwrap();
+        let state = temp.folder("state").unwrap();
+        let os = Arc::new(crate::FakeOs::with_volume(
+            &mount,
+            "11111111-2222-3333-4444-555555555555",
+            100,
+        ));
+        let b = crate::Barge::open_with(state, os, Arc::new(crate::ManualClock::new(1))).unwrap();
+        b.register_volume(crate::VolumeRegistration::new("disk", &mount).floor_bytes(0))
+            .unwrap();
+        let area = b
+            .area(crate::AreaSpec::new("test", "area", "disk"))
+            .unwrap();
+        let root = area.create_root("slot").unwrap();
+        FAIL_DELETE.with(|flag| flag.set(true));
+        assert!(area.evict(&root.id).is_err());
+        FAIL_READ.with(|flag| flag.set(true));
+        assert!(area
+            .sweep_trash()
+            .unwrap_err()
+            .message()
+            .contains("injected readdir"));
     }
 
     #[test]

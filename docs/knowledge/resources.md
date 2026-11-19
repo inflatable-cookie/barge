@@ -297,7 +297,7 @@ there that points inside the moved source and that no binding records is listed
 with the exact `barge bind adopt` command that records it afterwards. While the
 plan lists any, apply refuses unless the caller passes `--retarget-unrecorded`,
 which retargets those links in the same transaction and rolls them back with
-everything else. Nothing is scanned beyond that fixed list.
+everything else. Before retargeting a link, Barge checks that it is still a symlink to the expected target; a writer that changes the path between that check and the rename is outside the cooperative guarantee. Nothing is scanned beyond that fixed list.
 
 A VM's disk link must be retargeted before the VM starts. Lima recreates a
 missing disk, so a VM started with a dangling link boots a blank machine instead

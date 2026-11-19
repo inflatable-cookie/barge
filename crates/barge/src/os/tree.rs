@@ -444,7 +444,10 @@ fn unlink_at(directory: &File, name: &OsStr, flags: libc::c_int) -> std::io::Res
     // NUL-terminated name; it removes the entry named.
     let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), flags) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error);
+        }
     }
     Ok(())
 }

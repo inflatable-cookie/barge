@@ -17,11 +17,27 @@ use super::canonical_uuid;
 pub fn volume_uuid(mount: &Path) -> Result<Option<String>> {
     let c_path = CString::new(mount.as_os_str().as_bytes())
         .map_err(|_| Error::usage(format!("path {} contains a NUL byte", mount.display())))?;
+    let canonical = match std::fs::canonicalize(mount) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    // SAFETY: statfs is a plain C output structure and accepts zero initialization.
+    let mut status: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c_path is terminated and status is a valid output buffer.
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut status) } != 0 {
+        return Ok(None);
+    }
+    // SAFETY: statfs supplies a terminated mount-name array.
+    let mounted = unsafe { std::ffi::CStr::from_ptr(status.f_mntonname.as_ptr()) };
+    let mounted = Path::new(std::ffi::OsStr::from_bytes(mounted.to_bytes()));
+    if std::fs::canonicalize(mounted).ok().as_deref() != Some(canonical.as_path()) {
+        return Ok(None);
+    }
     let attributes = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
         commonattr: 0,
-        volattr: libc::ATTR_VOL_UUID,
+        volattr: libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID,
         dirattr: 0,
         fileattr: 0,
         forkattr: 0,

@@ -97,7 +97,7 @@ fn apply_retargets_links_and_rejects_drift() {
     fs::remove_file(&link).unwrap();
     symlink(f.mount.join("vms/one"), &link).unwrap();
     let result = f.barge.apply_move(&plan, stopped(true)).unwrap();
-    assert!(result.doctor.ok);
+    assert!(result.doctor.as_ref().unwrap().ok);
     for name in ["one", "two"] {
         assert_eq!(
             fs::read_link(f.temp.path().join(name)).unwrap(),
@@ -163,7 +163,7 @@ fn held_root_inside_source_refuses_move() {
     assert!(error.message().contains("held"));
     drop(hold);
     let result = f.barge.apply_move(&plan, stopped(true)).unwrap();
-    assert!(result.doctor.ok);
+    assert!(result.doctor.as_ref().unwrap().ok);
     let moved = f
         .barge
         .areas()
@@ -208,7 +208,7 @@ fn moves_a_binding_link_inside_the_source() {
     let plan = f.barge.plan_class_move(Class::Vms, "machines").unwrap();
     assert_eq!(plan.bindings[0].link_after, f.mount.join("machines/link"));
     let result = f.barge.apply_move(&plan, stopped(true)).unwrap();
-    assert!(result.doctor.ok);
+    assert!(result.doctor.as_ref().unwrap().ok);
     assert_eq!(
         f.barge
             .bindings()
@@ -375,7 +375,7 @@ fn retargeting_moves_a_known_disk_link_in_the_same_transaction() {
 
     let plan = barge.plan_class_move(Class::Vms, "machines").unwrap();
     let report = barge.apply_move(&plan, retargeting(false)).unwrap();
-    assert!(report.doctor.ok, "{report:?}");
+    assert!(report.doctor.as_ref().unwrap().ok, "{report:?}");
     assert_eq!(
         fs::read_link(&link).unwrap(),
         f.mount.join("machines/colima/disk")
@@ -414,7 +414,7 @@ fn a_known_link_outside_the_source_is_left_alone() {
     let plan = barge.plan_class_move(Class::Vms, "machines").unwrap();
     assert!(plan.unrecorded_links.is_empty());
     let report = barge.apply_move(&plan, retargeting(false)).unwrap();
-    assert!(report.doctor.ok, "{report:?}");
+    assert!(report.doctor.as_ref().unwrap().ok, "{report:?}");
     assert_eq!(fs::read_link(&link).unwrap(), target);
     assert_eq!(fs::read(&target).unwrap(), b"not in the class");
 }
@@ -436,7 +436,7 @@ fn a_recorded_disk_link_is_not_an_unrecorded_one() {
     assert!(plan.unrecorded_links.is_empty());
     assert_eq!(plan.consumers, ["colima-colima-disk"]);
     let report = barge.apply_move(&plan, retargeting(true)).unwrap();
-    assert!(report.doctor.ok, "{report:?}");
+    assert!(report.doctor.as_ref().unwrap().ok, "{report:?}");
     assert_eq!(
         fs::read_link(&link).unwrap(),
         f.mount.join("machines/colima/disk")
@@ -468,7 +468,7 @@ fn a_linked_colima_folder_does_not_widen_the_known_locations() {
         "a link behind a symlinked folder is not a documented location"
     );
     let report = barge.apply_move(&plan, retargeting(false)).unwrap();
-    assert!(report.doctor.ok, "{report:?}");
+    assert!(report.doctor.as_ref().unwrap().ok, "{report:?}");
     // Barge wrote nothing outside the documented locations: the link still holds
     // what it held, and the data is safe at the moved path. The plan's manual
     // step is the operator's cue for a link Barge cannot name.

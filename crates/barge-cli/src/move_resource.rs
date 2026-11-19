@@ -50,10 +50,13 @@ pub(crate) fn move_resource(arguments: &[String], json: bool) -> Result<()> {
             }
             println!(
                 "doctor: {}",
-                if report.doctor.ok {
-                    "ok"
-                } else {
-                    "issues found"
+                match &report.doctor {
+                    Some(doctor) if doctor.ok => "ok".to_string(),
+                    Some(_) => "issues found".to_string(),
+                    None => format!(
+                        "failed: {}",
+                        report.doctor_error.as_deref().unwrap_or("unknown error")
+                    ),
                 }
             );
         }
