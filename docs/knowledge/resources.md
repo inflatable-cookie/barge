@@ -53,12 +53,15 @@ under the `scratch` class, `scratch/<tool>/…`, with that tool's own expiry;
 there is no separate class for it. A stored layout that still names `evidence`
 is refused, naming the retired class, rather than misread.
 
-**Durability belongs to the class, not the volume** (Tom, 2026-11-18). Each
-class is placed on one registered volume, and different classes can live on
-different volumes. One drive can hold both expendable and kept classes, as
-Stash does today. A second drive can take some classes over by moving them
-(see [Moving a class](#moving-a-class)). Kept classes sit outside every
-expendable area (Q-006), so pruning can never reach them.
+**Durability belongs to the class, not the volume** (Tom, 2026-11-18). The
+volume's availability says whether it can currently be used; its stored
+`durability` field is descriptive metadata and does not set class policy. A
+volume can hold classes of either durability. Each class is placed on one
+registered volume, and different classes can live on different volumes. One
+drive can hold both expendable and kept classes, as Stash does today. A second
+drive can take some classes over by moving them (see [Moving a class](#moving-a-class)).
+Kept classes sit outside every expendable area (Q-006), so pruning can never
+reach them.
 
 ### Layout
 
@@ -140,7 +143,7 @@ The `link` kind's rules:
 - a destination is an existing folder or regular file inside the class folder,
   and Barge never creates it. A VM disk is a regular file, so both are
   destinations; the value is resolved first, so a link that leaves the class
-  folder is refused rather than followed;
+  folder is refused rather than followed. See the [VM disk startup warning](machines.md#vm-disks).
 - a destination is recorded with its device and inode, so doctor reports one
   that was replaced at the same path, and an apply refuses a destination that
   changed since its plan;

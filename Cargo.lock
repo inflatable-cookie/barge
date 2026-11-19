@@ -2234,7 +2234,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "longhorn-config"
 version = "0.5.0"
-source = "git+https://github.com/inflatable-cookie/longhorn?tag=v0.5.0#a3e627f37b218de8d832e26f3fd84424d1f0096a"
+source = "git+https://github.com/inflatable-cookie/longhorn?rev=a3e627f37b218de8d832e26f3fd84424d1f0096a#a3e627f37b218de8d832e26f3fd84424d1f0096a"
 dependencies = [
  "cap-std",
  "fs4",
@@ -2250,7 +2250,7 @@ dependencies = [
 [[package]]
 name = "longhorn-core"
 version = "0.5.0"
-source = "git+https://github.com/inflatable-cookie/longhorn?tag=v0.5.0#a3e627f37b218de8d832e26f3fd84424d1f0096a"
+source = "git+https://github.com/inflatable-cookie/longhorn?rev=a3e627f37b218de8d832e26f3fd84424d1f0096a#a3e627f37b218de8d832e26f3fd84424d1f0096a"
 dependencies = [
  "serde",
 ]
@@ -2258,7 +2258,7 @@ dependencies = [
 [[package]]
 name = "longhorn-settings"
 version = "0.5.0"
-source = "git+https://github.com/inflatable-cookie/longhorn?tag=v0.5.0#a3e627f37b218de8d832e26f3fd84424d1f0096a"
+source = "git+https://github.com/inflatable-cookie/longhorn?rev=a3e627f37b218de8d832e26f3fd84424d1f0096a#a3e627f37b218de8d832e26f3fd84424d1f0096a"
 dependencies = [
  "longhorn-core",
  "serde",
@@ -2269,7 +2269,7 @@ dependencies = [
 [[package]]
 name = "longhorn-settings-config"
 version = "0.5.0"
-source = "git+https://github.com/inflatable-cookie/longhorn?tag=v0.5.0#a3e627f37b218de8d832e26f3fd84424d1f0096a"
+source = "git+https://github.com/inflatable-cookie/longhorn?rev=a3e627f37b218de8d832e26f3fd84424d1f0096a#a3e627f37b218de8d832e26f3fd84424d1f0096a"
 dependencies = [
  "longhorn-config",
  "longhorn-core",
@@ -2282,7 +2282,7 @@ dependencies = [
 [[package]]
 name = "longhorn-storage-layout"
 version = "0.5.0"
-source = "git+https://github.com/inflatable-cookie/longhorn?tag=v0.5.0#a3e627f37b218de8d832e26f3fd84424d1f0096a"
+source = "git+https://github.com/inflatable-cookie/longhorn?rev=a3e627f37b218de8d832e26f3fd84424d1f0096a#a3e627f37b218de8d832e26f3fd84424d1f0096a"
 dependencies = [
  "serde",
  "serde_json",
@@ -2292,7 +2292,7 @@ dependencies = [
 [[package]]
 name = "longhorn-tauri-config"
 version = "0.5.0"
-source = "git+https://github.com/inflatable-cookie/longhorn?tag=v0.5.0#a3e627f37b218de8d832e26f3fd84424d1f0096a"
+source = "git+https://github.com/inflatable-cookie/longhorn?rev=a3e627f37b218de8d832e26f3fd84424d1f0096a#a3e627f37b218de8d832e26f3fd84424d1f0096a"
 dependencies = [
  "longhorn-config",
  "longhorn-storage-layout",
@@ -2303,7 +2303,7 @@ dependencies = [
 [[package]]
 name = "longhorn-tauri-settings"
 version = "0.5.0"
-source = "git+https://github.com/inflatable-cookie/longhorn?tag=v0.5.0#a3e627f37b218de8d832e26f3fd84424d1f0096a"
+source = "git+https://github.com/inflatable-cookie/longhorn?rev=a3e627f37b218de8d832e26f3fd84424d1f0096a#a3e627f37b218de8d832e26f3fd84424d1f0096a"
 dependencies = [
  "longhorn-core",
  "longhorn-settings",

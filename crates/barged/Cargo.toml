@@ -14,7 +14,7 @@ path = "src/main.rs"
 barge-machine = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
-httparse = "1"
+httparse.workspace = true
 libc.workspace = true
 
 # logind over D-Bus, Linux only (see the workspace manifest).

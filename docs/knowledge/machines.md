@@ -12,7 +12,8 @@ Remote menu-bar app ([vision](vision.md#direction)).
 
 - **`barge` CLI on the Mac:** the `machine` verbs listed in
   [architecture](architecture.md#cli). Wake-on-LAN is a client operation and
-  needs nothing running on the PC.
+  needs nothing running on the PC. JSON restart and shutdown requests require
+  `--yes` rather than prompting.
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
   power actions. On Bazzite it runs as a systemd user unit and asks logind over
   D-Bus for sleep, restart and shutdown, with a polkit rule granting only those
@@ -48,11 +49,8 @@ asked to retarget it ([moving a class](resources.md#moving-a-class)).
 
 ## Registry state
 
-The registry is `machines.json` in the account state directory, the same
-directory where `barge` keeps `volumes.json`, `areas/` and the bindings
-record. Both publish through a temporary file and an atomic rename, and both
-take the one `lock` file there, so a registry write and a storage write never
-interleave.
+The registry is `machines.json` in Barge's account state directory. Its files
+and shared lock follow the [account state contract](architecture.md#layout-on-a-volume).
 
 `crates/barge-machine` keeps its own copy of that publication step and the
 lock instead of depending on `crates/barge`: the storage library's dependency
@@ -108,7 +106,7 @@ Poodle and Longhorn, covering Machines and Storage in its first release.
   example config in `packaging/barged/`.
 - `crates/barge-cli`: the `barge` binary, which carries the machine verbs
   beside the storage ones.
-- `apps/barge-app`: the Barge app, specced in [app](app.md), not yet built.
+- [`apps/barge-app`](app.md): the menu-bar app.
 
 ## Build order
 
@@ -131,7 +129,3 @@ Poodle and Longhorn, covering Machines and Storage in its first release.
 Tom used MoonDeck Buddy on the Steam Deck only for remote control of the PC
 (2026-11-18), so `barged` replaces it entirely. No game-launch features carry
 over. The Steam Deck becomes a client of `barged` once a client exists for it.
-
-The registry can be read without creating account state; writers create the
-shared state directory and take the same account lock as storage. JSON restart
-and shutdown requests require `--yes` rather than prompting.

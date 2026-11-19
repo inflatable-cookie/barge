@@ -355,6 +355,6 @@ Designed separately, not yet built:
   `setting` adapters are not.
 - **Worktree pools:** areas of git worktrees leased through holds; see
   [vision](vision.md#direction).
-- **The machine daemon's later steps:** the remote-control replacement, the
-  Tailscale sign-ins and the Barge app ([machines](machines.md#build-order)).
-  Machine control steps 1-3 are built.
+- **The machine daemon's later steps:** the remote-control replacement and
+  Tailscale sign-ins ([machines](machines.md#build-order)). Machine control
+  steps 1-3 are built.
