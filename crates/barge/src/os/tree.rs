@@ -157,9 +157,7 @@ fn remove_contents(
             continue;
         }
         if kind != libc::S_IFDIR {
-            removed.bytes = removed
-                .bytes
-                .saturating_add(u64::try_from(metadata.st_size).unwrap_or(0));
+            removed.bytes = removed.bytes.saturating_add(allocated_bytes(&metadata));
             unlink_at(directory, &name, 0)
                 .map_err(|source| Error::io("cannot remove", &child, &source))?;
             continue;
@@ -218,7 +216,7 @@ fn measure_opened(path: &Path, device: DeviceFn<'_>) -> TreeSize {
             // Not a folder: a plain file is counted, anything else is unknown.
             match std::fs::symlink_metadata(path) {
                 Ok(metadata) if !metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                    measured.bytes = metadata.len();
+                    measured.bytes = metadata.blocks().saturating_mul(512);
                 }
                 _ => measured.approximate = true,
             }
@@ -271,9 +269,7 @@ fn measure_contents(
             continue;
         }
         if kind != libc::S_IFDIR {
-            measured.bytes = measured
-                .bytes
-                .saturating_add(u64::try_from(metadata.st_size).unwrap_or(0));
+            measured.bytes = measured.bytes.saturating_add(allocated_bytes(&metadata));
             continue;
         }
         let nested = match open_at(Some(directory), &name) {
@@ -296,6 +292,16 @@ fn measure_contents(
         }
         measure_contents(&nested, &child, root_device, depth + 1, device, measured);
     }
+}
+
+/// The bytes an entry occupies: its allocated 512-byte blocks, so a sparse or
+/// copy-on-write cloned file is counted at what it costs, not at its apparent
+/// length. `st_blocks` is always in 512-byte units, whatever the filesystem's
+/// block size, so a VM disk image does not overstate a soft cap or freed bytes.
+fn allocated_bytes(status: &libc::stat) -> u64 {
+    u64::try_from(status.st_blocks)
+        .unwrap_or(0)
+        .saturating_mul(512)
 }
 
 fn device_of(directory: &File) -> std::io::Result<u64> {
@@ -473,6 +479,12 @@ fn push_read_failure(fail: bool) {
 mod tests {
     use super::*;
     use crate::root::{RootMarker, ROOT_SCHEMA};
+    use std::os::unix::fs::MetadataExt;
+
+    /// The bytes a file is charged for, as the walk counts them.
+    fn charged(path: &Path) -> u64 {
+        std::fs::symlink_metadata(path).unwrap().blocks() * 512
+    }
 
     fn marker(id: &str) -> RootMarker {
         RootMarker {
@@ -495,9 +507,8 @@ mod tests {
         crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
         std::fs::write(nested.join("keep.txt"), b"keep").unwrap();
         std::fs::write(root.join("counted.bin"), vec![b'x'; 8]).unwrap();
-        let marker_bytes = std::fs::symlink_metadata(root.join(crate::root::MARKER_NAME))
-            .unwrap()
-            .len();
+        let marker_bytes = charged(&root.join(crate::root::MARKER_NAME));
+        let counted_bytes = charged(&root.join("counted.bin"));
 
         // The fixture cannot mount a second filesystem, so the seam reports one
         // for the folder a mount would appear as. The decision is taken on the
@@ -521,7 +532,7 @@ mod tests {
         assert!(!removed.removed);
         assert_eq!(
             removed.bytes,
-            8 + marker_bytes,
+            counted_bytes + marker_bytes,
             "the counted files were removed"
         );
         assert!(!root.join("counted.bin").exists());
@@ -563,9 +574,8 @@ mod tests {
         crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
         std::fs::write(root.join("readable.bin"), vec![b'x'; 6]).unwrap();
         std::fs::write(root.join("nested/other.bin"), vec![b'x'; 32]).unwrap();
-        let marker_bytes = std::fs::symlink_metadata(root.join(crate::root::MARKER_NAME))
-            .unwrap()
-            .len();
+        let marker_bytes = charged(&root.join(crate::root::MARKER_NAME));
+        let readable_bytes = charged(&root.join("readable.bin"));
 
         // The root lists, its child folder does not: the sum is a lower bound.
         push_read_failure(false);
@@ -573,7 +583,7 @@ mod tests {
         let measured = measure_tree(&root);
         assert_eq!(
             measured.bytes,
-            6 + marker_bytes,
+            readable_bytes + marker_bytes,
             "what was listed is counted"
         );
         assert!(

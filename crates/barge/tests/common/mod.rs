@@ -7,8 +7,9 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use barge::os::FakeOs;
 use barge::testing::TempDir;
@@ -91,4 +92,29 @@ impl Fixture {
 
 pub fn fill(root: &barge::Root, bytes: usize) {
     fs::write(root.path.join("data.bin"), vec![b'x'; bytes]).expect("write root data");
+}
+
+/// Every path under `root` with its modification time and, for a file, its
+/// contents, sorted by path. A test compares two of these to assert that a run
+/// wrote nothing.
+#[allow(clippy::type_complexity)]
+pub fn snapshot(root: &Path) -> Vec<(PathBuf, SystemTime, Option<Vec<u8>>)> {
+    fn visit(path: &Path, result: &mut Vec<(PathBuf, SystemTime, Option<Vec<u8>>)>) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let contents = if metadata.is_file() {
+            Some(fs::read(path).unwrap())
+        } else {
+            None
+        };
+        result.push((path.to_path_buf(), metadata.modified().unwrap(), contents));
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(&entry.unwrap().path(), result);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    visit(root, &mut result);
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
 }

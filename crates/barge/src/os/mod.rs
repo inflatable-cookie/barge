@@ -1,11 +1,12 @@
-//! The platform seam: everything in the crate that names a syscall, an errno or a
-//! platform path convention lives here — volume identity at a mount, free space,
-//! and the descriptor-relative helpers every other module calls: opening a folder
-//! or a lock without following a symlink, advisory locks, an inheritable
-//! descriptor and a no-replace rename.
+//! The platform seam: every syscall and errno in the crate lives here — volume
+//! identity at a mount, free space, and the descriptor-relative helpers every
+//! other module calls: opening a folder or a lock without following a symlink,
+//! advisory locks, an inheritable descriptor and a no-replace rename.
 //!
-//! Markers are portable, so a new platform is a new identity, free-space and
-//! lock-call implementation here, not a redesign.
+//! A path convention that is not a syscall stays with the fact it belongs to: the
+//! random source with root-ID minting, and the account state folder and home
+//! folder with the state module. Markers are portable, so a new platform is a new
+//! identity, free-space and lock-call implementation here, not a redesign.
 
 #[cfg(not(unix))]
 compile_error!("Barge supports unix platforms; macOS is first and Linux follows.");

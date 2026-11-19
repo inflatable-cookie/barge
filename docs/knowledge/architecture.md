@@ -204,9 +204,13 @@ compatibility, freshness or what a root contains.
 
 - A volume's **reserve** triggers pruning, it doesn't stop work. Below it,
   Barge evicts the least-recently-used idle, unpinned roots, from areas that
-  count toward the reserve, until free space is back above it.
-- An area's **soft cap** counts only that area's own bytes; above it, the
-  area's own LRU idle roots are evicted. Root sizes are recorded when holds are
+  count toward the reserve, until free space is back above it. The reserve is
+  about one volume's free space, so only roots on that volume count toward it,
+  and only bytes freed on that volume are credited to it.
+- An area's **soft cap** is a budget on the area, so it counts that area's own
+  bytes wherever its roots live: on the volume, or in its declared fallback on
+  the internal drive. Above it, the area's own LRU idle roots are evicted,
+  fallback roots included. Root sizes are recorded when holds are
   released; roots without a recorded size are measured once on the next
   soft-cap check. `status` reports that recorded total too, measuring only a root
   no release has recorded, so reading status never walks every root. The total is
@@ -216,6 +220,13 @@ compatibility, freshness or what a root contains.
   approximate rather than as exact. Only a complete measurement is recorded, and
   an incomplete release forgets any size recorded earlier, so a lower bound is
   never later read back as an exact size.
+- A size is the space an entry occupies, its allocated 512-byte blocks
+  (`st_blocks * 512`), not its apparent length, so a sparse file or a
+  copy-on-write cloned VM disk neither overstates a soft cap nor overstates the
+  bytes an eviction freed.
+- A reserve pass counts the measured bytes it evicts and stops when that reaches
+  the target. APFS can report freed space late, so free space is read once more
+  only at the end, for the report, instead of after every root.
 - An eviction that fails for a reason the filesystem gives — a rename or a
   delete that cannot be done — fails the prune with that error. Only a policy
   refusal is reported as a kept root. A trash copy a delete left behind is

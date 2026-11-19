@@ -4,12 +4,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod common;
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
 use barge::{Absent, AreaSpec, Barge, Class, Placement, VolumeRegistration};
-use common::Fixture;
+use common::{snapshot, Fixture};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 
 fn placement(path: &str, absent: Absent) -> Placement {
     Placement {
@@ -123,9 +121,14 @@ fn path_and_survey_are_read_only() {
     assert!(items
         .iter()
         .any(|i| i.classification == barge::layout::SurveyClassification::Barge));
-    assert!(items.iter().any(
-        |i| i.classification == barge::layout::SurveyClassification::Unknown && i.bytes == Some(5)
-    ));
+    let unknown_bytes = fs::symlink_metadata(f.base().join("unknown"))
+        .unwrap()
+        .blocks()
+        * 512;
+    assert!(items.iter().any(|i| {
+        i.classification == barge::layout::SurveyClassification::Unknown
+            && i.bytes == Some(unknown_bytes)
+    }));
     assert_eq!(
         items
             .iter()
@@ -161,25 +164,4 @@ fn path_and_survey_are_read_only() {
         .message()
         .contains("attach"));
     assert_eq!(before, snapshot(f.temp.path()));
-}
-
-fn snapshot(root: &Path) -> Vec<(PathBuf, SystemTime, Option<Vec<u8>>)> {
-    fn visit(path: &Path, result: &mut Vec<(PathBuf, SystemTime, Option<Vec<u8>>)>) {
-        let metadata = fs::symlink_metadata(path).unwrap();
-        let contents = if metadata.is_file() {
-            Some(fs::read(path).unwrap())
-        } else {
-            None
-        };
-        result.push((path.to_path_buf(), metadata.modified().unwrap(), contents));
-        if metadata.is_dir() {
-            for entry in fs::read_dir(path).unwrap() {
-                visit(&entry.unwrap().path(), result);
-            }
-        }
-    }
-    let mut result = Vec::new();
-    visit(root, &mut result);
-    result.sort_by(|a, b| a.0.cmp(&b.0));
-    result
 }

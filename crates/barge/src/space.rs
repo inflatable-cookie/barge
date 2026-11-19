@@ -1,10 +1,19 @@
 //! Space policy: a volume's reserve triggers pruning, an area's soft cap counts
 //! only its own bytes, and only the floor refuses work.
 //!
+//! A soft cap is a budget on the area, so it counts the area's roots wherever
+//! they live: on the volume or in its declared fallback on the internal drive.
+//! The reserve is about one volume's free space, so only roots on that volume
+//! count toward it, and only bytes freed on that volume are credited to it.
+//!
 //! Eviction is least-recently-used first and only over idle, unpinned roots. A
 //! root that is held or pinned keeps the run going, and is reported as the reason
 //! the run stopped. An eviction the filesystem refuses is returned as an error
 //! with its cause, never hidden as another policy refusal.
+//!
+//! APFS can report freed space late, so a reserve pass counts the bytes it has
+//! evicted and stops once that reaches the target. Free space is asked again only
+//! once, at the end of the pass, for the report.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -71,6 +80,37 @@ pub struct KeptRoot {
     pub reason: KeepReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+impl KeptRoot {
+    /// One kept root, with the size the policy counted for it.
+    fn new(
+        area: &Area,
+        info: &RootInfo,
+        reason: KeepReason,
+        size: TreeSize,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            area: area.key().label(),
+            id: info.id.clone(),
+            label: info.label.clone(),
+            bytes: size.bytes,
+            bytes_approximate: size.approximate,
+            reason,
+            detail,
+        }
+    }
+}
+
+/// Why a root that is not a candidate was kept: something holds it, or a pin
+/// protects it.
+fn protected_reason(info: &RootInfo) -> KeepReason {
+    if info.held {
+        KeepReason::Held
+    } else {
+        KeepReason::Pinned
+    }
 }
 
 /// The result of a prune.
@@ -176,15 +216,27 @@ pub(crate) fn prune(
         }
     }
 
-    soft_cap_pass(&areas, dry_run, &mut report, &mut planned)?;
+    // Bytes freed on the volume itself, which the reserve pass counts as it
+    // evicts instead of re-reading a filesystem that may report them late.
+    let mut freed_on_volume = 0_u64;
+    soft_cap_pass(
+        &areas,
+        dry_run,
+        &mut report,
+        &mut planned,
+        &mut freed_on_volume,
+    )?;
     reserve_pass(
         core,
         &mount,
         &areas,
-        dry_run,
-        target_bytes,
+        Target {
+            bytes: target_bytes,
+            dry_run,
+        },
         &planned,
         &mut report,
+        freed_on_volume,
     )?;
     Ok(report)
 }
@@ -194,8 +246,10 @@ fn soft_cap_pass(
     dry_run: bool,
     report: &mut PruneReport,
     planned: &mut HashSet<(String, String)>,
+    freed_on_volume: &mut u64,
 ) -> Result<()> {
-    // Each area's soft cap counts only that area's own bytes.
+    // Each area's soft cap counts only that area's own bytes, on the volume or in
+    // its declared fallback: the cap is a budget on the area, not on one drive.
     for area in areas {
         let Some(cap) = area.record().soft_cap_bytes else {
             continue;
@@ -226,8 +280,14 @@ fn soft_cap_pass(
             // A dry run plans with the size this pass already measured instead of
             // walking the root a second time.
             let size = sizes.get(&info.id).copied();
+            let freed_before = report.freed_bytes;
             if evict(area, &info, PruneReason::SoftCap, dry_run, size, report)?.is_none() {
                 continue;
+            }
+            // Only a fallback root leaves the volume's free space alone.
+            if info.on_volume {
+                *freed_on_volume =
+                    freed_on_volume.saturating_add(report.freed_bytes.saturating_sub(freed_before));
             }
             planned.insert((area.key().label(), info.id.clone()));
             bytes = bytes.saturating_sub(size.map_or(0, |size| size.bytes));
@@ -240,27 +300,27 @@ fn soft_cap_pass(
     Ok(())
 }
 
-/// Free space as this run sees it: a dry run predicts it from the reading taken
-/// before the run plus the bytes already freed, and a real run reads it again.
-fn free_bytes(core: &Core, mount: &Path, dry_run: bool, report: &PruneReport) -> Result<u64> {
-    if dry_run {
-        Ok(report.free_before_bytes.saturating_add(report.freed_bytes))
-    } else {
-        core.os.free_bytes(mount)
-    }
+/// What a reserve pass works toward, and whether it reports a prediction.
+#[derive(Debug, Clone, Copy)]
+struct Target {
+    bytes: u64,
+    dry_run: bool,
 }
 
 fn reserve_pass(
     core: &Core,
     mount: &Path,
     areas: &[Area],
-    dry_run: bool,
-    target_bytes: u64,
+    target: Target,
     planned: &HashSet<(String, String)>,
     report: &mut PruneReport,
+    freed_on_volume: u64,
 ) -> Result<()> {
-    let free = free_bytes(core, mount, dry_run, report)?;
-    if free >= target_bytes {
+    // APFS can report freed space late, so count the bytes each eviction freed
+    // instead of asking the filesystem after every root; it is asked once, at the
+    // end, for the report.
+    let mut free = report.free_before_bytes.saturating_add(freed_on_volume);
+    if free >= target.bytes {
         report.free_after_bytes = free;
         return Ok(());
     }
@@ -288,31 +348,38 @@ fn reserve_pass(
         (left.1.last_used_unix_ms, &left.1.id).cmp(&(right.1.last_used_unix_ms, &right.1.id))
     });
     for (area, info) in &candidates {
-        if free_bytes(core, mount, dry_run, report)? >= target_bytes {
+        if free >= target.bytes {
             break;
         }
         if planned.contains(&(area.key().label(), info.id.clone())) {
             continue;
         }
-        evict(area, info, PruneReason::Reserve, dry_run, None, report)?;
+        let freed_before = report.freed_bytes;
+        evict(
+            area,
+            info,
+            PruneReason::Reserve,
+            target.dry_run,
+            None,
+            report,
+        )?;
+        free = free.saturating_add(report.freed_bytes.saturating_sub(freed_before));
     }
-    let free_after = free_bytes(core, mount, dry_run, report)?;
-    if free_after < target_bytes {
+    let free_after = if target.dry_run {
+        free
+    } else {
+        core.os.free_bytes(mount)?
+    };
+    if free_after < target.bytes {
         for (area, info) in &protected {
             let size = area.recorded_or_measure_bytes(info, false);
-            report.kept.push(KeptRoot {
-                area: area.key().label(),
-                id: info.id.clone(),
-                label: info.label.clone(),
-                bytes: size.bytes,
-                bytes_approximate: size.approximate,
-                reason: if info.held {
-                    KeepReason::Held
-                } else {
-                    KeepReason::Pinned
-                },
-                detail: Some("protected from prune".to_string()),
-            });
+            report.kept.push(KeptRoot::new(
+                area,
+                info,
+                protected_reason(info),
+                size,
+                Some("protected from prune".to_string()),
+            ));
         }
     }
     report.free_after_bytes = free_after;
@@ -367,15 +434,13 @@ fn evict(
         }
         Err(error) => {
             let size = size.unwrap_or_else(|| area.recorded_or_measure_bytes(info, false));
-            let kept = KeptRoot {
-                area: area.key().label(),
-                id: info.id.clone(),
-                label: info.label.clone(),
-                bytes: size.bytes,
-                bytes_approximate: size.approximate,
-                reason: KeepReason::Refused,
-                detail: Some(error.message().to_string()),
-            };
+            let kept = KeptRoot::new(
+                area,
+                info,
+                KeepReason::Refused,
+                size,
+                Some(error.message().to_string()),
+            );
             match error.kind() {
                 // A policy refusal keeps the root and the run carries on.
                 ErrorKind::Refused | ErrorKind::NotFound => {
@@ -396,19 +461,13 @@ fn keep_protected(area: &Area, report: &mut PruneReport, detail: Option<&str>) -
             continue;
         }
         let size = area.recorded_or_measure_bytes(info, false);
-        report.kept.push(KeptRoot {
-            area: area.key().label(),
-            id: info.id.clone(),
-            label: info.label.clone(),
-            bytes: size.bytes,
-            bytes_approximate: size.approximate,
-            reason: if info.held {
-                KeepReason::Held
-            } else {
-                KeepReason::Pinned
-            },
-            detail: detail.map(str::to_string),
-        });
+        report.kept.push(KeptRoot::new(
+            area,
+            info,
+            protected_reason(info),
+            size,
+            detail.map(str::to_string),
+        ));
     }
     Ok(())
 }

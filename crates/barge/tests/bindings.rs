@@ -12,13 +12,12 @@ mod common;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use barge::{
     Absent, ApplyOptions, Barge, Binding, BindingState, Class, EntryIdentity, Observed, Placement,
     Prior,
 };
-use common::{Fixture, TIB, UUID};
+use common::{snapshot, Fixture, TIB, UUID};
 
 fn layout(fixture: &Fixture) {
     fixture
@@ -663,27 +662,6 @@ fn doctor_and_bind_list_write_nothing_on_a_read_only_account() {
     let report = read.doctor().unwrap();
     assert!(report.ok, "{report:?}");
     assert_eq!(before, snapshot(fixture.temp.path()));
-}
-
-fn snapshot(root: &Path) -> Vec<(PathBuf, SystemTime, Option<Vec<u8>>)> {
-    fn visit(path: &Path, result: &mut Vec<(PathBuf, SystemTime, Option<Vec<u8>>)>) {
-        let metadata = fs::symlink_metadata(path).unwrap();
-        let contents = if metadata.is_file() {
-            Some(fs::read(path).unwrap())
-        } else {
-            None
-        };
-        result.push((path.to_path_buf(), metadata.modified().unwrap(), contents));
-        if metadata.is_dir() {
-            for entry in fs::read_dir(path).unwrap() {
-                visit(&entry.unwrap().path(), result);
-            }
-        }
-    }
-    let mut result = Vec::new();
-    visit(root, &mut result);
-    result.sort_by(|a, b| a.0.cmp(&b.0));
-    result
 }
 
 #[test]
