@@ -137,6 +137,84 @@ fn plan_and_apply_a_new_link() {
 }
 
 #[test]
+fn undo_adopts_a_link_written_as_a_relative_path() {
+    let fixture = Fixture::new();
+    fixture.register();
+    layout(&fixture);
+    let destination = class_folder(&fixture, "cargo/git");
+    let link = home(&fixture).join("git");
+    // A tool that wrote its own link leaves the text it chose behind, here a
+    // path relative to the link's folder. Adopt keeps that text and records the
+    // resolved destination, so undo has to compare the resolved link.
+    let relative = Path::new("..").join(destination.strip_prefix(fixture.temp.path()).unwrap());
+    symlink(&relative, &link).unwrap();
+    assert_eq!(canonical(&link), canonical(&destination));
+
+    let adopt = fixture
+        .barge
+        .bindings()
+        .adopt(&Binding::link("cargo-git", Class::Caches, &link))
+        .unwrap();
+    assert_eq!(
+        adopt.prior,
+        Prior::Link {
+            destination: relative.clone()
+        }
+    );
+    assert_eq!(adopt.applied.value, canonical(&destination));
+    assert_ne!(
+        fs::read_link(&link).unwrap(),
+        adopt.applied.value,
+        "the raw text is not the resolved value"
+    );
+
+    fixture.barge.bindings().undo("cargo-git").unwrap();
+
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        relative,
+        "undo restores the relative link adopt found"
+    );
+}
+
+#[test]
+fn undo_adopts_a_link_through_a_symlinked_folder() {
+    let fixture = Fixture::new();
+    fixture.register();
+    layout(&fixture);
+    let destination = class_folder(&fixture, "cargo/registry");
+    // A macOS `/var`-style path: the text a tool wrote runs through a folder that
+    // is itself a symlink, so it never equals the resolved destination.
+    let alias = fixture.temp.path().join("alias");
+    symlink(fixture.base(), &alias).unwrap();
+    let through_alias = alias.join("caches/cargo/registry");
+    let link = home(&fixture).join("registry");
+    symlink(&through_alias, &link).unwrap();
+    assert_eq!(canonical(&link), canonical(&destination));
+
+    let adopt = fixture
+        .barge
+        .bindings()
+        .adopt(&Binding::link("cargo-registry", Class::Caches, &link))
+        .unwrap();
+    assert_eq!(
+        adopt.prior,
+        Prior::Link {
+            destination: through_alias.clone()
+        }
+    );
+    assert_eq!(adopt.applied.value, canonical(&destination));
+
+    fixture.barge.bindings().undo("cargo-registry").unwrap();
+
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        through_alias,
+        "undo restores the link adopt found"
+    );
+}
+
+#[test]
 fn adopt_records_an_existing_link_without_changing_it() {
     let fixture = Fixture::new();
     fixture.register();

@@ -2,6 +2,7 @@
 //! crate's test seams without widening the library's surface.
 
 use super::*;
+use crate::hold::{hold_lock_path, push_lock_hook, push_lock_open_hook};
 use crate::{Barge, ManualClock, VolumeRegistration};
 use std::cell::RefCell;
 use std::os::unix::fs::MetadataExt;
@@ -96,7 +97,7 @@ fn prune_above_reserve_without_soft_caps_does_not_list_or_walk() {
 }
 
 #[test]
-fn reserve_prune_walks_only_the_root_it_evicts() {
+fn reserve_prune_never_walks_the_root_it_evicts() {
     let (_temp, barge) = fixture_with_space(0, 1);
     let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
     let root = area.create_root("slot").unwrap();
@@ -104,7 +105,10 @@ fn reserve_prune_walks_only_the_root_it_evicts() {
     crate::root::reset_tree_bytes_calls();
     let report = barge.prune("disk", false).unwrap();
     assert_eq!(report.evicted.len(), 1);
-    assert_eq!(crate::root::tree_bytes_calls(), 1);
+    // The deletion counts the bytes it removes, so no separate walk runs while
+    // the hold lock and the area lock are held.
+    assert_eq!(crate::root::tree_bytes_calls(), 0);
+    assert!(report.evicted[0].bytes >= 16, "the deleted data is counted");
 }
 
 #[test]

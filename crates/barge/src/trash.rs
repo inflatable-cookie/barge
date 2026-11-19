@@ -9,6 +9,7 @@
 //! Eviction itself lives in [`crate::area`], next to the locks whose ordering it
 //! depends on; this module is the deletion it performs and the trash sweep.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
@@ -91,6 +92,22 @@ fn remove_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Removed> {
         Opened::Owned(tree) => tree.remove(),
         Opened::Refused(reason) => Err(Error::refused(reason)),
     }
+}
+
+/// Delete a root Barge created and could not finish writing a marker into.
+///
+/// Only a folder holding nothing but Barge's own marker is removed, and the walk
+/// runs on the descriptor it was opened on, so a replacement at the path is never
+/// walked and nothing a consumer put there is deleted.
+pub(crate) fn remove_half_made(path: &Path) -> Result<Removed> {
+    let tree = Tree::open(path)?;
+    if !tree.holds_only(&[OsStr::new(MARKER_NAME)])? {
+        return Err(Error::refused(format!(
+            "refusing to delete {}: it holds an entry Barge did not create",
+            path.display()
+        )));
+    }
+    tree.remove()
 }
 
 /// Why a deletion of an owned tree left part of it in place.

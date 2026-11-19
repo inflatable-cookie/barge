@@ -52,8 +52,7 @@ pub use hold::{Hold, Mode};
 pub use known_links::KnownLink;
 pub use layout::{Class, Layout, Placement, ResourcePath, SurveyItem};
 pub use move_plan::{
-    MoveApplyOptions, MoveArea, MoveBinding, MoveIdentity, MoveLayout, MovePlan, MoveReport,
-    UnrecordedLink,
+    MoveApplyOptions, MoveArea, MoveBinding, MoveLayout, MovePlan, MoveReport, UnrecordedLink,
 };
 pub use os::{FakeOs, Os};
 pub use root::{Listing, Root, RootInfo, Straggler};

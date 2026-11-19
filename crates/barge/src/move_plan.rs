@@ -16,17 +16,11 @@ use serde::{Deserialize, Serialize};
 use crate::bindings::{
     entry_identity, observe, same_target, BindingRecord, EntryIdentity, Observed,
 };
+use crate::hold;
 use crate::{AreaRecord, Barge, BindingTarget, Class, Error, Placement, Result};
 
 /// The schema name a reviewed move plan is written with.
 const MOVE_PLAN_SCHEMA: &str = "barge.move-plan/2";
-
-/// The filesystem identity captured for an existing entry.
-///
-/// A plan and a binding both mean the same thing by "the same entry": the
-/// device-and-inode pair `EntryIdentity` records, so a move plan reuses it
-/// instead of defining a second copy of the same two fields.
-pub type MoveIdentity = EntryIdentity;
 
 /// A recorded link and its exact observed and planned values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,9 +41,9 @@ pub struct MovePlan {
     /// The class the source belongs to, or is being moved into.
     pub class: Class,
     pub source: PathBuf,
-    pub source_identity: MoveIdentity,
+    pub source_identity: EntryIdentity,
     pub destination: PathBuf,
-    pub destination_parent_identity: MoveIdentity,
+    pub destination_parent_identity: EntryIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_directory: Option<PathBuf>,
     pub bindings: Vec<MoveBinding>,
@@ -207,10 +201,64 @@ impl Barge {
         let layout_record = self.layout()?;
         let base = canonical(&volume.base())?;
         let source = move_source(source)?;
+        let destination =
+            self.resolve_destination(&layout_record, volume_name, &base, destination, creatable)?;
+        check_containment(
+            &source,
+            &destination.path,
+            &base,
+            &layout_record,
+            volume_name,
+            layout.as_ref(),
+        )?;
+        let source_identity = entry_identity(&source)?;
+        let destination_parent_identity = entry_identity(&destination.parent)?;
+        if source_identity.dev != destination_parent_identity.dev {
+            return Err(Error::refused(
+                "move crosses a filesystem; copy is not supported",
+            ));
+        }
+        let records = self.bindings().list()?;
+        let bindings = plan_bindings(&records, &source, &destination.path)?;
+        let unrecorded_links =
+            self.unrecorded_links(&records, class, &source, &destination.path)?;
+        let areas = self.plan_areas(volume_name, &base, &source, &destination.path)?;
+        let consumers = bindings.iter().map(|b| b.record.consumer.clone()).collect();
+        let manual_steps = manual_steps(&unrecorded_links, &areas, &source, &destination.path);
+        Ok(MovePlan {
+            schema: MOVE_PLAN_SCHEMA.into(),
+            volume: volume_name.into(),
+            volume_spec: volume.spec().clone(),
+            class,
+            source,
+            source_identity,
+            destination: destination.path,
+            destination_parent_identity,
+            create_directory: destination.create,
+            bindings,
+            unrecorded_links,
+            layout,
+            areas,
+            consumers,
+            manual_steps,
+        })
+    }
+
+    /// Where the move puts the data: the destination with its parent resolved,
+    /// the class folder apply has to create when there is none, and the existing
+    /// ancestor whose identity apply re-checks.
+    fn resolve_destination(
+        &self,
+        layout: &crate::layout::Layout,
+        volume_name: &str,
+        base: &Path,
+        destination: &Path,
+        creatable: Option<&Path>,
+    ) -> Result<MoveDestination> {
         let parent = destination
             .parent()
             .ok_or_else(|| Error::usage("destination needs a parent"))?;
-        let (parent, create_directory, identity_parent) = match canonical(parent) {
+        let (parent, create, identity_parent) = match canonical(parent) {
             Ok(parent) => (parent.clone(), None, parent),
             Err(_error) if creatable == Some(parent) && !parent.exists() => {
                 let ancestor = parent
@@ -221,7 +269,7 @@ impl Barge {
                     .file_name()
                     .ok_or_else(|| Error::usage("class folder needs a name"))?;
                 let parent = ancestor.join(name);
-                let class_folder = layout_record.classes.values().any(|placement| {
+                let class_folder = layout.classes.values().any(|placement| {
                     placement.volume == volume_name && base.join(&placement.path) == parent
                 });
                 if !class_folder {
@@ -236,150 +284,45 @@ impl Barge {
         let name = destination
             .file_name()
             .ok_or_else(|| Error::usage("destination needs a name"))?;
-        let destination = parent.join(name);
-        if !source.starts_with(&base)
-            || source == base
-            || !parent.starts_with(&base)
-            || parent.starts_with(&source)
-        {
-            return Err(Error::refused(
-                "source and destination must be distinct paths inside the registered volume",
-            ));
-        }
-        match fs::symlink_metadata(&destination) {
-            Ok(_) => {
-                return Err(Error::refused(format!(
-                    "destination {} already exists",
-                    destination.display()
-                )))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Error::io("cannot inspect", &destination, &e)),
-        }
-        let source_identity = entry_identity(&source)?;
-        let destination_parent_identity = entry_identity(&identity_parent)?;
-        if source_identity.dev != destination_parent_identity.dev {
-            return Err(Error::refused(
-                "move crosses a filesystem; copy is not supported",
-            ));
-        }
-        for (other_class, placement) in &layout_record.classes {
-            if placement.volume == volume_name
-                && layout
-                    .as_ref()
-                    .is_none_or(|change| change.class != *other_class)
-            {
-                let other = base.join(&placement.path);
-                if other.starts_with(&source) {
-                    return Err(Error::refused(format!(
-                        "move contains class {}; move it separately first",
-                        other_class.name()
-                    )));
-                }
-            }
-        }
-        let mut bindings = Vec::new();
-        let records = self.bindings().list()?;
-        for record in &records {
-            // A workflow binding is not a link, and a move does not regenerate
-            // its block: doctor reports the block stale until `barge init` runs.
-            let BindingTarget::Link { path } = &record.target else {
-                continue;
-            };
-            let link = path.as_path();
-            let link_parent = link
-                .parent()
-                .ok_or_else(|| Error::usage("link has no parent"))?;
-            let resolved_link = canonical(link_parent)?.join(
-                link.file_name()
-                    .ok_or_else(|| Error::usage("link has no name"))?,
-            );
-            let value_suffix = record.applied.value.strip_prefix(&source).ok();
-            let link_suffix = resolved_link.strip_prefix(&source).ok();
-            if value_suffix.is_some() || link_suffix.is_some() {
-                let before = observe(link)?;
-                if !matches!(&before, Observed::Link { .. })
-                    || canonical(link)? != record.applied.value
-                {
-                    return Err(Error::refused(format!(
-                        "binding {} has drifted",
-                        record.consumer
-                    )));
-                }
-                let after = value_suffix.map_or_else(
-                    || record.applied.value.clone(),
-                    |suffix| destination.join(suffix),
-                );
-                let link_after = link_suffix
-                    .map_or_else(|| link.to_path_buf(), |suffix| destination.join(suffix));
-                bindings.push(MoveBinding {
-                    record: record.clone(),
-                    before,
-                    after,
-                    link_after,
-                });
-            }
-        }
-        let unrecorded_links = self.unrecorded_links(&records, class, &source, &destination)?;
+        Ok(MoveDestination {
+            path: parent.join(name),
+            create,
+            parent: identity_parent,
+        })
+    }
+
+    /// The declared areas a moved folder carries, with their rewritten folder.
+    fn plan_areas(
+        &self,
+        volume_name: &str,
+        base: &Path,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<Vec<MoveArea>> {
         let mut areas = Vec::new();
         for before in self.core.state.read_areas()? {
             if before.volume != volume_name {
                 continue;
             }
             let area_path = base.join(before.effective_folder());
-            if let Ok(suffix) = area_path.strip_prefix(&source) {
-                let new_path = destination.join(suffix);
-                let relative = new_path
-                    .strip_prefix(&base)
-                    .map_err(|_| Error::refused("area would leave volume"))?;
-                let mut after = before.clone();
-                after.folder = Some(
-                    relative
-                        .to_str()
-                        .ok_or_else(|| Error::usage("area path is not UTF-8"))?
-                        .to_string(),
-                );
-                after.validate()?;
-                areas.push(MoveArea { before, after });
-            }
+            let Ok(suffix) = area_path.strip_prefix(source) else {
+                continue;
+            };
+            let new_path = destination.join(suffix);
+            let relative = new_path
+                .strip_prefix(base)
+                .map_err(|_| Error::refused("area would leave volume"))?;
+            let mut after = before.clone();
+            after.folder = Some(
+                relative
+                    .to_str()
+                    .ok_or_else(|| Error::usage("area path is not UTF-8"))?
+                    .to_string(),
+            );
+            after.validate()?;
+            areas.push(MoveArea { before, after });
         }
-        let consumers = bindings.iter().map(|b| b.record.consumer.clone()).collect();
-        let mut manual_steps = vec![
-            "Update any unrecorded settings or workflows that refer to the old path.".to_string(),
-        ];
-        for unrecorded in &unrecorded_links {
-            manual_steps.push(format!(
-                "Record the {} link at {}: {}",
-                unrecorded.location,
-                unrecorded.link.display(),
-                unrecorded.adopt
-            ));
-        }
-        for area in &areas {
-            manual_steps.push(format!(
-                "Update the {} area declaration to use folder {}.",
-                area.before.key().label(),
-                area.after.effective_folder()
-            ));
-        }
-        manual_steps.extend(crate::tool_steps::for_move(&source, &destination));
-        Ok(MovePlan {
-            schema: MOVE_PLAN_SCHEMA.into(),
-            volume: volume_name.into(),
-            volume_spec: volume.spec().clone(),
-            class,
-            source,
-            source_identity,
-            destination,
-            destination_parent_identity,
-            create_directory,
-            bindings,
-            unrecorded_links,
-            layout,
-            areas,
-            consumers,
-            manual_steps,
-        })
+        Ok(areas)
     }
 
     /// The known links under the home folder that point into `source` and that no
@@ -433,6 +376,143 @@ impl Barge {
         }
         Ok(found)
     }
+}
+
+/// Where a plan puts the data, and what must still hold when it is applied.
+struct MoveDestination {
+    /// The destination path, with its parent resolved.
+    path: PathBuf,
+    /// The class folder apply has to create, when it does not exist yet.
+    create: Option<PathBuf>,
+    /// The existing ancestor whose device and inode apply re-checks.
+    parent: PathBuf,
+}
+
+/// Refuse a move that is not a rename of one entry to a new name inside the
+/// volume, over an empty destination, carrying no other class folder with it.
+fn check_containment(
+    source: &Path,
+    destination: &Path,
+    base: &Path,
+    layout: &crate::layout::Layout,
+    volume_name: &str,
+    change: Option<&MoveLayout>,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Error::usage("destination needs a parent"))?;
+    if !source.starts_with(base)
+        || source == base
+        || !parent.starts_with(base)
+        || parent.starts_with(source)
+    {
+        return Err(Error::refused(
+            "source and destination must be distinct paths inside the registered volume",
+        ));
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(Error::refused(format!(
+                "destination {} already exists",
+                destination.display()
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::io("cannot inspect", destination, &e)),
+    }
+    for (other_class, placement) in &layout.classes {
+        if placement.volume == volume_name
+            && change.is_none_or(|change| change.class != *other_class)
+        {
+            let other = base.join(&placement.path);
+            if other.starts_with(source) {
+                return Err(Error::refused(format!(
+                    "move contains class {}; move it separately first",
+                    other_class.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The recorded links a move carries, with the exact value each must hold before
+/// and after it.
+fn plan_bindings(
+    records: &[BindingRecord],
+    source: &Path,
+    destination: &Path,
+) -> Result<Vec<MoveBinding>> {
+    let mut bindings = Vec::new();
+    for record in records {
+        // A workflow binding is not a link, and a move does not regenerate its
+        // block: doctor reports the block stale until `barge init` runs.
+        let BindingTarget::Link { path } = &record.target else {
+            continue;
+        };
+        let link = path.as_path();
+        let link_parent = link
+            .parent()
+            .ok_or_else(|| Error::usage("link has no parent"))?;
+        let resolved_link = canonical(link_parent)?.join(
+            link.file_name()
+                .ok_or_else(|| Error::usage("link has no name"))?,
+        );
+        let value_suffix = record.applied.value.strip_prefix(source).ok();
+        let link_suffix = resolved_link.strip_prefix(source).ok();
+        if value_suffix.is_none() && link_suffix.is_none() {
+            continue;
+        }
+        let before = observe(link)?;
+        if !matches!(&before, Observed::Link { .. }) || canonical(link)? != record.applied.value {
+            return Err(Error::refused(format!(
+                "binding {} has drifted",
+                record.consumer
+            )));
+        }
+        let after = value_suffix.map_or_else(
+            || record.applied.value.clone(),
+            |suffix| destination.join(suffix),
+        );
+        let link_after =
+            link_suffix.map_or_else(|| link.to_path_buf(), |suffix| destination.join(suffix));
+        bindings.push(MoveBinding {
+            record: record.clone(),
+            before,
+            after,
+            link_after,
+        });
+    }
+    Ok(bindings)
+}
+
+/// What a consumer has to do by hand after the move: everything the transaction
+/// cannot reach.
+fn manual_steps(
+    unrecorded_links: &[UnrecordedLink],
+    areas: &[MoveArea],
+    source: &Path,
+    destination: &Path,
+) -> Vec<String> {
+    let mut steps =
+        vec!["Update any unrecorded settings or workflows that refer to the old path.".to_string()];
+    for unrecorded in unrecorded_links {
+        steps.push(format!(
+            "Record the {} link at {}: {}",
+            unrecorded.location,
+            unrecorded.link.display(),
+            unrecorded.adopt
+        ));
+    }
+    for area in areas {
+        steps.push(format!(
+            "Update the {} area declaration to use folder {}.",
+            area.before.key().label(),
+            area.after.effective_folder()
+        ));
+    }
+    steps.extend(crate::tool_steps::for_move(source, destination));
+    steps
 }
 
 /// What a link points at, resolved when the target exists so an equivalent path
@@ -531,6 +611,25 @@ struct MoveChanges<'a> {
     links: Vec<&'a UnrecordedLink>,
 }
 
+/// The records a commit leaves behind: every carried binding names the link and
+/// the destination the commit retargeted it to, so the records and the links
+/// agree even when the data could not be renamed back.
+fn moved_records(plan: &MovePlan, originals: &[BindingRecord]) -> Vec<BindingRecord> {
+    let mut records = originals.to_vec();
+    for binding in &plan.bindings {
+        if let Some(record) = records
+            .iter_mut()
+            .find(|record| record.consumer == binding.record.consumer)
+        {
+            record.applied.value = binding.after.clone();
+            record.target = BindingTarget::Link {
+                path: binding.link_after.clone(),
+            };
+        }
+    }
+    records
+}
+
 /// The refusals a plan must pass before anything is locked or written.
 fn check_move_request(plan: &MovePlan, options: MoveApplyOptions) -> Result<()> {
     if plan.schema != MOVE_PLAN_SCHEMA {
@@ -556,17 +655,17 @@ fn check_move_request(plan: &MovePlan, options: MoveApplyOptions) -> Result<()> 
     Ok(())
 }
 
-/// Test seam: count a link step down and fail when the counter reaches one, so a
-/// rollback test can stop a commit at a known step.
+/// Test seam: `FAIL_AFTER` counts the link steps that still succeed, and the one
+/// that takes it to zero fails, so a rollback test stops a commit at a known
+/// step.
 #[cfg(test)]
 fn fail_injected_binding() -> Result<()> {
-    FAIL_AFTER.with(|count| {
-        let remaining = count.get();
-        if remaining > 0 {
-            count.set(remaining - 1);
-        }
+    let remaining = FAIL_AFTER.with(|count| {
+        let remaining = count.get().saturating_sub(1);
+        count.set(remaining);
+        remaining
     });
-    if FAIL_AFTER.with(|count| count.get() == 1) {
+    if remaining == 0 {
         return Err(Error::refused("injected binding failure"));
     }
     Ok(())
@@ -614,12 +713,20 @@ impl Barge {
                         .path
                         .parent()
                         .ok_or_else(|| Error::unknown_state("root has no area"))?;
-                    let lock_path = crate::area::hold_lock_path(directory, &root.id);
-                    let file = crate::area::lock_root_try(&lock_path, crate::Mode::Exclusive)?
-                        .ok_or_else(|| {
-                            Error::refused(format!("root {} is held", root.path.display()))
-                        })?;
-                    root_locks.push(file);
+                    let lock_path = hold::hold_lock_path(directory, &root.id);
+                    let mut taken = None;
+                    for _ in 0..2 {
+                        taken = hold::lock_root_try(&lock_path, crate::Mode::Exclusive)?;
+                        if taken.is_some() {
+                            break;
+                        }
+                        // A listing probes a root's lock exclusively to report it
+                        // as held, so one attempt can fail spuriously; a real
+                        // holder still wins the second.
+                    }
+                    root_locks.push(taken.ok_or_else(|| {
+                        Error::refused(format!("root {} is held", root.path.display()))
+                    })?);
                 }
             }
         }
@@ -752,8 +859,8 @@ impl Barge {
         let mut failures = Vec::new();
         if let Err(e) = crate::os::rename_no_replace(&plan.destination, &plan.source) {
             // The source name was occupied or the filesystem refused recovery.
-            // Keep links on the surviving destination when possible rather than
-            // knowingly pointing them at the absent old source.
+            // The data therefore stays at the destination, and every link is
+            // moved onto it rather than left pointing at the absent old source.
             for binding in &plan.bindings {
                 if changes.bindings.contains(&binding) {
                     continue;
@@ -767,8 +874,10 @@ impl Barge {
                 };
                 if let Err(problem) = replace_link(&binding.link_after, before, &binding.after) {
                     failures.push(format!(
-                        "link {} could not be repaired: {problem}",
-                        binding.link_after.display()
+                        "the link {} still points at {} while its record names {}: {problem}",
+                        binding.link_after.display(),
+                        before.display(),
+                        binding.after.display()
                     ));
                 }
             }
@@ -778,10 +887,23 @@ impl Barge {
                 }
                 if let Err(problem) = replace_link(&link.link, &link.before, &link.after) {
                     failures.push(format!(
-                        "link {} could not be repaired: {problem}",
-                        link.link.display()
+                        "the link {} still points at {} while the plan names {}: {problem}",
+                        link.link.display(),
+                        link.before.display(),
+                        link.after.display()
                     ));
                 }
+            }
+            // The records follow the links onto the surviving destination, so a
+            // later `barge doctor` reports drift only where a link could not be
+            // repaired, which the message above names.
+            if let Err(problem) =
+                crate::bindings::write(&self.core, &moved_records(plan, originals))
+            {
+                failures.push(format!(
+                    "the binding records still name {}: {problem}",
+                    plan.source.display()
+                ));
             }
             return Err(Error::new(
                 error.kind(),
@@ -867,19 +989,7 @@ fn replace_link(path: &Path, expected: &Path, destination: &Path) -> Result<()> 
                         hook(&temporary);
                     }
                 });
-                let result = (|| {
-                    match observe(path)? {
-                        Observed::Link { destination } if destination == expected => {}
-                        _ => {
-                            return Err(Error::refused(format!(
-                                "link {} changed before retargeting",
-                                path.display()
-                            )))
-                        }
-                    }
-                    fs::rename(&temporary, path)
-                        .map_err(|e| Error::io("cannot replace link", path, &e))
-                })();
+                let result = install_replacement(path, &temporary, expected);
                 if result.is_err() {
                     let _ = fs::remove_file(&temporary);
                 }
@@ -890,6 +1000,21 @@ fn replace_link(path: &Path, expected: &Path, destination: &Path) -> Result<()> 
         }
     }
     Err(Error::refused("cannot allocate a temporary link name"))
+}
+
+/// Swap a replacement link into place, but only while the path still holds the
+/// link the plan observed: another writer's link is never replaced.
+fn install_replacement(path: &Path, temporary: &Path, expected: &Path) -> Result<()> {
+    match observe(path)? {
+        Observed::Link { destination } if destination == expected => {}
+        _ => {
+            return Err(Error::refused(format!(
+                "link {} changed before retargeting",
+                path.display()
+            )))
+        }
+    }
+    fs::rename(temporary, path).map_err(|e| Error::io("cannot replace link", path, &e))
 }
 
 #[cfg(test)]
@@ -1026,7 +1151,7 @@ mod tests {
                 .unwrap();
         }
         let plan = b.plan_class_move(Class::Vms, "new-vms").unwrap();
-        FAIL_AFTER.with(|count| count.set(3));
+        FAIL_AFTER.with(|count| count.set(2));
         let error = b
             .apply_move(
                 &plan,
@@ -1047,6 +1172,100 @@ mod tests {
             );
         }
         assert!(b.doctor().unwrap().ok);
+    }
+
+    #[test]
+    fn a_rollback_that_cannot_rename_back_records_the_surviving_destination() {
+        let temp = crate::testing::TempDir::new("move-rollback-rename").unwrap();
+        let mount = temp.folder("volume").unwrap();
+        let state = temp.folder("state").unwrap();
+        let home = temp.folder("home").unwrap();
+        let os = Arc::new(FakeOs::new());
+        os.add_volume(
+            mount.clone(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            1000,
+        );
+        let b = Barge::open_with(state, os, Arc::new(ManualClock::new(1)))
+            .unwrap()
+            .with_home(&home);
+        b.register_volume(VolumeRegistration::new("volume", &mount).floor_bytes(0))
+            .unwrap();
+        b.set_layout(
+            Class::Vms,
+            Placement {
+                volume: "volume".into(),
+                path: "vms".into(),
+                absent: Absent::Fail,
+            },
+        )
+        .unwrap();
+        fs::create_dir(mount.join("vms")).unwrap();
+        for name in ["one", "two"] {
+            fs::create_dir(mount.join("vms").join(name)).unwrap();
+            let link = temp.path().join(name);
+            symlink(mount.join("vms").join(name), &link).unwrap();
+            b.bindings()
+                .adopt(&Binding::link(name, Class::Vms, link))
+                .unwrap();
+        }
+        let plan = b.plan_class_move(Class::Vms, "new-vms").unwrap();
+        // A writer racing the rollback takes the old source name back, so the
+        // data cannot be renamed home and has to stay at the destination.
+        let source = plan.source.clone();
+        RETARGET_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                fs::write(&source, b"collision").unwrap();
+            }))
+        });
+        FAIL_AFTER.with(|count| count.set(2));
+        let error = b
+            .apply_move(
+                &plan,
+                MoveApplyOptions {
+                    confirm_stopped: true,
+                    retarget_unrecorded: false,
+                },
+            )
+            .unwrap_err();
+        FAIL_AFTER.with(|count| count.set(0));
+
+        assert!(
+            error.message().contains("rollback rename failed"),
+            "{}",
+            error.message()
+        );
+        assert!(mount.join("new-vms").exists(), "the data survives");
+        for binding in &plan.bindings {
+            assert_eq!(
+                fs::read_link(binding.record.owned_path()).unwrap(),
+                binding.after,
+                "the link follows the data to the surviving destination"
+            );
+        }
+        let records = b.bindings().list().unwrap();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert!(
+                record.applied.value.starts_with(&plan.destination),
+                "the record names the surviving destination: {}",
+                record.applied.value.display()
+            );
+        }
+        // With the data left at the destination the layout still names the old
+        // class folder, so doctor reports exactly that; no binding may report a
+        // link that disagrees with its record.
+        let report = b.doctor().unwrap();
+        for binding in &report.binding_reports {
+            if let crate::BindingState::Drifted { reason, .. } = &binding.state {
+                assert!(
+                    reason != "the link points somewhere else",
+                    "{}: {:?}",
+                    binding.consumer,
+                    binding.state
+                );
+            }
+        }
     }
 
     #[test]
@@ -1092,7 +1311,7 @@ mod tests {
 
         // Fail after the first link was retargeted, so the rollback has to put a
         // retargeted link back as well as the data and the records.
-        FAIL_AFTER.with(|count| count.set(3));
+        FAIL_AFTER.with(|count| count.set(2));
         let error = b
             .apply_move(
                 &plan,

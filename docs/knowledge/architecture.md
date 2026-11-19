@@ -223,7 +223,9 @@ compatibility, freshness or what a root contains.
 - A size is the space an entry occupies, its allocated 512-byte blocks
   (`st_blocks * 512`), not its apparent length, so a sparse file or a
   copy-on-write cloned VM disk neither overstates a soft cap nor overstates the
-  bytes an eviction freed.
+  bytes an eviction freed. An eviction takes those bytes from the deletion that
+  removes the trash copy, or from the size a release recorded, so no separate
+  walk runs while the hold lock and the area lock are held.
 - A reserve pass counts the measured bytes it evicts and stops when that reaches
   the target. APFS can report freed space late, so free space is read once more
   only at the end, for the report, instead of after every root.
@@ -318,7 +320,8 @@ identity. Required cases:
 - a different volume at the registered mount is refused;
 - a mismatched area declaration is refused with the differing fields named;
 - plan, apply, adopt and undo of a link on temporary paths, including a target
-  that changed after the plan, a preserved directory, and deletion that never
+  that changed after the plan, a preserved directory, an adopted link whose text
+  is relative or runs through a symlinked folder, and deletion that never
   follows a symlink;
 - doctor reports ok, drifted, stale, missing and unavailable, and writes nothing
   on a read-only account;
