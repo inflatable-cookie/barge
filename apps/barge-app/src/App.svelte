@@ -102,10 +102,9 @@
   });
 </script>
 
-<div class="titlebar" data-tauri-drag-region></div>
+<div class="titlebar" data-tauri-drag-region><span class="titlebar-brand" data-tauri-drag-region>Barge</span></div>
 <div class="shell">
   <aside>
-    <div class="brand">Barge</div>
     <SidebarNav {groups} bind:value={view} ariaLabel="Barge navigation" />
   </aside>
   <main class="content">

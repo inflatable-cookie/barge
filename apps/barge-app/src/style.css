@@ -1,5 +1,5 @@
 /* macOS draws no title bar: the traffic lights float over this strip (app.md, "Window"). */
-:root { --chrome-strip: 0px; --sidebar: 190px; font: 14px -apple-system, BlinkMacSystemFont, sans-serif; color: var(--poodle-color-text-primary); background: var(--poodle-color-background-canvas); }
+:root { --chrome-strip: 0px; --top-inset: 16px; --sidebar: 190px; font: 14px -apple-system, BlinkMacSystemFont, sans-serif; color: var(--poodle-color-text-primary); background: var(--poodle-color-background-canvas); }
 * { box-sizing: border-box; }
 body { margin: 0; }
 [data-chrome="overlay"] { --chrome-strip: 40px; }
@@ -7,12 +7,17 @@ h1 { font-size: 1.5rem; margin: 0 0 1.5rem; }
 h2 { color: var(--poodle-color-text-secondary); font-size: .8rem; margin: 0 0 .5rem; }
 p { line-height: 1.5; }
 .shell { display: grid; grid-template-columns: var(--sidebar) 1fr; height: 100vh; }
-aside { background: var(--poodle-color-background-surface); border-right: 1px solid var(--poodle-color-border-subtle); padding: calc(var(--chrome-strip) + 24px) 12px 24px; overflow-y: auto; }
-.brand { font-weight: 700; padding: 0 12px 24px; }
-.content { display: flex; flex-direction: column; padding: calc(var(--chrome-strip) + 32px) 40px 40px; min-width: 0; overflow-y: auto; }
+aside { background: var(--poodle-color-background-surface); border-right: 1px solid var(--poodle-color-border-subtle); padding: calc(var(--chrome-strip) + var(--top-inset)) 12px 24px; overflow-y: auto; }
+/* Poodle's SidebarNav carries its own outer padding; without this the first
+   item would sit below the content heading instead of sharing its top line. */
+aside .poodle-sidebar-nav { padding-block: 0; }
+.content { display: flex; flex-direction: column; padding: calc(var(--chrome-strip) + var(--top-inset)) 40px 40px; min-width: 0; overflow-y: auto; }
 /* The window's drag handle, from edge to edge; nothing interactive sits in it.
    Over the content it takes the canvas colour, so scrolled cards pass under it. */
-.titlebar { position: fixed; inset: 0 0 auto; height: var(--chrome-strip); z-index: 20; background: linear-gradient(to right, transparent var(--sidebar), var(--poodle-color-background-canvas) var(--sidebar)); }
+.titlebar { position: fixed; inset: 0 0 auto; height: var(--chrome-strip); z-index: 20; display: flex; align-items: center; background: linear-gradient(to right, transparent var(--sidebar), var(--poodle-color-background-canvas) var(--sidebar)); }
+/* The title sits beside the traffic lights, inside the drag region; it takes
+   no pointer events, so the whole strip keeps dragging the window. */
+.titlebar-brand { margin-left: 78px; font-weight: 700; pointer-events: none; user-select: none; -webkit-user-select: none; }
 .heading { display: flex; align-items: baseline; justify-content: space-between; }
 .observed { color: var(--poodle-color-text-secondary); font-size: .85rem; margin: 0 0 12px; }
 .volumes { padding: 0; list-style: none; }

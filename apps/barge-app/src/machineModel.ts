@@ -1,6 +1,7 @@
 //! How a machine's state reads in the window. The states and the offers come
 //! from the Rust state model (`machine_state.rs`); this file only words them.
-//! Keep the words in step with `machine_state::label`, which the menu uses.
+//! The card menu's labels are plain ("Restart"); the native menu keeps its
+//! ellipses (`menu_plan.rs`), so the two wordings differ on purpose.
 
 import type { MachineStatus, Offer } from "./types";
 
@@ -12,7 +13,13 @@ export function countdownSeconds(deadline: number, now: number): number {
 
 export function stateLabel(status: MachineStatus, now: number): string {
   switch (status.phase) {
-    case "offline": return "Offline";
+    case "offline": {
+      // The last observation folds into the label, so the card needs no
+      // separate last-seen line. A fresh or future stamp reads plain.
+      if (status.last_seen_unix_ms === null) return "Offline";
+      if (now - status.last_seen_unix_ms < 5_000) return "Offline";
+      return `Offline for ${offlineFor(status.last_seen_unix_ms, now)}`;
+    }
     case "checking": return "Checking…";
     case "waking": return "Waking…";
     case "awake": return "Awake";
@@ -46,8 +53,8 @@ export function offerLabel(offer: Offer): string {
   switch (offer) {
     case "wake": return "Wake";
     case "sleep": return "Sleep";
-    case "restart": return "Restart…";
-    case "shutdown": return "Shut down…";
+    case "restart": return "Restart";
+    case "shutdown": return "Shut down";
     case "cancel": return "Cancel";
     case "moonlight": return "Open Moonlight";
   }
@@ -78,6 +85,20 @@ export function observedAge(at: number, now: number): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours} h ago`;
   return `${Math.floor(hours / 24)} d ago`;
+}
+
+/**
+ * How long the machine has been offline, from its last observation: "27 s",
+ * "5 min", "2 h", "3 d". The stamp is clamped, never in the future.
+ */
+export function offlineFor(at: number, now: number): string {
+  const seconds = Math.floor(Math.max(0, now - at) / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} h`;
+  return `${Math.floor(hours / 24)} d`;
 }
 
 /** The power button shows an action's icon, even while it waits on one. */

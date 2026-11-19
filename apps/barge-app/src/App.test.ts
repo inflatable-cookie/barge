@@ -176,7 +176,7 @@ describe("Machines", () => {
     return { action: null, deadline_unix_ms: null, last_seen_unix_ms: null, offers: [], waiting: false, ...fields };
   }
   /** What the awake card's menu offers, in order. */
-  const AWAKE = ["Restart…", "Shut down…", "Open Moonlight", "Details…"];
+  const AWAKE = ["Restart", "Shut down", "Open Moonlight", "Details"];
   function machine(fields: Partial<MachineView> & { status: MachineStatus }): MachineView {
     return {
       name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", address: "bazzite.local",
@@ -225,7 +225,7 @@ describe("Machines", () => {
 
   async function openDetails(region: HTMLElement) {
     const menu = await openActions(region);
-    await fireEvent.click(within(menu).getByRole("menuitem", { name: "Details…" }));
+    await fireEvent.click(within(menu).getByRole("menuitem", { name: "Details" }));
     return screen.findByRole("dialog");
   }
 
@@ -245,15 +245,15 @@ describe("Machines", () => {
   });
 
   it.each([
-    ["checking", checking(), "Checking…", "Wake", ["Details…"]],
-    ["offline", offline(), "Offline", "Wake", ["Details…"]],
-    ["waking", waking(), "Waking…", "Waking…", ["Details…"]],
+    ["checking", checking(), "Checking…", "Wake", ["Details"]],
+    ["offline", offline(), "Offline for 12 min", "Wake", ["Details"]],
+    ["waking", waking(), "Waking…", "Waking…", ["Details"]],
     ["awake", awake(), "Awake", "Sleep", AWAKE],
-    ["pending", pendingSleep(), /^Sleeping in \d+ s$/, "Cancel", ["Details…"]],
-    ["going to sleep", goingDown("sleep"), "Going to sleep…", "Going to sleep…", ["Details…"]],
-    ["shutting down", goingDown("shutdown"), "Shutting down…", "Shutting down…", ["Details…"]],
-    ["restarting", restarting(), "Restarting…", "Restarting…", ["Details…"]],
-    ["didn't wake", didNotWake(), "Didn't wake", "Wake", ["Details…"]],
+    ["pending", pendingSleep(), /^Sleeping in \d+ s$/, "Cancel", ["Details"]],
+    ["going to sleep", goingDown("sleep"), "Going to sleep…", "Going to sleep…", ["Details"]],
+    ["shutting down", goingDown("shutdown"), "Shutting down…", "Shutting down…", ["Details"]],
+    ["restarting", restarting(), "Restarting…", "Restarting…", ["Details"]],
+    ["didn't wake", didNotWake(), "Didn't wake", "Wake", ["Details"]],
     ["still on", stillOn(), "Still on", "Sleep", AWAKE],
   ])("a card in %s shows its state once and offers only that state's actions", async (_, value, label, power, items) => {
     const api = fixture();
@@ -287,7 +287,7 @@ describe("Machines", () => {
 
     // The poll owns the state afterwards, not the renderer's copy.
     sent.finish();
-    await waitFor(() => expect(within(region).getByText("Offline")).toBeInTheDocument());
+    await waitFor(() => expect(within(region).getByText("Offline for 12 min")).toBeInTheDocument());
   });
 
   it("says so and puts the card back when the send fails", async () => {
@@ -300,7 +300,7 @@ describe("Machines", () => {
     await fireEvent.click(within(region).getByRole("button", { name: "Wake" }));
 
     expect(await screen.findByText("Wake failed: the wake packet was refused")).toBeInTheDocument();
-    expect(await within(region).findByText("Offline")).toBeInTheDocument();
+    expect(await within(region).findByText("Offline for 12 min")).toBeInTheDocument();
     expect(within(region).getByRole("button", { name: "Wake" })).toBeEnabled();
   });
 
@@ -322,7 +322,7 @@ describe("Machines", () => {
     vi.mocked(api.machines).mockResolvedValue([awake()]);
     render(App, { props: { api } });
     const menu = await openActions(await card());
-    await fireEvent.click(within(menu).getByRole("menuitem", { name: "Restart…" }));
+    await fireEvent.click(within(menu).getByRole("menuitem", { name: "Restart" }));
     expect(await screen.findByText("Restart bazzite?")).toBeInTheDocument();
     expect(api.machineAction).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole("button", { name: "Restart" }));
@@ -336,12 +336,36 @@ describe("Machines", () => {
     expect(await screen.findByText(/A cancel can't be confirmed until it answers again/)).toBeInTheDocument();
   });
 
-  it("shows the last seen age only for an unreachable machine", async () => {
+  it.each([
+    ["seconds", 27_000, "Offline for 27 s"],
+    ["minutes", 5 * 60_000, "Offline for 5 min"],
+    ["hours", 2 * 3_600_000, "Offline for 2 h"],
+  ])("folds the last observation into the offline label (%s), with no last-seen line", async (_, age, label) => {
     const api = fixture();
-    vi.mocked(api.machines).mockResolvedValue([offline()]);
+    const value = offline();
+    value.status.last_seen_unix_ms = Date.now() - age;
+    vi.mocked(api.machines).mockResolvedValue([value]);
     render(App, { props: { api } });
     const region = await card();
-    expect(within(region).getByText(/Last seen/)).toBeInTheDocument();
+    expect(within(region).getByText(label)).toBeInTheDocument();
+    expect(within(region).queryByText(/Last seen/)).not.toBeInTheDocument();
+  });
+
+  it("reads a fresh or future observation as plain Offline", async () => {
+    const api = fixture();
+    const fresh = offline();
+    fresh.status.last_seen_unix_ms = Date.now();
+    const future = offline();
+    future.name = "bazzite-future";
+    future.status.last_seen_unix_ms = Date.now() + 60_000;
+    const never = offline();
+    never.name = "bazzite-never";
+    never.status.last_seen_unix_ms = null;
+    vi.mocked(api.machines).mockResolvedValue([fresh, future, never]);
+    render(App, { props: { api } });
+    const first = await card();
+    expect(within(first).getByText("Offline", { exact: true })).toBeInTheDocument();
+    expect(screen.queryByText(/Offline for/)).not.toBeInTheDocument();
   });
 
   it.each([
@@ -448,7 +472,7 @@ describe("Machines", () => {
     expect(within(region).getByRole("button", { name: "Wake" })).toBeEnabled();
     expect(screen.queryByText(/No machines yet/)).not.toBeInTheDocument();
     refresh.finish([offline()]);
-    expect(await within(region).findByText("Offline")).toBeInTheDocument();
+    expect(await within(region).findByText("Offline for 12 min")).toBeInTheDocument();
   });
 
   it("never shows the empty state while the first snapshot is loading", async () => {

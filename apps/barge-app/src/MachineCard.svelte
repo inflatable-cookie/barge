@@ -1,6 +1,5 @@
 <script lang="ts">
   import { Card, IconButton, Menu, StatusIndicator, type MenuItem } from "@inflatable-cookie/poodle-svelte";
-  import ObservedAge from "./ObservedAge.svelte";
   import { offerIcons } from "./icons";
   import { offerLabel, powerButton, secondaryOffers, stateLabel, tone } from "./machineModel";
   import type { MachineView, Offer } from "./types";
@@ -22,7 +21,7 @@
   let menu = $derived<MenuItem[]>([
     ...actions.map((offer) => ({ value: offer, label: offerLabel(offer), disabled: busy })),
     ...(actions.length > 0 ? [{ value: "separator", label: "", kind: "separator" as const }] : []),
-    { value: "details", label: "Details…" },
+    { value: "details", label: "Details" },
   ]);
   let unreachablePending = $derived(status.phase === "pending" && !machine.reachable);
 </script>
@@ -53,9 +52,6 @@
       </div>
       <StatusIndicator status={tone(status)} label={stateLabel(status, now)} />
       <p class="muted">{machine.mode === "lan" ? "LAN" : "Tailscale"} · {machine.address}</p>
-      {#if status.last_seen_unix_ms !== null}
-        <p class="muted">Last seen <ObservedAge at={status.last_seen_unix_ms} {now} /></p>
-      {/if}
       {#if unreachablePending}
         <p class="note">Can't reach the machine. A cancel can't be confirmed until it answers again.</p>
       {/if}
