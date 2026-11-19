@@ -106,55 +106,69 @@ fn now_ms() -> u64 {
         .map_or(0, |value| value.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct MachinePresentation {
+    header: String,
+    pending: String,
+    wake: bool,
+    power: bool,
+    cancel: bool,
+}
+
+fn present(machine: &MachineView, now: u64) -> MachinePresentation {
+    let observation = machine.observation.as_ref();
+    let pending = observation.and_then(|value| value.pending);
+    let state = if !machine.reachable {
+        "unreachable"
+    } else if observation.is_some_and(|value| value.power == barge_machine::PowerState::Awake) {
+        "awake"
+    } else if observation.is_some_and(|value| value.power == barge_machine::PowerState::Asleep) {
+        "asleep"
+    } else {
+        "unknown"
+    };
+    let age = observation
+        .map(|value| {
+            format!(
+                ", {} s ago",
+                now.saturating_sub(value.observed_at_unix_ms) / 1000
+            )
+        })
+        .unwrap_or_default();
+    let text = pending
+        .map(|value| {
+            let verb = match value.action {
+                barge_machine::PowerActionKind::Sleep => "Sleeping",
+                barge_machine::PowerActionKind::Restart => "Restarting",
+                barge_machine::PowerActionKind::Shutdown => "Shutting down",
+            };
+            format!(
+                "{verb} in {} s",
+                value.deadline_unix_ms.saturating_sub(now).div_ceil(1000)
+            )
+        })
+        .unwrap_or_else(|| "No pending action".into());
+    MachinePresentation {
+        header: format!("{} · {state}{age}", machine.name),
+        pending: text,
+        wake: pending.is_none(),
+        power: machine.reachable && state == "awake" && pending.is_none(),
+        cancel: machine.reachable && pending.is_some(),
+    }
+}
+
 fn update(rows: &MenuRows, snapshot: &Snapshot, now: u64) {
     let _ = rows.storage.set_text(&snapshot.storage);
     let _ = rows.error.set_text(&snapshot.error);
     for (row, machine) in rows.machines.iter().zip(&snapshot.machines) {
-        let observation = machine.observation.as_ref();
-        let pending = observation.and_then(|value| value.pending);
-        let state = if !machine.reachable {
-            "unreachable"
-        } else if observation.is_some_and(|value| value.power == barge_machine::PowerState::Awake) {
-            "awake"
-        } else if observation.is_some_and(|value| value.power == barge_machine::PowerState::Asleep)
-        {
-            "asleep"
-        } else {
-            "unknown"
-        };
-        let age = observation
-            .map(|value| {
-                format!(
-                    ", {} s ago",
-                    now.saturating_sub(value.observed_at_unix_ms) / 1000
-                )
-            })
-            .unwrap_or_default();
-        let _ = row
-            .header
-            .set_text(format!("{} · {state}{age}", machine.name));
-        let power = machine.reachable && state == "awake" && pending.is_none();
-        let _ = row.wake.set_enabled(pending.is_none());
-        let _ = row.sleep.set_enabled(power);
-        let _ = row.restart.set_enabled(power);
-        let _ = row.shutdown.set_enabled(power);
-        let _ = row
-            .cancel
-            .set_enabled(machine.reachable && pending.is_some());
-        let text = pending
-            .map(|value| {
-                let verb = match value.action {
-                    barge_machine::PowerActionKind::Sleep => "Sleeping",
-                    barge_machine::PowerActionKind::Restart => "Restarting",
-                    barge_machine::PowerActionKind::Shutdown => "Shutting down",
-                };
-                format!(
-                    "{verb} in {} s",
-                    value.deadline_unix_ms.saturating_sub(now).div_ceil(1000)
-                )
-            })
-            .unwrap_or_else(|| "No pending action".into());
-        let _ = row.pending.set_text(text);
+        let value = present(machine, now);
+        let _ = row.header.set_text(value.header);
+        let _ = row.pending.set_text(value.pending);
+        let _ = row.wake.set_enabled(value.wake);
+        let _ = row.sleep.set_enabled(value.power);
+        let _ = row.restart.set_enabled(value.power);
+        let _ = row.shutdown.set_enabled(value.power);
+        let _ = row.cancel.set_enabled(value.cancel);
     }
 }
 
@@ -317,7 +331,9 @@ fn needs_rebuild(current: &[String], next: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::needs_rebuild;
+    use super::{needs_rebuild, present};
+    use crate::machines::MachineView;
+    use barge_machine::{Pending, PowerActionKind, PowerState, State};
 
     #[test]
     fn state_changes_keep_existing_items_and_registry_changes_rebuild() {
@@ -328,5 +344,36 @@ mod tests {
             &["pc".to_owned(), "other".to_owned()]
         ));
         assert!(needs_rebuild(&current, &[]));
+    }
+    #[test]
+    fn same_machine_updates_its_menu_presentation_without_rebuild() {
+        let names = vec!["pc".to_owned()];
+        let mut machine = MachineView {
+            name: "pc".into(),
+            hostname: "pc.local".into(),
+            mac: "00:11:22:33:44:55".into(),
+            mode: "lan",
+            address: "pc.local".into(),
+            reachable: true,
+            observation: Some(State::new(PowerState::Awake, 1_000)),
+            error: None,
+        };
+        let awake = present(&machine, 2_000);
+        assert_eq!(awake.header, "pc · awake, 1 s ago");
+        assert!(awake.power);
+        machine.observation.as_mut().unwrap().pending = Some(Pending {
+            action: PowerActionKind::Sleep,
+            deadline_unix_ms: 14_000,
+        });
+        let pending = present(&machine, 2_000);
+        assert!(!needs_rebuild(&names, &[machine.name.clone()]));
+        assert_eq!(pending.pending, "Sleeping in 12 s");
+        assert!(pending.cancel);
+        assert!(!pending.power);
+        machine.reachable = false;
+        let offline = present(&machine, 3_000);
+        assert!(offline.header.contains("unreachable"));
+        assert!(!offline.cancel);
+        assert_eq!(offline.pending, "Sleeping in 11 s");
     }
 }
