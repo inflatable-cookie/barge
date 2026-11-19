@@ -14,6 +14,8 @@ It replaces the earlier design, whose files are deleted together with its code.
 
 ## Safety model
 
+Retargeting checks the expected symlink immediately before replacement; a writer that changes that path between the check and rename is outside the cooperative guarantee.
+
 Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 
 - **Barge deletes only what it owns:** a root whose marker matches the area and

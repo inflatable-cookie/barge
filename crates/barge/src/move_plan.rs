@@ -611,7 +611,13 @@ impl Barge {
                 if FAIL_AFTER.with(|count| count.get() == 1) {
                     return Err(Error::refused("injected binding failure"));
                 }
-                replace_link(&binding.link_after, &binding.after)?;
+                let Observed::Link {
+                    destination: before,
+                } = &binding.before
+                else {
+                    return Err(Error::unknown_state("move binding is not a link"));
+                };
+                replace_link(&binding.link_after, before, &binding.after)?;
                 changed.push(binding);
                 let record = records
                     .iter_mut()
@@ -634,7 +640,7 @@ impl Barge {
                 if FAIL_AFTER.with(|count| count.get() == 1) {
                     return Err(Error::refused("injected binding failure"));
                 }
-                replace_link(&link.link, &link.after)?;
+                replace_link(&link.link, &link.before, &link.after)?;
                 retargeted.push(link);
             }
             crate::bindings::write(&self.core, &records)?;
@@ -664,7 +670,18 @@ impl Barge {
                 // Keep links on the surviving destination when possible rather
                 // than knowingly pointing them at the absent old source.
                 for binding in &plan.bindings {
-                    if let Err(problem) = replace_link(&binding.link_after, &binding.after) {
+                    if changed.contains(&binding) {
+                        continue;
+                    }
+                    let Observed::Link {
+                        destination: before,
+                    } = &binding.before
+                    else {
+                        failures.push(format!("binding {} is not a link", binding.record.consumer));
+                        continue;
+                    };
+                    if let Err(problem) = replace_link(&binding.link_after, before, &binding.after)
+                    {
                         failures.push(format!(
                             "link {} could not be repaired: {problem}",
                             binding.link_after.display()
@@ -672,7 +689,10 @@ impl Barge {
                     }
                 }
                 for link in &plan.unrecorded_links {
-                    if let Err(problem) = replace_link(&link.link, &link.after) {
+                    if retargeted.contains(&link) {
+                        continue;
+                    }
+                    if let Err(problem) = replace_link(&link.link, &link.before, &link.after) {
                         failures.push(format!(
                             "link {} could not be repaired: {problem}",
                             link.link.display()
@@ -691,7 +711,9 @@ impl Barge {
             }
             for binding in changed.iter().rev() {
                 if let Observed::Link { destination } = &binding.before {
-                    if let Err(e) = replace_link(&binding.record.owned_path(), destination) {
+                    if let Err(e) =
+                        replace_link(&binding.record.owned_path(), &binding.after, destination)
+                    {
                         failures.push(format!(
                             "link {} could not be restored: {e}",
                             binding.record.owned_path().display()
@@ -700,7 +722,7 @@ impl Barge {
                 }
             }
             for link in retargeted.iter().rev() {
-                if let Err(e) = replace_link(&link.link, &link.before) {
+                if let Err(e) = replace_link(&link.link, &link.after, &link.before) {
                     failures.push(format!(
                         "link {} could not be restored: {e}",
                         link.link.display()
@@ -765,7 +787,7 @@ impl Barge {
 }
 
 /// Replace a symlink atomically using a unique sibling in the same directory.
-fn replace_link(path: &Path, destination: &Path) -> Result<()> {
+fn replace_link(path: &Path, expected: &Path, destination: &Path) -> Result<()> {
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -780,11 +802,29 @@ fn replace_link(path: &Path, destination: &Path) -> Result<()> {
         ));
         match symlink(destination, &temporary) {
             Ok(()) => {
-                if let Err(e) = fs::rename(&temporary, path) {
+                #[cfg(test)]
+                RETARGET_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook(&temporary);
+                    }
+                });
+                let result = (|| {
+                    match observe(path)? {
+                        Observed::Link { destination } if destination == expected => {}
+                        _ => {
+                            return Err(Error::refused(format!(
+                                "link {} changed before retargeting",
+                                path.display()
+                            )))
+                        }
+                    }
+                    fs::rename(&temporary, path)
+                        .map_err(|e| Error::io("cannot replace link", path, &e))
+                })();
+                if result.is_err() {
                     let _ = fs::remove_file(&temporary);
-                    return Err(Error::io("cannot replace link", path, &e));
                 }
-                return Ok(());
+                return result;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(Error::io("cannot create replacement link beside", path, &e)),
@@ -793,6 +833,10 @@ fn replace_link(path: &Path, destination: &Path) -> Result<()> {
     Err(Error::refused("cannot allocate a temporary link name"))
 }
 
+#[cfg(test)]
+type RetargetHook = Option<Box<dyn FnOnce(&Path)>>;
+#[cfg(test)]
+thread_local! { static RETARGET_HOOK: std::cell::RefCell<RetargetHook> = std::cell::RefCell::new(None); }
 #[cfg(test)]
 thread_local! { static FAIL_DOCTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
@@ -804,6 +848,49 @@ mod tests {
     use crate::{Absent, Binding, FakeOs, ManualClock, VolumeRegistration};
     use std::os::unix::fs::symlink;
     use std::sync::Arc;
+
+    #[test]
+    fn retarget_refuses_replaced_entries_and_removes_the_temporary_link() {
+        let temp = crate::testing::TempDir::new("retarget-race").unwrap();
+        let path = temp.child("link");
+        let before = temp.child("before");
+        let after = temp.child("after");
+        for kind in ["file", "directory", "link"] {
+            symlink(&before, &path).unwrap();
+            let changed = path.clone();
+            let other = temp.child("other");
+            RETARGET_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    fs::remove_file(&changed).unwrap();
+                    match kind {
+                        "file" => fs::write(&changed, b"keep").unwrap(),
+                        "directory" => fs::create_dir(&changed).unwrap(),
+                        _ => symlink(&other, &changed).unwrap(),
+                    }
+                }))
+            });
+            assert!(replace_link(&path, &before, &after).is_err());
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            match kind {
+                "file" => assert_eq!(fs::read(&path).unwrap(), b"keep"),
+                "directory" => assert!(metadata.is_dir()),
+                _ => assert_eq!(fs::read_link(&path).unwrap(), temp.child("other")),
+            }
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+            if metadata.is_dir() {
+                fs::remove_dir(&path).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+        }
+        symlink(&before, &path).unwrap();
+        RETARGET_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|temporary| fs::remove_file(temporary).unwrap()))
+        });
+        assert!(replace_link(&path, &before, &after).is_err());
+        assert_eq!(fs::read_link(&path).unwrap(), before);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn doctor_failure_does_not_undo_a_committed_move() {
