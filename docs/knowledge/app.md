@@ -1,6 +1,6 @@
 # Barge app
 
-Status: Machines and Storage read views built; Machines reworked and polished on Tom's 2026-11-19 feedback. Moves, Activity and notifications remain planned.
+Status: Machines and Storage read views built; the Machines cards were reworked on Tom's 2026-11-19 feedback and tightened after PR #106 (instant wait, one countdown, one actions menu). Moves, Activity and notifications remain planned.
 
 The Barge app is a macOS menu-bar app for the two things an operator checks
 most often: the machines Barge controls, and the storage it manages. It sits
@@ -44,6 +44,15 @@ After reviewing those cards (PR #103) the same day, Tom asked for:
 - no native title bar: floating traffic lights over a top strip that drags the
   window;
 - a fix for "Last observation: in 5s".
+
+After using the cards once more (PR #106) Tom asked for:
+
+- the wait to show as soon as a button is clicked: the wake packet went out at
+  once, but the card sat unchanged for 3–4 s;
+- a countdown shown once, not in the label and again under the button;
+- the small action buttons consolidated into one `[...]` menu at the card's top
+  right, because a sleeping machine's single icon claimed a whole row;
+- the card down to the height of its power button and text.
 
 ## Form
 
@@ -93,6 +102,9 @@ Quit
   "· N issues" is added only when the last doctor result has findings.
 - Offline: the header reads "bazzite — Offline" with Wake beneath it only.
   Waiting states show the header only. Pending shows its countdown and Cancel.
+- A chosen action shows in the menu's header at once, before the daemon answers
+  and before the next poll: the click is recorded in the shared state the
+  window also reads, and is rolled back if the send fails.
 - The error row shows only when there is an error.
 
 ## First release scope
@@ -106,20 +118,31 @@ Quit
   - **Power button,** in the avatar position: a large round icon button whose
     ring carries the state colour. Wake (power icon) when offline or after a
     failed wake, Sleep (moon) when awake or still on, Cancel (✕) while a
-    countdown runs, with the seconds beneath it. While a machine waits
-    (Waking, Going to sleep, Shutting down, Restarting) the button shows that
-    action, an arc runs round the ring, and it can't be pressed.
-  - **Beside it:** the name, the state label, and a muted line with the mode
-    and address (`LAN · bazzite.local`). A stale observation also says when
-    Barge last saw the machine. Beneath, small icon buttons for the other
-    actions the state offers (Restart…, Shut down…, Open Moonlight) and a
-    Details button. Every icon button has an accessible label and a tooltip.
+    countdown runs. While a machine waits (Waking, Going to sleep, Shutting
+    down, Restarting) the button shows that action, an arc runs round the ring,
+    and it can't be pressed.
+  - **The click shows at once.** Pressing the power button or a menu action
+    shows its wait in the same frame: the click is recorded in the shared Rust
+    state before the daemon answers, and a refused send rolls it back with an
+    error. The renderer keeps no state model of its own.
+  - **One countdown:** it appears in the state label only ("Sleeping in 6 s").
+    The button carries the progress in its ring, with no seconds beneath it; a
+    waiting state says its progress once the same way.
+  - **Beside it:** the name with one `[...]` button at the card's top right, the
+    state label, and a muted line with the mode and address
+    (`LAN · bazzite.local`). A stale observation also says when Barge last saw
+    the machine. The `[...]` button opens a menu with the rest of what the
+    state offers — Restart…, Shut down…, Open Moonlight — then a separator and
+    Details…; with nothing else to offer, Details… alone. Both the power button
+    and the menu button have an accessible label and a tooltip.
+  - **Height:** the card is the power button and its text, with no row of icons
+    along the bottom.
   - Only the actions the state offers appear. Restart and Shut down name the
     machine and ask first. Moonlight launch, which the MoonDeck Remote user
     relies on, is an action the awake card offers.
 - **Grid:** cards are at least 380 px wide, with generous gaps; the grid wraps
   by width, and one machine fills the row rather than sitting cramped.
-- **Details dialog:** opened from the card's Details button: connection mode,
+- **Details dialog:** opened from the card's menu (Details…): connection mode,
   address, port, MAC, last observation and the last error, with Pair… and
   Remove… (Remove asks first). A dialog rather than a page keeps the window to
   one level of navigation.
@@ -183,6 +206,11 @@ prune, and machine metrics beyond power state.
   timer. While an action is pending, a second action is unavailable and
   Cancel is always visible. If the connection drops mid-countdown, say that a
   cancel can't be confirmed until it's back.
+- **A click answers before the network does.** The action the operator chose is
+  written to the shared state as the click is accepted, so the card and the
+  menu show its wait without waiting for the command or the next poll. A
+  refused send removes that record and reports the error; the next poll is
+  always the truth.
 - **Confirmation names the target.** Restart, shutdown and applying a move
   need a confirmation that names the machine or move and what it interrupts.
   Escape cancels it.
@@ -250,8 +278,8 @@ Tauri Rust host (apps/barge-app/src-tauri)
 - **Poodle components,** a first mapping:
   - `SidebarNav` for the window's navigation (Machines, Storage, Activity,
     Settings);
-  - `Card` for a machine, `IconButton` for its power button and actions, and
-    `Dialog` with `DetailItem` for its details;
+  - `Card` for a machine, `IconButton` for its power button, `Menu` for its
+    actions, and `Dialog` with `DetailItem` for its details;
   - `StatusIndicator` for observed state, and `TimeAgo` outside Machines;
   - `ConfirmAction` and `AlertDialog` for confirmations;
   - `Progress` for countdowns and move progress;
@@ -294,14 +322,17 @@ opens on launch, so the app is usable even when macOS hides its menu-bar item.
 
 - Rust: the state model is a pure function (`machine_state.rs`), tested row by
   row against the states table, each timeout, restart passing through
-  unreachable, cancel, and a stale observation. The menu's item set per state
-  is tested in `menu_plan.rs`.
+  unreachable, cancel, and a stale observation. The observations (`machines.rs`)
+  keep a click's wait before the daemon answers and roll it back on a refused
+  send. The menu's item set per state is tested in `menu_plan.rs`.
 - Renderer: Vitest and Svelte Testing Library over each machine card state and
-  the actions it offers, plus storage's absent volume, mismatch, drift, and
-  empty. `apps/barge-app/fixtures.html?view=<view>&scenario=<scenario>&theme=<light|dark>`
+  the actions its menu offers, the wait showing before a deferred command
+  resolves, a refused send rolling back, the countdown appearing once, plus
+  storage's absent volume, mismatch, drift, and empty.
+  `apps/barge-app/fixtures.html?view=<view>&scenario=<scenario>&theme=<light|dark>`
   mounts the real renderer against a fake api, so a view's states can be
   screenshotted without a build. `&details` opens a machine's details;
-  `&chrome=native` drops the macOS top strip.
+  `&menu` opens its actions menu; `&chrome=native` drops the macOS top strip.
 - Rust: command tests against the fake OS identity and a loopback `barged`
   stub, as the crates already do.
 - End-to-end through Longhorn's agent-control surface, when it's added.

@@ -23,15 +23,16 @@ aside { background: var(--poodle-color-background-surface); border-right: 1px so
 .empty { display: flex; flex-direction: column; align-items: flex-start; gap: var(--poodle-space-stack-md); }
 .muted { color: var(--poodle-color-text-secondary); font-size: .85rem; margin: 0; }
 .note { color: var(--poodle-color-text-secondary); font-size: .85rem; margin: .5rem 0 0; }
-.age, .countdown { font-variant-numeric: tabular-nums; }
+.age { font-variant-numeric: tabular-nums; }
 
-/* Machines: roomy profile cards, the power button in the avatar position. */
+/* Machines: roomy profile cards, the power button in the avatar position and
+   one actions menu at the card's top right. */
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 380px), 1fr)); gap: 24px; align-items: start; }
-.machine { display: flex; gap: 24px; align-items: flex-start; padding: 8px 4px 4px; }
+.machine { display: flex; gap: 24px; align-items: center; padding: 4px; }
 .body { display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
-.body h2 { color: var(--poodle-color-text-primary); font-size: 1.2rem; font-weight: 650; letter-spacing: -.01em; margin: 0 0 2px; overflow-wrap: anywhere; }
-.tools { display: flex; align-self: stretch; align-items: center; gap: 4px; margin: 10px 0 0 -6px; }
-.tools .details { margin-left: auto; }
+.body h2 { color: var(--poodle-color-text-primary); font-size: 1.2rem; font-weight: 650; letter-spacing: -.01em; margin: 0; overflow-wrap: anywhere; }
+.head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; align-self: stretch; min-width: 0; }
+.actions-menu { flex: none; margin: -4px -6px 0 0; }
 
 .power { --ring: var(--poodle-color-border-strong); display: flex; flex: none; flex-direction: column; align-items: center; gap: 10px; }
 .power[data-tone="success"] { --ring: var(--poodle-color-status-success); }
@@ -45,7 +46,6 @@ aside { background: var(--poodle-color-background-surface); border-right: 1px so
 /* Waiting: an arc runs around the ring until the state settles. */
 .power[data-waiting="true"] .poodle-icon-button { box-shadow: 0 0 0 3px var(--poodle-color-background-surface), 0 0 0 5px color-mix(in srgb, var(--ring) 28%, transparent); }
 .power[data-waiting="true"] .poodle-icon-button-wrap::after { content: ""; position: absolute; inset: -5px; border: 2px solid transparent; border-top-color: var(--ring); border-right-color: var(--ring); border-radius: 50%; animation: ring-spin 1.1s linear infinite; pointer-events: none; }
-.countdown { color: var(--poodle-color-text-secondary); font-size: .8rem; font-weight: 600; }
 @keyframes ring-spin { to { transform: rotate(1turn); } }
 @media (prefers-reduced-motion: reduce) { .power[data-waiting="true"] .poodle-icon-button-wrap::after { animation: none; border-color: var(--ring); border-style: dashed; } }
 [data-poodle-motion-policy="reduced"] .power[data-waiting="true"] .poodle-icon-button-wrap::after,

@@ -52,6 +52,10 @@ struct Entry {
     state: Option<State>,
     seen_at: Option<u64>,
     action: Option<LastAction>,
+    /// Set while a click is being sent: the state shows its wait at once.
+    sending: bool,
+    /// The action that click replaced, put back if the send is refused.
+    replaced: Option<LastAction>,
 }
 
 impl Entry {
@@ -64,6 +68,8 @@ impl Entry {
             state: None,
             seen_at: None,
             action: None,
+            sending: false,
+            replaced: None,
         }
     }
 
@@ -149,10 +155,34 @@ impl Observations {
         }
     }
 
+    /// Record the action a click sends before the daemon answers, so the window
+    /// and the menu show its wait at once instead of after the send and a poll.
+    /// [`Self::sent`] keeps the daemon's own time; [`Self::refused`] puts it back.
+    pub fn begin(&mut self, name: &str, action: LastAction) {
+        if let Some(entry) = self.entry_mut(name) {
+            entry.replaced = entry.action;
+            entry.sending = true;
+            entry.action = Some(action);
+        }
+    }
+
     /// Record an action the daemon accepted, at the time it was accepted.
     pub fn sent(&mut self, name: &str, action: LastAction) {
         if let Some(entry) = self.entry_mut(name) {
             entry.action = Some(action);
+            entry.sending = false;
+            entry.replaced = None;
+        }
+    }
+
+    /// The send failed, so nothing was sent: put back what the click replaced.
+    pub fn refused(&mut self, name: &str) {
+        if let Some(entry) = self.entry_mut(name) {
+            if entry.sending {
+                entry.action = entry.replaced;
+                entry.sending = false;
+                entry.replaced = None;
+            }
         }
     }
 
@@ -160,6 +190,8 @@ impl Observations {
     pub fn cancelled(&mut self, name: &str) {
         if let Some(entry) = self.entry_mut(name) {
             entry.action = None;
+            entry.sending = false;
+            entry.replaced = None;
             if let Some(state) = entry.state.as_mut() {
                 state.pending = None;
             }
@@ -352,6 +384,92 @@ mod tests {
         observations.sent("pc", LastAction::wake(T0 + 2_000));
         observations.apply(vec![poll(T0 + 3_000, Err("timeout".into()))]);
         assert!(observations.any_waiting(T0 + 3_000));
+    }
+
+    #[test]
+    fn a_click_shows_its_wait_before_the_daemon_answers_and_a_refusal_puts_it_back() {
+        let mut observations = Observations::default();
+        observations.apply(vec![poll(T0, Ok(awake(T0)))]);
+        observations.apply(vec![poll(T0 + 500, Err("timed out".into()))]);
+        assert_eq!(
+            observations.snapshot(T0 + 1_000)[0].status.phase,
+            machine_state::Phase::Offline
+        );
+
+        observations.begin("pc", LastAction::wake(T0 + 1_000));
+        let waiting = &observations.snapshot(T0 + 1_000)[0];
+        assert_eq!(waiting.status.phase, machine_state::Phase::Waking);
+        assert!(waiting.status.waiting);
+
+        observations.refused("pc");
+        let back = &observations.snapshot(T0 + 2_000)[0];
+        assert_eq!(back.status.phase, machine_state::Phase::Offline);
+        assert_eq!(back.status.offers, vec![machine_state::Offer::Wake]);
+        assert!(!back.status.waiting);
+    }
+
+    #[test]
+    fn a_clicked_sleep_shows_its_countdown_before_the_daemon_reports_one() {
+        let mut observations = Observations::default();
+        observations.apply(vec![poll(T0, Ok(awake(T0)))]);
+        observations.begin("pc", sleep_action(T0 + 1_000));
+        let view = &observations.snapshot(T0 + 1_000)[0];
+        assert_eq!(view.status.phase, machine_state::Phase::Pending);
+        assert_eq!(view.status.offers, vec![machine_state::Offer::Cancel]);
+        assert!(view.status.waiting);
+
+        // The daemon accepted it after its own check, so its time wins.
+        observations.sent("pc", sleep_action(T0 + 2_000));
+        observations.refused("pc");
+        assert_eq!(
+            observations.snapshot(T0 + 3_000)[0].status.phase,
+            machine_state::Phase::Pending
+        );
+    }
+
+    #[test]
+    fn a_refusal_restores_the_action_the_click_replaced() {
+        let mut observations = Observations::default();
+        observations.apply(vec![poll(T0, Ok(awake(T0)))]);
+        // A sleep that fired and left the machine on: the card says "Still on".
+        observations.sent("pc", sleep_action(T0));
+        observations.apply(vec![poll(T0 + 80_000, Ok(awake(T0 + 80_000)))]);
+        assert_eq!(
+            observations.snapshot(T0 + 80_000)[0].status.phase,
+            machine_state::Phase::StillOn
+        );
+
+        observations.begin(
+            "pc",
+            LastAction::power(PowerActionKind::Shutdown, T0 + 81_000, 15),
+        );
+        assert_eq!(
+            observations.snapshot(T0 + 81_000)[0].status.phase,
+            machine_state::Phase::Pending
+        );
+
+        observations.refused("pc");
+        assert_eq!(
+            observations.snapshot(T0 + 82_000)[0].status.phase,
+            machine_state::Phase::StillOn
+        );
+    }
+
+    #[test]
+    fn a_refusal_after_a_late_refresh_leaves_the_observation_alone() {
+        let mut observations = Observations::default();
+        let pending = awake(T0).with_pending(Some(Pending {
+            action: PowerActionKind::Sleep,
+            deadline_unix_ms: T0 + 12_000,
+        }));
+        observations.apply(vec![poll(T0, Ok(pending))]);
+        observations.begin("pc", LastAction::wake(T0 + 1_000));
+        // A poll taken while the click was in flight lands before the answer.
+        observations.apply(vec![poll(T0 + 2_000, Ok(awake(T0 + 2_000)))]);
+        observations.refused("pc");
+        let view = &observations.snapshot(T0 + 2_000)[0];
+        assert_eq!(view.status.phase, machine_state::Phase::Awake);
+        assert!(!view.status.waiting);
     }
 
     #[test]

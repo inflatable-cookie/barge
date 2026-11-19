@@ -249,7 +249,15 @@ fn run_action(app: &AppHandle, action: &str, name: &str, shared: &SharedState) {
         let result = if action == "moonlight" {
             local::launch_moonlight()
         } else {
-            machines::action(&app.state::<MachineState>().0, &name, &action)
+            let observations = &app.state::<MachineState>().0;
+            // Record the click before the send, so the next time the menu opens
+            // it shows the wait instead of waiting for a poll.
+            if let Some(clicked) = machines::clicked(&action, now_ms()) {
+                if let Ok(mut store) = observations.lock() {
+                    store.begin(&name, clicked);
+                }
+            }
+            machines::action(observations, &name, &action)
         };
         if let Ok(mut state) = shared.lock() {
             state.action_error = result

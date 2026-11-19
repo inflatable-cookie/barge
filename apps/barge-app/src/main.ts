@@ -17,6 +17,7 @@ const api: AppApi = {
   addMachine: (input) => invoke("machines_add", { input }),
   pairMachine: (name, key) => invoke("machines_pair", { name, key }),
   removeMachine: (name) => invoke("machines_remove", { name }),
+  beginMachineAction: (name, operation) => invoke<MachineView[]>("machines_begin", { name, operation }),
   machineAction: (name, operation) => invoke("machines_action", { name, operation }),
   moonlight: () => invoke("open_moonlight"),
 };
