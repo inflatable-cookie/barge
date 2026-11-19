@@ -5,6 +5,8 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub struct LocalMachine {
     pub name: String,
+    pub state: &'static str,
+    pub observed_at_unix_ms: u64,
     pub model: Option<String>,
     pub uptime_seconds: Option<u64>,
     pub volumes: Vec<crate::storage::VolumeSummary>,
@@ -49,9 +51,32 @@ pub fn local_machine() -> LocalMachine {
                 .as_secs()
                 .checked_sub(boot)
         });
+    let account = barge::Barge::open_read_only().map_err(|error| error.to_string());
+    local_from_account(
+        name,
+        model,
+        uptime_seconds,
+        account.as_ref().map_err(Clone::clone),
+    )
+}
+
+fn local_from_account(
+    name: String,
+    model: Option<String>,
+    uptime_seconds: Option<u64>,
+    account: Result<&barge::Barge, String>,
+) -> LocalMachine {
+    let state = if uptime_seconds.is_some() {
+        "awake"
+    } else {
+        "unknown"
+    };
+    let observed_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |value| value.as_millis().try_into().unwrap_or(u64::MAX));
     let storage = (|| {
-        let account = barge::Barge::open_read_only().map_err(|error| error.to_string())?;
-        let volumes = crate::storage::volumes(&account).map_err(|error| error.to_string())?;
+        let account = account?;
+        let volumes = crate::storage::volumes(account).map_err(|error| error.to_string())?;
         let doctor = account.doctor().map_err(|error| error.to_string())?;
         Ok::<_, String>((volumes, doctor.problems()))
     })();
@@ -61,6 +86,8 @@ pub fn local_machine() -> LocalMachine {
     };
     LocalMachine {
         name,
+        state,
+        observed_at_unix_ms,
         model,
         uptime_seconds,
         volumes,
@@ -88,4 +115,31 @@ pub async fn open_moonlight() -> Result<(), String> {
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn local_machine_is_available_without_any_registry() {
+        let fixture = barge::testing::TempDir::new("app-local").unwrap();
+        let state = fixture.child("missing");
+        let account = barge::Barge::open_read_only_with(
+            &state,
+            Arc::new(barge::FakeOs::new()),
+            Arc::new(barge::ManualClock::new(0)),
+        )
+        .unwrap();
+        let local = local_from_account("Test Mac".into(), None, Some(42), Ok(&account));
+        assert_eq!(local.name, "Test Mac");
+        assert_eq!(local.state, "awake");
+        assert!(local.volumes.is_empty());
+        assert!(!state.exists());
+        assert_eq!(
+            local_from_account("Test Mac".into(), None, None, Ok(&account)).state,
+            "unknown"
+        );
+    }
 }

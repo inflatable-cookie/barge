@@ -37,7 +37,7 @@ const api: AppApi = {
   },
   openWindow: async () => {},
   quit: async () => {},
-  localMachine: async () => ({ name: "Tom’s Mac", model: "Mac15,7", uptime_seconds: 54000, volumes, doctor_findings: 0, storage_error: null }),
+  localMachine: async () => ({ name: "Tom’s Mac", state: "awake", observed_at_unix_ms: Date.now(), model: "Mac15,7", uptime_seconds: 54000, volumes, doctor_findings: 0, storage_error: null }),
   machines: async () => scenario === "empty" ? [] : [{ name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", address: "bazzite.local", reachable: scenario !== "unreachable", error: scenario === "unreachable" ? "Connection timed out" : null, observation: { power: "awake", observed_at_unix_ms: Date.now() - 12000, pending: scenario === "pending" ? { action: "sleep", deadline_unix_ms: Date.now() + 12000 } : null } }],
   addMachine: async () => {}, pairMachine: async () => {}, removeMachine: async () => {}, machineAction: async () => {}, moonlight: async () => {},
 };

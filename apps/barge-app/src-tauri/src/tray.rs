@@ -20,7 +20,21 @@ use tauri::{
 struct Snapshot {
     machines: Vec<MachineView>,
     storage: String,
-    error: String,
+    local_state: Option<(&'static str, u64)>,
+    poll_error: String,
+    action_error: String,
+}
+
+impl Snapshot {
+    fn record_poll(&mut self, result: Result<Vec<MachineView>, String>) {
+        match result {
+            Ok(machines) => {
+                self.machines = machines;
+                self.poll_error.clear();
+            }
+            Err(error) => self.poll_error = format!("Could not read machines: {error}"),
+        }
+    }
 }
 
 type Shared = Arc<Mutex<Snapshot>>;
@@ -38,6 +52,7 @@ struct Rows {
 struct MenuRows {
     names: Vec<String>,
     storage: MenuItem<tauri::Wry>,
+    local_state: MenuItem<tauri::Wry>,
     error: MenuItem<tauri::Wry>,
     machines: Vec<Rows>,
 }
@@ -54,7 +69,8 @@ fn item(
 fn build(app: &AppHandle, names: &[String]) -> tauri::Result<(Menu<tauri::Wry>, MenuRows)> {
     let menu = Menu::new(app)?;
     menu.append(&item(app, "local", "This Mac", false)?)?;
-    menu.append(&item(app, "local-state", "Awake", false)?)?;
+    let local_state = item(app, "local-state", "Checking…", false)?;
+    menu.append(&local_state)?;
     let storage = item(app, "storage", "Checking storage…", false)?;
     menu.append(&storage)?;
     let mut machines = Vec::new();
@@ -94,6 +110,7 @@ fn build(app: &AppHandle, names: &[String]) -> tauri::Result<(Menu<tauri::Wry>, 
         MenuRows {
             names: names.to_vec(),
             storage,
+            local_state,
             error,
             machines,
         },
@@ -159,7 +176,16 @@ fn present(machine: &MachineView, now: u64) -> MachinePresentation {
 
 fn update(rows: &MenuRows, snapshot: &Snapshot, now: u64) {
     let _ = rows.storage.set_text(&snapshot.storage);
-    let _ = rows.error.set_text(&snapshot.error);
+    let _ = rows
+        .local_state
+        .set_text(local_state_line(snapshot.local_state, now));
+    let _ = rows.error.set_text(
+        [snapshot.poll_error.as_str(), snapshot.action_error.as_str()]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · "),
+    );
     for (row, machine) in rows.machines.iter().zip(&snapshot.machines) {
         let value = present(machine, now);
         let _ = row.header.set_text(value.header);
@@ -172,9 +198,21 @@ fn update(rows: &MenuRows, snapshot: &Snapshot, now: u64) {
     }
 }
 
-fn storage_summary() -> String {
-    let local = local::local_machine();
-    if let Some(error) = local.storage_error {
+fn local_state_line(state: Option<(&str, u64)>, now: u64) -> String {
+    state.map_or_else(
+        || "Checking…".into(),
+        |(state, observed)| {
+            format!(
+                "{} · {} s ago",
+                if state == "awake" { "Awake" } else { "Unknown" },
+                now.saturating_sub(observed) / 1000
+            )
+        },
+    )
+}
+
+fn storage_summary(local: &local::LocalMachine) -> String {
+    if let Some(error) = &local.storage_error {
         return format!("Storage unavailable: {error}");
     }
     let volumes = if local.volumes.is_empty() {
@@ -270,7 +308,7 @@ pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Resu
                                 machines::action(&name, &action)
                             };
                             if let Ok(mut snapshot) = events.lock() {
-                                snapshot.error = result
+                                snapshot.action_error = result
                                     .err()
                                     .map_or_else(String::new, |error| format!("{name}: {error}"));
                             }
@@ -282,26 +320,21 @@ pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Resu
         .build(app)?;
     let poll_app = app.clone();
     let poll_shared = shared.clone();
-    std::thread::spawn(move || {
-        let storage = storage_summary();
+    std::thread::spawn(move || loop {
+        let local = local::local_machine();
+        let storage = storage_summary(&local);
+        let observations = poll_app.state::<MachineState>().0.clone();
+        let result = machines::poll(&observations);
         if let Ok(mut snapshot) = poll_shared.lock() {
             snapshot.storage = storage;
+            snapshot.local_state = Some((local.state, local.observed_at_unix_ms));
+            snapshot.record_poll(result);
         }
-        loop {
-            let observations = poll_app.state::<MachineState>().0.clone();
-            let result = machines::poll(&observations);
-            if let Ok(mut snapshot) = poll_shared.lock() {
-                match result {
-                    Ok(machines) => snapshot.machines = machines,
-                    Err(error) => snapshot.error = format!("Could not read machines: {error}"),
-                }
-            }
-            let interval = poll_app
-                .state::<Store>()
-                .get()
-                .map_or(10, |value| value.refresh_interval);
-            std::thread::sleep(Duration::from_secs(interval));
-        }
+        let interval = poll_app
+            .state::<Store>()
+            .get()
+            .map_or(10, |value| value.refresh_interval);
+        std::thread::sleep(Duration::from_secs(interval));
     });
     let app = app.clone();
     std::thread::spawn(move || loop {
@@ -331,7 +364,7 @@ fn needs_rebuild(current: &[String], next: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_rebuild, present};
+    use super::{local_state_line, needs_rebuild, present, storage_summary, Snapshot};
     use crate::machines::MachineView;
     use barge_machine::{Pending, PowerActionKind, PowerState, State};
 
@@ -375,5 +408,42 @@ mod tests {
         assert!(offline.header.contains("unreachable"));
         assert!(!offline.cancel);
         assert_eq!(offline.pending, "Sleeping in 11 s");
+    }
+    #[test]
+    fn recovered_poll_clears_only_poll_error() {
+        let mut snapshot = Snapshot {
+            action_error: "Cancel could not be confirmed".into(),
+            ..Snapshot::default()
+        };
+        snapshot.record_poll(Err("offline".into()));
+        assert!(snapshot.poll_error.contains("offline"));
+        snapshot.record_poll(Ok(Vec::new()));
+        assert!(snapshot.poll_error.is_empty());
+        assert_eq!(snapshot.action_error, "Cancel could not be confirmed");
+    }
+    #[test]
+    fn local_state_and_storage_follow_fresh_observations() {
+        let mut local = crate::commands::local::LocalMachine {
+            name: "Mac".into(),
+            state: "awake",
+            observed_at_unix_ms: 1_000,
+            model: None,
+            uptime_seconds: Some(5),
+            volumes: vec![],
+            doctor_findings: Some(0),
+            storage_error: None,
+        };
+        assert_eq!(
+            local_state_line(Some((local.state, local.observed_at_unix_ms)), 3_000),
+            "Awake · 2 s ago"
+        );
+        assert!(storage_summary(&local).contains("doctor OK"));
+        local.state = "unknown";
+        local.doctor_findings = Some(2);
+        assert_eq!(
+            local_state_line(Some((local.state, 3_000)), 3_000),
+            "Unknown · 0 s ago"
+        );
+        assert!(storage_summary(&local).contains("2 findings"));
     }
 }

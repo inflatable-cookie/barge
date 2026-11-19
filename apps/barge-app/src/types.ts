@@ -34,7 +34,7 @@ export interface MachineView {
   address: string; reachable: boolean; observation: Observation | null; error: string | null;
 }
 export interface LocalMachine {
-  name: string; model: string | null; uptime_seconds: number | null;
+  name: string; state: "awake" | "unknown"; observed_at_unix_ms: number; model: string | null; uptime_seconds: number | null;
   volumes: VolumeSummary[]; doctor_findings: number | null; storage_error: string | null;
 }
 export interface NewMachine {

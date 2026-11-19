@@ -130,9 +130,9 @@ Tauri Rust host (apps/barge-app/src-tauri)
 - **Refresh:**
   - machine state is polled while the app runs, at the refresh interval
     (default 10 s), and once on open;
-  - storage is read on open and on Refresh;
-  - survey sizes and doctor's binding checks run on request, never in the
-    background.
+  - the menu's local storage and doctor summary is refreshed at that interval;
+    the Storage view reads on open and on Refresh;
+  - survey sizes run only on request.
 - **Longhorn crates** (the "minimal" shape plus services):
   - `longhorn-core`, `longhorn-config`, `longhorn-settings`,
     `longhorn-settings-config`, `longhorn-tauri-config` and

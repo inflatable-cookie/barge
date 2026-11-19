@@ -21,7 +21,7 @@ function fixture(volumes: VolumeSummary[] = []): AppApi {
     openWindow: vi.fn().mockResolvedValue(undefined),
     quit: vi.fn().mockResolvedValue(undefined),
     machines: vi.fn().mockResolvedValue([]),
-    localMachine: vi.fn().mockResolvedValue({ name: "Mac", model: "Mac15,7", uptime_seconds: 100, volumes: [], doctor_findings: 0, storage_error: null }),
+    localMachine: vi.fn().mockResolvedValue({ name: "Mac", state: "awake", observed_at_unix_ms: Date.now(), model: "Mac15,7", uptime_seconds: 100, volumes: [], doctor_findings: 0, storage_error: null }),
     addMachine: vi.fn(), pairMachine: vi.fn(), removeMachine: vi.fn(), machineAction: vi.fn(), moonlight: vi.fn(),
   };
 }
@@ -171,4 +171,36 @@ describe("Machines", () => {
     expect(await screen.findByText(/Cancel could not be confirmed/)).toBeInTheDocument();
     expect(screen.getByText(/Sleeping in/)).toBeInTheDocument();
   });
+  it("clears a recovered refresh error without clearing a cancel failure", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    vi.mocked(api.machines).mockRejectedValueOnce(new Error("registry unreadable")).mockResolvedValue([remote(true, true)]);
+    vi.mocked(api.machineAction).mockRejectedValue(new Error("cancel timeout"));
+    render(App, { props: { api } });
+    await vi.waitFor(() => expect(screen.getByText(/registry unreadable/)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(screen.queryByText(/registry unreadable/)).not.toBeInTheDocument());
+    await fireEvent.click(screen.getByRole("button", { name: /bazzite.*Action pending/ }));
+    await fireEvent.click(screen.getByRole("button", { name: "Cancel action" }));
+    await vi.waitFor(() => expect(screen.getByText(/cancel timeout/)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(screen.getByText(/cancel timeout/)).toBeInTheDocument();
+  });
+  it("shows an unknown local state when the local observation fails", async () => {
+    const api = fixture();
+    vi.mocked(api.localMachine).mockResolvedValue({ name: "Mac", state: "unknown", observed_at_unix_ms: Date.now(), model: null, uptime_seconds: null, volumes: [], doctor_findings: 0, storage_error: null });
+    render(App, { props: { api } });
+    expect(await screen.findByRole("button", { name: /This Mac.*Unknown/ })).toBeInTheDocument();
+  });
+
+  it("clears a local refresh error after a successful observation", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    vi.mocked(api.localMachine).mockRejectedValueOnce(new Error("local read failed")).mockResolvedValue({ name: "Mac", state: "awake", observed_at_unix_ms: Date.now(), model: null, uptime_seconds: 2, volumes: [], doctor_findings: 0, storage_error: null });
+    render(App, { props: { api } });
+    await vi.waitFor(() => expect(screen.getByText(/local read failed/)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(screen.queryByText(/local read failed/)).not.toBeInTheDocument());
+  });
+
 });

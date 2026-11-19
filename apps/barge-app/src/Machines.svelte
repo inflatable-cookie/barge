@@ -8,6 +8,8 @@
   let local = $state<LocalMachine | null>(null);
   let selected = $state("");
   let error = $state("");
+  let pollError = $state("");
+  let localError = $state("");
   let busy = $state(false);
   let addOpen = $state(false);
   let pairOpen = $state(false);
@@ -26,8 +28,8 @@
   const describe = (reason: unknown) => reason instanceof Error ? reason.message : String(reason);
 
   async function refresh() {
-    try { machines = await api.machines(); }
-    catch (reason) { error = `Could not read machines: ${describe(reason)}`; }
+    try { machines = await api.machines(); pollError = ""; }
+    catch (reason) { pollError = `Could not read machines: ${describe(reason)}`; }
   }
   async function run(operation: string) {
     if (!current) return;
@@ -70,19 +72,22 @@
     return machine.observation?.power === "awake" ? "Awake" : machine.observation?.power === "asleep" ? "Asleep" : "Unknown";
   }
   onMount(() => {
-    void api.localMachine().then(value => local = value).catch(reason => error = `Could not read this Mac: ${describe(reason)}`);
+    const refreshLocal = () => { void api.localMachine().then(value => { local = value; localError = ""; }).catch(reason => localError = `Could not read this Mac: ${describe(reason)}`); };
+    refreshLocal();
     void refresh();
     let last = Date.now();
-    const timer = setInterval(() => { now = Date.now(); if (now - last >= refreshInterval * 1000) { last = now; void refresh(); } }, 1000);
+    const timer = setInterval(() => { now = Date.now(); if (now - last >= refreshInterval * 1000) { last = now; void refresh(); refreshLocal(); } }, 1000);
     return () => clearInterval(timer);
   });
 </script>
 
 <div class="heading"><h1>Machines</h1><Button onClick={() => { error = ""; addOpen = true; }}>Add machine</Button></div>
+{#if localError}<Callout tone="danger" title="Local refresh error" message={localError} />{/if}
+{#if pollError}<Callout tone="danger" title="Machine refresh error" message={pollError} />{/if}
 {#if error}<Callout tone="danger" title="Machine error" message={error} />{/if}
 <div class="machines-layout">
   <nav aria-label="Machines" class="machine-list">
-    <Button variant={selected === "" ? "secondary" : "ghost"} onClick={() => selected = ""}>This Mac · Awake</Button>
+    <Button variant={selected === "" ? "secondary" : "ghost"} onClick={() => selected = ""}>This Mac · {local ? (local.state === "awake" ? "Awake" : "Unknown") : "Checking…"}{#if local} · <TimeAgo datetime={local.observed_at_unix_ms} live />{/if}</Button>
     {#each machines as machine (machine.name)}
       <Button variant={selected === machine.name ? "secondary" : "ghost"} onClick={() => selected = machine.name}>
         {machine.name} · {machine.mode === "lan" ? "LAN" : "Tailscale"} · {stateLabel(machine)}{#if machine.observation} · <TimeAgo datetime={machine.observation.observed_at_unix_ms} live />{/if}
