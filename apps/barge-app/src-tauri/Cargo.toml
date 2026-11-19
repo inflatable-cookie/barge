@@ -10,6 +10,7 @@ tauri-build.workspace = true
 
 [dependencies]
 barge.workspace = true
+barge-machine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true

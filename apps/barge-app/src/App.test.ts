@@ -16,10 +16,14 @@ afterEach(() => {
 function fixture(volumes: VolumeSummary[] = []): AppApi {
   return {
     volumes: vi.fn().mockResolvedValue(volumes),
+    doctorStatus: vi.fn().mockResolvedValue({ observation: null, error: null }),
     preferences: vi.fn().mockResolvedValue({ ...preferences }),
     savePreferences: vi.fn(async (next: Preferences) => next),
     openWindow: vi.fn().mockResolvedValue(undefined),
     quit: vi.fn().mockResolvedValue(undefined),
+    machines: vi.fn().mockResolvedValue([]),
+    localMachine: vi.fn().mockResolvedValue({ name: "Mac", state: "awake", observed_at_unix_ms: Date.now(), model: "Mac15,7", uptime_seconds: 100, volumes: [], doctor_findings: 0, storage_error: null }),
+    addMachine: vi.fn(), pairMachine: vi.fn(), removeMachine: vi.fn(), machineAction: vi.fn(), moonlight: vi.fn(),
   };
 }
 
@@ -27,59 +31,19 @@ async function settingsView() {
   await fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
 }
 
-describe("tray popover", () => {
-  it("shows empty state and opens the window or quits", async () => {
-    const api = fixture();
-    render(App, { props: { api, popover: true } });
-    expect(await screen.findByText("No volumes registered")).toBeInTheDocument();
-    expect(screen.getByText("No machines yet")).toBeInTheDocument();
-    await fireEvent.click(screen.getByRole("button", { name: "Open Barge" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Quit" }));
-    expect(api.openWindow).toHaveBeenCalledOnce();
-    expect(api.quit).toHaveBeenCalledOnce();
-  });
-
-  it("distinguishes available, absent and mismatched volumes", async () => {
-    render(App, { props: { api: fixture([
-      { name: "Builds", presence: "present", free_bytes: 10 * 1024 ** 3 },
-      { name: "Archive", presence: "absent", free_bytes: null },
-      { name: "Other", presence: "mismatch", free_bytes: null },
-    ]), popover: true } });
-    // Sizes are binary: GiB, not GB.
-    expect(await screen.findByText(/10.0 GiB free/)).toBeInTheDocument();
-    expect(screen.queryByText(/GB free/)).not.toBeInTheDocument();
-    expect(screen.getByText(/Absent/)).toBeInTheDocument();
-    expect(screen.getByText(/Different volume at mount/)).toBeInTheDocument();
-  });
-
-  it("refreshes storage when the popover is opened again", async () => {
-    const api = fixture([{ name: "Builds", presence: "present", free_bytes: 1024 ** 3 }]);
-    render(App, { props: { api, popover: true } });
-    expect(await screen.findByText(/1.0 GiB free/)).toBeInTheDocument();
-
-    vi.mocked(api.volumes).mockResolvedValue([{ name: "Builds", presence: "absent", free_bytes: null }]);
-    await fireEvent.blur(window);
-    await fireEvent.focus(window);
-
-    expect(await screen.findByText(/Absent/)).toBeInTheDocument();
-    expect(screen.queryByText(/1.0 GiB free/)).not.toBeInTheDocument();
-    expect(api.volumes).toHaveBeenCalledTimes(2);
-  });
-
-  it("says a failed read failed instead of claiming there is no storage", async () => {
-    const api = fixture();
-    vi.mocked(api.volumes).mockRejectedValue(new Error("the account state is unreadable"));
-    render(App, { props: { api, popover: true } });
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not read storage");
-    expect(screen.queryByText("No volumes registered")).not.toBeInTheDocument();
-  });
-});
-
 describe("window navigation", () => {
+  it("runs the storage read when opening Storage, not when opening Machines", async () => {
+    const api = fixture();
+    render(App, { props: { api } });
+    await screen.findByRole("button", { name: /This Mac/ });
+    expect(api.volumes).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole("button", { name: "Storage" }));
+    await waitFor(() => expect(api.volumes).toHaveBeenCalledOnce());
+  });
   it("shows the machines, storage, activity and settings views", async () => {
     const api = fixture();
     render(App, { props: { api } });
-    expect(await screen.findByText("No machines yet")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /This Mac/ })).toBeInTheDocument();
     await fireEvent.click(screen.getByRole("button", { name: "Storage" }));
     expect(await screen.findByText("No volumes registered")).toBeInTheDocument();
     await fireEvent.click(screen.getByRole("button", { name: "Activity" }));
@@ -87,7 +51,7 @@ describe("window navigation", () => {
     await settingsView();
     expect(screen.getByRole("switch", { name: "Launch at login" })).not.toBeChecked();
     expect(screen.getByRole("switch", { name: "Show window at launch" })).toBeChecked();
-    expect(screen.getByText(/menu bar at the top of the screen/)).toBeInTheDocument();
+    expect(screen.queryByText(/Barge lives in the menu bar/)).not.toBeInTheDocument();
   });
 
   it("shows a registered but absent volume without calling it empty", async () => {
@@ -180,4 +144,98 @@ describe("settings", () => {
     await waitFor(() => expect(api.savePreferences).toHaveBeenCalledOnce());
     expect(vi.mocked(api.savePreferences).mock.calls[0][0].theme).toBe("dark");
   });
+});
+
+describe("Machines", () => {
+  function remote(reachable = true, pending = false) {
+    return { name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan" as const, address: "bazzite.local", reachable, error: reachable ? null : "Connection timed out", observation: { power: "awake" as const, observed_at_unix_ms: Date.now() - 12000, pending: pending ? { action: "sleep" as const, deadline_unix_ms: Date.now() + 12000 } : null } };
+  }
+  it("always lists this Mac with no registered machines", async () => {
+    render(App, { props: { api: fixture() } });
+    expect(await screen.findByRole("button", { name: /This Mac/ })).toBeInTheDocument();
+    expect(await screen.findByText("Mac15,7")).toBeInTheDocument();
+  });
+  it("shows a reachable machine and its controls", async () => {
+    const api = fixture(); vi.mocked(api.machines).mockResolvedValue([remote()]);
+    render(App, { props: { api } });
+    await fireEvent.click(await screen.findByRole("button", { name: /bazzite.*Awake/ }));
+    expect(screen.getByRole("button", { name: "Sleep" })).toBeEnabled();
+    expect(screen.getByText("bazzite.local")).toBeInTheDocument();
+  });
+  it("keeps an unreachable machine's previous observation visible", async () => {
+    const api = fixture(); vi.mocked(api.machines).mockResolvedValue([remote(false)]);
+    render(App, { props: { api } });
+    await fireEvent.click(await screen.findByRole("button", { name: /bazzite.*Unreachable/ }));
+    expect(screen.getByText("Connection timed out")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sleep" })).toBeDisabled();
+    expect(screen.getByText("Last observation")).toBeInTheDocument();
+  });
+  it("shows pending state and preserves a failed cancel", async () => {
+    const api = fixture(); vi.mocked(api.machines).mockResolvedValue([remote(true, true)]);
+    vi.mocked(api.machineAction).mockRejectedValue(new Error("timeout"));
+    render(App, { props: { api } });
+    await fireEvent.click(await screen.findByRole("button", { name: /bazzite.*Action pending/ }));
+    expect(screen.getByText(/Sleeping in/)).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole("button", { name: "Cancel action" }));
+    expect(await screen.findByText(/Cancel could not be confirmed/)).toBeInTheDocument();
+    expect(screen.getByText(/Sleeping in/)).toBeInTheDocument();
+  });
+  it("clears a recovered refresh error without clearing a cancel failure", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    vi.mocked(api.machines).mockRejectedValueOnce(new Error("registry unreadable")).mockResolvedValue([remote(true, true)]);
+    vi.mocked(api.machineAction).mockRejectedValue(new Error("cancel timeout"));
+    render(App, { props: { api } });
+    await vi.waitFor(() => expect(screen.getByText(/registry unreadable/)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(screen.queryByText(/registry unreadable/)).not.toBeInTheDocument());
+    await fireEvent.click(screen.getByRole("button", { name: /bazzite.*Action pending/ }));
+    await fireEvent.click(screen.getByRole("button", { name: "Cancel action" }));
+    await vi.waitFor(() => expect(screen.getByText(/cancel timeout/)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(screen.getByText(/cancel timeout/)).toBeInTheDocument();
+  });
+  it("shows an unknown local state when the local observation fails", async () => {
+    const api = fixture();
+    vi.mocked(api.localMachine).mockResolvedValue({ name: "Mac", state: "unknown", observed_at_unix_ms: Date.now(), model: null, uptime_seconds: null, volumes: [], doctor_findings: 0, storage_error: null });
+    render(App, { props: { api } });
+    expect(await screen.findByRole("button", { name: /This Mac.*Unknown/ })).toBeInTheDocument();
+  });
+
+  it("clears a local refresh error after a successful observation", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    vi.mocked(api.localMachine).mockRejectedValueOnce(new Error("local read failed")).mockResolvedValue({ name: "Mac", state: "awake", observed_at_unix_ms: Date.now(), model: null, uptime_seconds: 2, volumes: [], doctor_findings: 0, storage_error: null });
+    render(App, { props: { api } });
+    await vi.waitFor(() => expect(screen.getByText(/local read failed/)).toBeInTheDocument());
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(screen.queryByText(/local read failed/)).not.toBeInTheDocument());
+  });
+
+  it("shows the last doctor result and failure in Machines, then clears it after recovery", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    const base = { name: "Mac", state: "awake" as const, observed_at_unix_ms: Date.now(), model: null, uptime_seconds: 2, volumes: [], doctor_findings: 0, doctor_observed_at_unix_ms: Date.now() - 12_000, storage_error: null };
+    vi.mocked(api.localMachine).mockResolvedValueOnce({ ...base, doctor_error: "layout unreadable" }).mockResolvedValue({ ...base, doctor_error: null });
+    render(App, { props: { api } });
+    await vi.waitFor(() => expect(screen.getByText("layout unreadable")).toBeInTheDocument());
+    expect(screen.getByText(/Last doctor result: OK/)).toBeInTheDocument();
+    expect(screen.getByText(/earlier result/)).toBeInTheDocument();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(screen.queryByText("layout unreadable")).not.toBeInTheDocument());
+  });
+  it("keeps volumes and shows doctor failure and age in Storage, then shows recovery", async () => {
+    const api = fixture([{ name: "Builds", presence: "present", free_bytes: 1024 ** 3 }]);
+    vi.mocked(api.doctorStatus).mockResolvedValueOnce({ observation: { findings: 0, observed_at_unix_ms: Date.now() - 12_000 }, error: "layout unreadable" }).mockResolvedValue({ observation: { findings: 2, observed_at_unix_ms: Date.now() }, error: null });
+    render(App, { props: { api, initialView: "storage" } });
+    expect(await screen.findByText("layout unreadable")).toBeInTheDocument();
+    expect(screen.getByText("1.0 GiB free")).toBeInTheDocument();
+    expect(screen.getByText(/Last doctor result: OK/)).toBeInTheDocument();
+    expect(screen.getByText(/earlier result/)).toBeInTheDocument();
+    expect(document.querySelector("time[datetime]")).not.toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText(/Last doctor result: 2 findings/)).toBeInTheDocument();
+    expect(screen.queryByText("layout unreadable")).not.toBeInTheDocument();
+  });
+
 });

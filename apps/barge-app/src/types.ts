@@ -9,9 +9,36 @@ export interface Preferences {
 }
 export interface AppApi {
   volumes(): Promise<VolumeSummary[]>;
+  doctorStatus(): Promise<DoctorStatus>;
   preferences(): Promise<Preferences>;
   /** Resolves with what was stored: launch at login comes back from the OS. */
   savePreferences(preferences: Preferences): Promise<Preferences>;
   openWindow(): Promise<void>;
   quit(): Promise<void>;
+  machines(): Promise<MachineView[]>;
+  localMachine(): Promise<LocalMachine>;
+  addMachine(input: NewMachine): Promise<void>;
+  pairMachine(name: string, key: string): Promise<void>;
+  removeMachine(name: string): Promise<void>;
+  machineAction(name: string, operation: string): Promise<void>;
+  moonlight(): Promise<void>;
+}
+
+export interface DoctorStatus { observation: { findings: number; observed_at_unix_ms: number } | null; error: string | null }
+export type PowerAction = "sleep" | "restart" | "shutdown";
+export interface Observation {
+  power: "awake" | "asleep" | "unknown";
+  observed_at_unix_ms: number;
+  pending?: { action: PowerAction; deadline_unix_ms: number } | null;
+}
+export interface MachineView {
+  name: string; hostname: string; mac: string; mode: "lan" | "tailscale";
+  address: string; reachable: boolean; observation: Observation | null; error: string | null;
+}
+export interface LocalMachine {
+  name: string; state: "awake" | "unknown"; observed_at_unix_ms: number; model: string | null; uptime_seconds: number | null;
+  volumes: VolumeSummary[]; doctor_findings: number | null; doctor_observed_at_unix_ms?: number | null; doctor_error?: string | null; storage_error: string | null;
+}
+export interface NewMachine {
+  name: string; hostname: string; mac: string; tailscale_name: string | null; key: string | null;
 }

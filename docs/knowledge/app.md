@@ -1,7 +1,6 @@
 # Barge app
 
-Status: scaffold built; the remaining first-release capabilities below are
-planned. Tom's review includes native tray and popover verification.
+Status: Machines built; the remaining first-release capabilities below are planned.
 
 The Barge app is a macOS menu-bar app for the two things an operator checks
 most often: the machines Barge controls, and the storage it manages. It sits
@@ -25,22 +24,16 @@ Its visual system is replaced by Poodle.
 
 ## Form
 
-- **Menu-bar icon,** a monochrome template image. Its popover is the daily
-  surface:
-  - each machine's state, with its age;
-  - Wake, Sleep, Restart, Shut down and Cancel;
-  - one storage line (volume present or absent, free space, doctor ok or a
-    count of findings);
-  - Open Barge.
+- **Menu-bar icon:** a monochrome template image opens a native menu with this
+  Mac's state and storage summary, registered machines and their power actions,
+  Moonlight, Open Barge, Settings and Quit. The menu updates while Barge runs.
 - **The app is never reachable only through the menu bar.** macOS parks menu-bar
   items off-screen when the space beside the notch is full, so:
   - the window opens when the app launches, controlled by the "Show window at
     launch" setting (on by default);
   - launching the app again while it runs reopens the window (macOS
     `RunEvent::Reopen`);
-  - the window says where the menu-bar item lives and that macOS may hide it
-    when the menu bar is full.
-- **Window on demand:** also opened from the popover. The app shows a Dock icon
+- **Window on demand:** also opened from the menu. The app shows a Dock icon
   only while the window is open (`ActivationPolicy::Accessory` otherwise).
 - **Launch at login** is a setting, off by default.
 
@@ -48,7 +41,7 @@ Its visual system is replaced by Poodle.
 
 ### Machines
 
-- **List:** each registered machine, with its observed state and age: online,
+- **List:** this Mac always appears first without registration, followed by each registered machine, with its observed state and age: online,
   checking, waking, unreachable, or pending an action.
 - **Detail:**
   - connection: LAN or Tailscale mode, address, MAC;
@@ -135,11 +128,13 @@ Tauri Rust host (apps/barge-app/src-tauri)
   inside an action the operator started (pair, move apply), and is released
   when the action ends. The app holds no Barge locks or holds while idle.
 - **Refresh:**
-  - machine state is polled while the popover or window is visible, at the
-    refresh interval (default 10 s), and once on open;
-  - storage is read on open and on Refresh;
+  - machine state is polled while the app runs, at the refresh interval
+    (default 10 s), and once on open;
+  - the menu's local storage summary refreshes at that interval; the Storage
+    view reads on open and on Refresh;
   - survey sizes and doctor's binding checks run on request, never in the
-    background.
+    background. The menu shows the last doctor result and its age; its Refresh
+    item runs doctor.
 - **Longhorn crates** (the "minimal" shape plus services):
   - `longhorn-core`, `longhorn-config`, `longhorn-settings`,
     `longhorn-settings-config`, `longhorn-tauri-config` and
@@ -169,7 +164,6 @@ Tauri Rust host (apps/barge-app/src-tauri)
   - `Callout` and `RemediationBanner` for doctor findings;
   - `EmptyState`, `DetailShell` and `SettingsShell`;
   - `ToastStack` for transient results;
-  - `Popover` for the tray surface.
 
 ## Keys
 
@@ -214,10 +208,10 @@ opens on launch, so the app is usable even when macOS hides its menu-bar item.
 ## Build order
 
 1. **Scaffold (built):** Tauri, the Longhorn minimal shape and Poodle; tray icon,
-   popover and window; settings; an empty Machines view with real navigation.
+   window; settings; an empty Machines view with real navigation.
    Tom reviews it running.
-2. **Machines:** list, detail, power with countdown and cancel, pairing, and
-   Moonlight.
+2. **Machines (built):** list, detail, power with countdown and cancel, pairing,
+   Moonlight and the native tray menu.
 3. **Storage, read views:** volumes, layout, bindings with doctor, and survey.
 4. **Moves:** plan from survey, review, apply with confirmation, and progress
    through `longhorn-operation`.
