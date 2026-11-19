@@ -1,7 +1,7 @@
 /**
  * Fixture harness for renderer screenshots: `/fixtures.html?view=machines&scenario=awake&theme=dark`.
- * `&details` opens the first machine's details; `&chrome=native` drops the
- * macOS top strip.
+ * `&details` opens the first machine's details, `&menu` opens its actions menu,
+ * and `&chrome=native` drops the macOS top strip.
  *
  * It mounts the real App against a fake api, so a screenshot shows the same
  * markup and Poodle styles the app renders. Not part of the app build. The
@@ -71,7 +71,8 @@ const api: AppApi = {
   openWindow: async () => {},
   quit: async () => {},
   machines: async () => machineFor[scenario] ?? [],
-  addMachine: async () => {}, pairMachine: async () => {}, removeMachine: async () => {}, machineAction: async () => {}, moonlight: async () => {},
+  addMachine: async () => {}, pairMachine: async () => {}, removeMachine: async () => {},
+  beginMachineAction: async () => machineFor[scenario] ?? [], machineAction: async () => {}, moonlight: async () => {},
 };
 
 const target = document.getElementById("app");
@@ -87,5 +88,16 @@ if (scenario === "save-failed") {
   }, 150);
 }
 if (params.has("details")) {
-  setTimeout(() => document.querySelector<HTMLButtonElement>('button[aria-label="Details"]')?.click(), 150);
+  // Details lives in the card's actions menu, like every action beside the power button.
+  setTimeout(() => {
+    document.querySelector<HTMLButtonElement>('button[aria-label^="Actions for"]')?.click();
+    setTimeout(() => {
+      [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+        .find((item) => item.textContent?.trim() === "Details…")
+        ?.click();
+    }, 150);
+  }, 150);
+}
+if (params.has("menu")) {
+  setTimeout(() => document.querySelector<HTMLButtonElement>('button[aria-label^="Actions for"]')?.click(), 150);
 }

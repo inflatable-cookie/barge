@@ -76,6 +76,7 @@ fn run() -> tauri::Result<()> {
             commands::machines::machines_add,
             commands::machines::machines_pair,
             commands::machines::machines_remove,
+            commands::machines::machines_begin,
             commands::machines::machines_action,
             commands::storage::storage_volumes,
             commands::window::open_main_window,

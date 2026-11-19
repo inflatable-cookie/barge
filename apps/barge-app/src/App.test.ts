@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 function fixture(volumes: VolumeSummary[] = []): AppApi {
-  return {
+  const api: AppApi = {
     volumes: vi.fn().mockResolvedValue(volumes),
     doctorStatus: vi.fn().mockResolvedValue({ observation: null, error: null }),
     preferences: vi.fn().mockResolvedValue({ ...preferences }),
@@ -23,8 +23,12 @@ function fixture(volumes: VolumeSummary[] = []): AppApi {
     openWindow: vi.fn().mockResolvedValue(undefined),
     quit: vi.fn().mockResolvedValue(undefined),
     machines: vi.fn().mockResolvedValue([]),
-    addMachine: vi.fn(), pairMachine: vi.fn(), removeMachine: vi.fn(), machineAction: vi.fn(), moonlight: vi.fn(),
+    addMachine: vi.fn(), pairMachine: vi.fn(), removeMachine: vi.fn(), beginMachineAction: vi.fn(), machineAction: vi.fn(), moonlight: vi.fn(),
   };
+  // A recorded click answers with the machines as they stand; a test that wants
+  // a different answer stubs it.
+  vi.mocked(api.beginMachineAction).mockImplementation(async () => api.machines());
+  return api;
 }
 
 async function settingsView() {
@@ -168,22 +172,62 @@ describe("Machines", () => {
   function status(fields: Partial<MachineStatus> & Pick<MachineStatus, "phase">): MachineStatus {
     return { action: null, deadline_unix_ms: null, last_seen_unix_ms: null, offers: [], waiting: false, ...fields };
   }
-  const AWAKE = ["Sleep", "Restart…", "Shut down…", "Open Moonlight"];
+  /** What the awake card's menu offers, in order. */
+  const AWAKE = ["Restart…", "Shut down…", "Open Moonlight", "Details…"];
   function machine(fields: Partial<MachineView> & { status: MachineStatus }): MachineView {
     return {
       name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", address: "bazzite.local",
       daemon_port: 9777, reachable: true, error: null, seen_at_unix_ms: now(), ...fields,
     };
   }
+  const offline = () => machine({
+    reachable: false, error: "Connection timed out",
+    status: status({ phase: "offline", offers: ["wake"], last_seen_unix_ms: now() - 720_000 }),
+  });
+  const waking = () => machine({
+    reachable: false, error: "Connection timed out",
+    status: status({ phase: "waking", waiting: true, last_seen_unix_ms: now() - 720_000 }),
+  });
   const awake = () => machine({ status: status({ phase: "awake", offers: ["sleep", "restart", "shutdown", "moonlight"] }) });
+  const stillOn = () => machine({ status: status({ phase: "still_on", offers: ["sleep", "restart", "shutdown", "moonlight"] }) });
   const pendingSleep = (reachable = true) => machine({
     reachable,
     error: reachable ? null : "Connection timed out",
     status: status({ phase: "pending", action: "sleep", deadline_unix_ms: now() + 12_000, offers: ["cancel"], waiting: true }),
   });
+  const goingDown = (action: "sleep" | "shutdown") => machine({ status: status({ phase: "going_down", action, waiting: true }) });
+  const restarting = () => machine({ status: status({ phase: "restarting", action: "restart", waiting: true }) });
+  const didNotWake = () => machine({ reachable: false, status: status({ phase: "did_not_wake", offers: ["wake"] }) });
+
+  const MENU_BUTTON = "Actions for bazzite";
 
   async function card(name = "bazzite") {
     return screen.findByLabelText(`${name} machine`);
+  }
+
+  /**
+   * The card's actions menu, opened from the `...` button at its top right.
+   * Poodle's Menu wraps its trigger, so the wrapper and the icon button inside
+   * it carry the same accessible name.
+   */
+  async function openActions(region: HTMLElement) {
+    const [trigger] = within(region).getAllByRole("button", { name: MENU_BUTTON });
+    await fireEvent.click(trigger);
+    return screen.findByRole("menu", { name: "bazzite actions" });
+  }
+
+  async function openDetails(region: HTMLElement) {
+    const menu = await openActions(region);
+    await fireEvent.click(within(menu).getByRole("menuitem", { name: "Details…" }));
+    return screen.findByRole("dialog");
+  }
+
+  /** A command that stays in flight until the test finishes it. */
+  function deferred<T = void>() {
+    let finish!: (value: T) => void;
+    let fail!: (reason: unknown) => void;
+    const promise = new Promise<T>((resolve, reject) => { finish = resolve; fail = reject; });
+    return { promise, finish, fail };
   }
 
   it("shows an empty state with the add button when nothing is registered", async () => {
@@ -194,31 +238,83 @@ describe("Machines", () => {
   });
 
   it.each([
-    ["offline", machine({ reachable: false, error: "Connection timed out", status: status({ phase: "offline", offers: ["wake"], last_seen_unix_ms: now() - 720_000 }) }), "Offline", ["Wake"]],
-    ["waking", machine({ reachable: false, status: status({ phase: "waking", waiting: true, last_seen_unix_ms: now() - 720_000 }) }), "Waking…", []],
-    ["awake", awake(), "Awake", AWAKE],
-    ["pending", pendingSleep(), /Sleeping in \d+ s/, ["Cancel"]],
-    ["going down", machine({ status: status({ phase: "going_down", action: "sleep", waiting: true }) }), "Going to sleep…", []],
-    ["restarting", machine({ status: status({ phase: "restarting", action: "restart", waiting: true }) }), "Restarting…", []],
-    ["didn't wake", machine({ reachable: false, status: status({ phase: "did_not_wake", offers: ["wake"] }) }), "Didn't wake", ["Wake"]],
-    ["still on", machine({ status: status({ phase: "still_on", offers: ["sleep", "restart", "shutdown", "moonlight"] }) }), "Still on", AWAKE],
-  ])("a card in %s shows its label and only the actions that state offers", async (_, value, label, offered) => {
+    ["offline", offline(), "Offline", "Wake", ["Details…"]],
+    ["waking", waking(), "Waking…", "Waking…", ["Details…"]],
+    ["awake", awake(), "Awake", "Sleep", AWAKE],
+    ["pending", pendingSleep(), /^Sleeping in \d+ s$/, "Cancel", ["Details…"]],
+    ["going to sleep", goingDown("sleep"), "Going to sleep…", "Going to sleep…", ["Details…"]],
+    ["shutting down", goingDown("shutdown"), "Shutting down…", "Shutting down…", ["Details…"]],
+    ["restarting", restarting(), "Restarting…", "Restarting…", ["Details…"]],
+    ["didn't wake", didNotWake(), "Didn't wake", "Wake", ["Details…"]],
+    ["still on", stillOn(), "Still on", "Sleep", AWAKE],
+  ])("a card in %s shows its state once and offers only that state's actions", async (_, value, label, power, items) => {
     const api = fixture();
     vi.mocked(api.machines).mockResolvedValue([value]);
     render(App, { props: { api } });
     const region = await card();
     expect(within(region).getByText(label)).toBeInTheDocument();
-    for (const action of ["Wake", ...AWAKE, "Cancel"]) {
-      expect(!!within(region).queryByRole("button", { name: action }), action).toBe(offered.includes(action));
-    }
+    // One what-I-can-do-now control in the avatar position, one menu beside it.
+    expect(within(region).getByRole("button", { name: power })).toBeInTheDocument();
+    const menu = await openActions(region);
+    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual(items);
+  });
+
+  it("shows the wait at once, before the command resolves", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([offline()]);
+    vi.mocked(api.beginMachineAction).mockResolvedValue([waking()]);
+    const sent = deferred();
+    vi.mocked(api.machineAction).mockReturnValue(sent.promise);
+    render(App, { props: { api } });
+    const region = await card();
+    await fireEvent.click(within(region).getByRole("button", { name: "Wake" }));
+
+    // The click is recorded in the shared state, so the card shows the wait
+    // while the daemon is still being asked.
+    expect(api.beginMachineAction).toHaveBeenCalledWith("bazzite", "wake");
+    expect(await within(region).findByText("Waking…")).toBeInTheDocument();
+    expect(region.querySelector('.power[data-waiting="true"]')).not.toBeNull();
+    expect(api.machineAction).toHaveBeenCalledWith("bazzite", "wake");
+    expect(within(region).getByRole("button", { name: "Waking…" })).toBeDisabled();
+
+    // The poll owns the state afterwards, not the renderer's copy.
+    sent.finish();
+    await waitFor(() => expect(within(region).getByText("Offline")).toBeInTheDocument());
+  });
+
+  it("says so and puts the card back when the send fails", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([offline()]);
+    vi.mocked(api.beginMachineAction).mockResolvedValue([waking()]);
+    vi.mocked(api.machineAction).mockRejectedValue(new Error("the wake packet was refused"));
+    render(App, { props: { api } });
+    const region = await card();
+    await fireEvent.click(within(region).getByRole("button", { name: "Wake" }));
+
+    expect(await screen.findByText("Wake failed: the wake packet was refused")).toBeInTheDocument();
+    expect(await within(region).findByText("Offline")).toBeInTheDocument();
+    expect(within(region).getByRole("button", { name: "Wake" })).toBeEnabled();
+  });
+
+  it("shows the countdown once, in the state label", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([pendingSleep()]);
+    render(App, { props: { api } });
+    const region = await card();
+    expect(within(region).getByText(/^Sleeping in \d+ s$/)).toBeInTheDocument();
+    expect(within(region).getAllByText(/\b\d+ s\b/)).toHaveLength(1);
+    expect(region.querySelector(".countdown")).toBeNull();
+    // The ring carries the progress and the button keeps the cancel glyph.
+    expect(within(region).getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(region.querySelector('.power[data-waiting="true"]')).not.toBeNull();
   });
 
   it("names the machine in a restart confirmation and sends it only after confirming", async () => {
     const api = fixture();
     vi.mocked(api.machines).mockResolvedValue([awake()]);
     render(App, { props: { api } });
-    const region = await card();
-    await fireEvent.click(within(region).getByRole("button", { name: "Restart…" }));
+    const menu = await openActions(await card());
+    await fireEvent.click(within(menu).getByRole("menuitem", { name: "Restart…" }));
     expect(await screen.findByText("Restart bazzite?")).toBeInTheDocument();
     expect(api.machineAction).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole("button", { name: "Restart" }));
@@ -234,64 +330,51 @@ describe("Machines", () => {
 
   it("shows the last seen age only for an unreachable machine", async () => {
     const api = fixture();
-    vi.mocked(api.machines).mockResolvedValue([machine({ reachable: false, status: status({ phase: "offline", offers: ["wake"], last_seen_unix_ms: now() - 720_000 }) })]);
+    vi.mocked(api.machines).mockResolvedValue([offline()]);
     render(App, { props: { api } });
     const region = await card();
     expect(within(region).getByText(/Last seen/)).toBeInTheDocument();
   });
 
   it.each([
-    ["offline", machine({ reachable: false, status: status({ phase: "offline", offers: ["wake"] }) }), "Wake", "wake"],
+    ["offline", offline(), "Wake", "wake"],
     ["awake", awake(), "Sleep", "sleep"],
     ["pending", pendingSleep(), "Cancel", "cancel"],
-    ["didn't wake", machine({ reachable: false, status: status({ phase: "did_not_wake", offers: ["wake"] }) }), "Wake", "wake"],
-    ["still on", machine({ status: status({ phase: "still_on", offers: ["sleep", "restart", "shutdown", "moonlight"] }) }), "Sleep", "sleep"],
-  ])("the power button in %s is %s and sends it", async (_, value, label, offer) => {
+    ["didn't wake", didNotWake(), "Wake", "wake"],
+    ["still on", stillOn(), "Sleep", "sleep"],
+  ])("the power button in %s sends the action it names", async (_, value, label, offer) => {
     const api = fixture();
     vi.mocked(api.machines).mockResolvedValue([value]);
     render(App, { props: { api } });
     const region = await card();
-    // The large button comes first in the card, in the avatar position.
-    const power = within(region).getAllByRole("button")[0];
-    expect(power).toHaveAccessibleName(label);
+    const power = within(region).getByRole("button", { name: label });
     expect(power).toBeEnabled();
     await fireEvent.click(power);
     await waitFor(() => expect(api.machineAction).toHaveBeenCalledWith("bazzite", offer));
   });
 
   it.each([
-    ["waking", machine({ reachable: false, status: status({ phase: "waking", waiting: true }) }), "Waking…"],
-    ["going to sleep", machine({ status: status({ phase: "going_down", action: "sleep", waiting: true }) }), "Going to sleep…"],
-    ["shutting down", machine({ status: status({ phase: "going_down", action: "shutdown", waiting: true }) }), "Shutting down…"],
-    ["restarting", machine({ status: status({ phase: "restarting", action: "restart", waiting: true }) }), "Restarting…"],
+    ["waking", waking(), "Waking…"],
+    ["going to sleep", goingDown("sleep"), "Going to sleep…"],
+    ["shutting down", goingDown("shutdown"), "Shutting down…"],
+    ["restarting", restarting(), "Restarting…"],
   ])("the power button while %s shows the wait and is disabled", async (_, value, label) => {
     const api = fixture();
     vi.mocked(api.machines).mockResolvedValue([value]);
     render(App, { props: { api } });
     const region = await card();
-    const power = within(region).getAllByRole("button")[0];
-    expect(power).toHaveAccessibleName(label);
+    const power = within(region).getByRole("button", { name: label });
     expect(power).toBeDisabled();
     expect(region.querySelector('.power[data-waiting="true"]')).not.toBeNull();
   });
 
-  it("shows the countdown under the Cancel power button while pending", async () => {
-    const api = fixture();
-    vi.mocked(api.machines).mockResolvedValue([pendingSleep()]);
-    render(App, { props: { api } });
-    const region = await card();
-    expect(region.querySelector(".power .countdown")?.textContent).toMatch(/^\d+ s$/);
-  });
-
-  it("opens the details dialog with the connection, Pair and Remove, and closes it", async () => {
+  it("opens the details dialog from the menu with Pair and Remove, and closes it", async () => {
     const api = fixture();
     vi.mocked(api.machines).mockResolvedValue([awake()]);
     render(App, { props: { api } });
     const region = await card();
     expect(region.querySelector("details")).toBeNull();
-    expect(within(region).queryByRole("button", { name: /Pair|Remove/ })).toBeNull();
-    await fireEvent.click(within(region).getByRole("button", { name: "Details" }));
-    const dialog = await screen.findByRole("dialog");
+    const dialog = await openDetails(region);
     expect(within(dialog).getByText("00:11:22:33:44:55")).toBeInTheDocument();
     expect(within(dialog).getByText("9777")).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: "Pair…" })).toBeInTheDocument();
@@ -304,8 +387,7 @@ describe("Machines", () => {
     const api = fixture();
     vi.mocked(api.machines).mockResolvedValue([awake()]);
     render(App, { props: { api } });
-    await fireEvent.click(within(await card()).getByRole("button", { name: "Details" }));
-    await fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Remove…" }));
+    await fireEvent.click(within(await openDetails(await card())).getByRole("button", { name: "Remove…" }));
     expect(await screen.findByText("Remove bazzite?")).toBeInTheDocument();
     expect(api.removeMachine).not.toHaveBeenCalled();
   });
@@ -318,8 +400,7 @@ describe("Machines", () => {
       machine({ seen_at_unix_ms: Date.now() + 3_000, status: status({ phase: "waking", waiting: true }) }),
     ]);
     render(App, { props: { api } });
-    await fireEvent.click(within(await card()).getByRole("button", { name: "Details" }));
-    const dialog = await screen.findByRole("dialog");
+    const dialog = await openDetails(await card());
     const age = () => within(dialog).getByText((_, node) => node?.tagName === "TIME").textContent;
     expect(age()).toBe("now");
     // The waiting machine polls every 2 s; Poodle's TimeAgo, ticking every 30 s, read "in 10s" here.
@@ -333,7 +414,7 @@ describe("Machines", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const api = fixture();
     vi.mocked(api.machines)
-      .mockResolvedValueOnce([machine({ reachable: false, status: status({ phase: "waking", waiting: true }) })])
+      .mockResolvedValueOnce([waking()])
       .mockResolvedValue([awake()]);
     render(App, { props: { api } });
     await vi.waitFor(() => expect(screen.getByText("Waking…")).toBeInTheDocument());

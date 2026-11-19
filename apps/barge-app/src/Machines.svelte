@@ -52,6 +52,11 @@
   async function perform(machine: string, offer: Offer) {
     working = machine;
     try {
+      // The shared state records the click here, so the card and the menu show
+      // its wait before the command returns and before the next poll. A waiting
+      // machine then polls fast.
+      machines = await api.beginMachineAction(machine, offer);
+      schedule();
       await api.machineAction(machine, offer);
       error = "";
     } catch (reason) {

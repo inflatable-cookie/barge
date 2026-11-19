@@ -19,6 +19,8 @@ export interface AppApi {
   addMachine(input: NewMachine): Promise<void>;
   pairMachine(name: string, key: string): Promise<void>;
   removeMachine(name: string): Promise<void>;
+  /** Records the click in the shared state at once and returns the machines as they now stand. */
+  beginMachineAction(name: string, operation: string): Promise<MachineView[]>;
   machineAction(name: string, operation: string): Promise<void>;
   moonlight(): Promise<void>;
 }
