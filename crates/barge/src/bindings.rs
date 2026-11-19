@@ -395,6 +395,8 @@ impl Bindings {
             }
         }
         make_way(&binding.link, &prior)?;
+        #[cfg(test)]
+        run_before_link_hook();
         if let Err(source) = symlink(&destination, &binding.link) {
             let mut message = format!(
                 "cannot create the link at {}: {source}",
@@ -1079,6 +1081,32 @@ pub(crate) fn validate_record(record: &BindingRecord) -> Result<()> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// A test seam in `apply`, after the prior entry is moved aside and before
+    /// the link is created: it lets a test make that creation fail the way a
+    /// racing writer does, which no temporary directory can produce on demand.
+    static BEFORE_LINK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run the one queued seam, if a test set one.
+#[cfg(test)]
+fn run_before_link_hook() {
+    BEFORE_LINK_HOOK.with(|hook| {
+        let callback = hook.borrow_mut().take();
+        if let Some(callback) = callback {
+            callback();
+        }
+    });
+}
+
+/// Queue one seam for the next link creation.
+#[cfg(test)]
+fn push_before_link_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_LINK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
 mod rollback_kind_tests {
     use super::*;
     #[test]
@@ -1114,6 +1142,78 @@ mod rollback_kind_tests {
         assert!(restore_prior(&link, &prior).is_err());
         assert_eq!(fs::read_link(&link).unwrap(), temp.child("elsewhere"));
         assert!(preserved.exists(), "the prior entry is still preserved");
+    }
+
+    #[test]
+    fn apply_that_cannot_create_the_link_keeps_another_writers_link() {
+        use crate::{Absent, FakeOs, ManualClock, Placement, VolumeRegistration};
+        use std::sync::Arc;
+
+        let temp = crate::testing::TempDir::new("binding-apply-create").unwrap();
+        let mount = temp.folder("volume").unwrap();
+        let state = temp.folder("state").unwrap();
+        let home = temp.folder("home").unwrap();
+        let barge = Barge::open_with(
+            state,
+            Arc::new(FakeOs::with_volume(
+                &mount,
+                "11111111-2222-3333-4444-555555555555",
+                1000,
+            )),
+            Arc::new(ManualClock::new(1)),
+        )
+        .unwrap();
+        barge
+            .register_volume(VolumeRegistration::new("volume", &mount).floor_bytes(0))
+            .unwrap();
+        barge
+            .set_layout(
+                Class::Caches,
+                Placement {
+                    volume: "volume".into(),
+                    path: "caches".into(),
+                    absent: Absent::Fail,
+                },
+            )
+            .unwrap();
+        let destination = mount.join("caches/cargo");
+        fs::create_dir_all(&destination).unwrap();
+        let link = home.join("registry");
+        let old = home.join("old-place");
+        fs::create_dir(&old).unwrap();
+        symlink(&old, &link).unwrap();
+
+        let bindings = barge.bindings();
+        let binding = Binding::link("cargo-registry", Class::Caches, &link).to(&destination);
+        let plan = bindings.plan(&binding).unwrap();
+        // `apply` moves the prior link aside, and in that moment another writer
+        // puts its own link at the path: creating Barge's link then fails, and
+        // the failure path must leave that link alone.
+        let theirs = home.join("their-place");
+        fs::create_dir(&theirs).unwrap();
+        let raced = link.clone();
+        let planted = theirs.clone();
+        push_before_link_hook(move || symlink(&planted, &raced).unwrap());
+
+        let error = bindings
+            .apply(&binding, &plan, ApplyOptions::default())
+            .unwrap_err();
+
+        assert!(
+            error.message().contains("cannot create the link at"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            theirs,
+            "the other writer's link is never removed"
+        );
+        assert!(old.is_dir(), "the prior link's destination is untouched");
+        assert!(
+            bindings.list().unwrap().is_empty(),
+            "a failed apply records nothing"
+        );
     }
 
     #[test]
