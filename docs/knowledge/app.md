@@ -80,6 +80,8 @@ above the sidebar and the content alike; nothing interactive sits in it, and no
 content sits under the lights. The "Barge" title sits in the strip, vertically
 centred with the traffic lights and just to their right; it is part of the
 drag region and takes no pointer events, so the whole strip keeps dragging.
+The title's 90 px left margin and the native lights' `(18, 22)` position are
+paired in the renderer CSS and Tauri window command.
 The sidebar and the content share one top inset below the strip
 (`--top-inset`), so the first navigation item and the page heading share a top
 line. Other platforms keep their decorations.
