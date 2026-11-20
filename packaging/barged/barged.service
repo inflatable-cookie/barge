@@ -24,6 +24,9 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
+# The one writable place: paired clients, the machine ID and the state lock
+# live beside the config.
+ReadWritePaths=%h/.config/barged
 StateDirectory=barged
 ReadWritePaths=-%h/.config/barged
 ProtectKernelTunables=yes
