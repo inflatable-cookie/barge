@@ -24,6 +24,11 @@ longhorn-tauri-config.workspace = true
 longhorn-tauri-settings.workspace = true
 longhorn-storage-layout.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
 [dev-dependencies]
 barge = { workspace = true, features = ["testing"] }
 # Unlocks tauri::test (mock app and runtime) for the command-level tests below.

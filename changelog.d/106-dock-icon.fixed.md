@@ -1,0 +1,1 @@
+Set the Dock icon from the bundled `.icns` on every switch to Regular, so the Barge icon (not the generic executable icon) shows under `effigy app:dev` and in a bundled build. Rebuild the Tauri context when `icons/` changes.

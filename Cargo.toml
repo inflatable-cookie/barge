@@ -65,6 +65,13 @@ longhorn-storage-layout = { git = "https://github.com/inflatable-cookie/longhorn
 # the daemon still compiles (and reports state) on the Mac.
 zbus = "5.19.0"
 
+# The Dock icon refresh on macOS (menu-bar app only): the exact objc2
+# generations Tauri 2.12.7 pulls in, so the app sets the same application
+# icon image Tauri sets on Ready (see commands::window::show_main).
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
 # Workspace lints: clippy::all plus the rustc lints for API and unsafe hygiene,
 # and the three "no panics outside tests" clippy lints. `clippy.toml` grants test
 # code its exception (`allow-*-in-tests`), so a test may unwrap or panic while
