@@ -1,6 +1,7 @@
 # Worktree pools
 
-Status: design draft for Tom's sign-off, 2026-11-20. Nothing here is built.
+Status: design draft for Tom's sign-off, 2026-11-20, revised after the Nucleus
+planner's review. Nothing here is built.
 
 Barge keeps a warm pool of git worktrees per repository on Stash and leases
 them to agents. An agent starts in a checkout that already has its dependencies
@@ -34,14 +35,19 @@ has `--json` output under the CLI's schema contract.
 
 ```
 barge worktree lease --repo <origin> --base <sha> [--base-name main]
-  --branch <name> --request <id> --json
+  --branch <name> --request <id> [--label <task id>] --json
 ```
 
 - `--base` is an exact commit. A branch name can accompany it but never
   replaces it.
-- `--request` is the caller's idempotency key (for Nucleus, the task ID).
-  Leasing the same request twice returns the same lease; a different request
-  can never get a leased root.
+- `--request` identifies one allocation, not one task: Nucleus may replace a
+  lost checkout or move a task to another host while the task stays open, and
+  each allocation gets its own request ID. `--label` carries the task ID as
+  metadata only.
+- The request is bound to its repository, base and branch. Repeating it with
+  the same payload returns the same lease; repeating it with a changed payload
+  is refused. A branch name that already exists in the pool's clone is
+  refused, not reused. A different request can never get a leased root.
 - Barge picks a free warm root (or makes one if the pool is below its size),
   fetches, checks out a new branch `<name>` at `<sha>`, and verifies the tree
   is clean.
@@ -50,6 +56,8 @@ barge worktree lease --repo <origin> --base <sha> [--base-name main]
 - The lease is recorded durably before the call returns, so a caller that lost
   the reply can read it back:
   `barge worktree lease get --request <id>` or `--lease <id>`.
+- The durable lease, not a process, reserves the root. It stays reserved
+  between runs, when nothing holds it, until it is returned.
 
 ### Return
 
@@ -57,8 +65,11 @@ barge worktree lease --repo <origin> --base <sha> [--base-name main]
 barge worktree return --lease <id> [--disposable] --request <id> --json
 ```
 
-- Return hands the root back to the pool. It is refused, and the lease stays,
-  while the hold is still taken (something is still running in the tree).
+- Return hands the root back to the pool. The caller first clears its own
+  side (Nucleus releases its registration and proves participants, tools and
+  effects are clear). Barge then fences the return to that lease ID: it is
+  refused, and the lease stays, while any hold is taken, and no new hold can
+  start on the root once the return begins.
 - Barge resets a returned tree only when it can prove nothing is lost:
   - the tree has no uncommitted or untracked changes outside the warm paths
     below; and
@@ -67,13 +78,19 @@ barge worktree return --lease <id> [--disposable] --request <id> --json
     merged or abandoned on purpose. Barge does not infer a merge from branch
     ancestry: squash merges break that, and the caller (Nucleus) already holds
     the publication evidence.
-- Anything else is refused with the reason. The tree stays exactly as it is
-  and the lease stays with the caller; Barge never discards work.
-- On an accepted return Barge resets the tree to the latest base (fetch,
-  detach at the base, delete the task branch locally, `git clean` everything
-  except the warm paths) and marks the root free.
-- Return is idempotent by lease ID; a repeated return of a returned lease
-  reports the earlier outcome.
+- Anything else is refused with the reason, before anything is changed. Only
+  this preflight refusal promises the tree is untouched; the lease stays with
+  the caller and Barge never discards work.
+- On an accepted return the lease moves to `returning`, and the root stays
+  unavailable through reset and verification. Barge resets the tree to the
+  latest base (fetch, detach at the base, delete the task branch locally,
+  remove the cleanup set below), verifies it, then marks the lease `returned`
+  and the root free.
+- A return cut off part-way leaves the lease `interrupted` and the root out of
+  the pool; the next return or `prune` finishes it. `lease get` reports each
+  of `leased`, `returning`, `returned` and `interrupted`.
+- Return is idempotent by lease ID. Replaying an old return after the root has
+  been leased again reports the old result and never touches the root.
 
 ## Warm paths
 
@@ -88,7 +105,23 @@ What makes a pooled tree worth having is what survives between leases.
   the agent's own install rebuilds it. Barge never runs an install itself.
 - Rust build output is not a warm path: Oxide places it in its own pool, and
   pairing a warm worktree with a warm Oxide slot is a later step.
-- Everything else ignored is removed at return.
+- Barge also re-hashes the key files of the outgoing checkout at return. If a
+  task changed a lockfile and reinstalled, the folder is recorded under the
+  new key or removed, so the next task never gets dependencies under an old
+  key.
+
+## Cleanup rules
+
+At return, Barge removes only what it can name:
+
+- tracked changes are already refused by the return preflight;
+- warm paths stay or go by their key, as above;
+- ignored paths the pool declares disposable, such as `dist` or `.cache`, are
+  removed;
+- any other ignored file refuses the return: it could be local data, and Barge
+  doesn't delete what it can't account for. The operator adds it to the pool's
+  disposable list or removes it;
+- symlinks are removed as links and never followed.
 
 ## Pools
 
@@ -97,7 +130,8 @@ A pool is declared once per repository in the account layout:
 ```json
 { "repo": "github.com/inflatable-cookie/barge",
   "warm": 2, "max": 6,
-  "warm_paths": [{ "path": "apps/barge-app/node_modules", "keys": ["apps/barge-app/bun.lock"] }] }
+  "warm_paths": [{ "path": "apps/barge-app/node_modules", "keys": ["apps/barge-app/bun.lock"] }],
+  "disposable": ["apps/barge-app/dist", ".effigy"] }
 ```
 
 - `warm` trees are kept ready; `max` caps the pool. Beyond `max`, a lease
@@ -119,11 +153,14 @@ by the Nucleus planner, built after Barge's CLI exists.
 
 What Nucleus needs from Barge, and this contract gives it:
 
-- a lease keyed by the task ID, with the repository identity, the exact base
-  commit and the task branch;
+- a lease keyed by allocation, with the task ID as a label, bound to the
+  repository identity, the exact base commit and the task branch;
 - a canonical path, a stable lease ID and the verified branch and head;
 - durable recording before the reply, and read-back by request or lease ID for
-  a reply that was lost, on both lease and return;
+  a reply that was lost, on both lease and return, with the lease's state
+  (`leased`, `returning`, `returned`, `interrupted`);
+- a return fenced to its lease ID and against new holds, whose replay never
+  touches a root that has been leased again;
 - exactly one lease per task, kept through revisions, review, restart and
   unsettled effects. Nucleus holds the lease for the task's whole life and
   returns it only at closeout;
