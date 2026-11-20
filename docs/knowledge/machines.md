@@ -168,13 +168,21 @@ Mac keeps working.
    checking the codes match. Matching codes prove no one on the LAN swapped
    the keys in between. The daemon then saves the client's key and name.
 
-Where approval happens:
+Where approval happens (Tom, 2026-11-20: a seamless experience needs a UI on
+the PC, not a terminal):
 
-- **From a paired client.** The Mac app shows "Steam Deck wants to pair" with
-  the code, and Approve or Deny. This is the normal route.
-- **On the PC itself,** for the first client, when nothing is paired yet:
-  `barged pair --approve` in a terminal lists pending requests with their
-  codes. This is the one-time bootstrap and replaces today's printed key.
+- **On the PC, in Gaming Mode:** the Barge Decky plugin, installed on the PC
+  as well as the Deck, shows "Steam Deck wants to pair" with the code, and
+  Approve or Deny. Bazzite runs Decky Loader, so this reuses the plugin; on
+  the PC it talks to its own `barged` over localhost.
+- **On the PC, in Desktop Mode:** `barged` sends a desktop notification with
+  the code and Approve and Deny actions, through the session's
+  `org.freedesktop.Notifications` service. It already runs as a user unit in
+  that session.
+- **From any paired client,** such as the Mac app, with the same code and
+  buttons, for when the PC is in another room.
+- `barged pair --approve` in a terminal stays as the fallback when no UI is
+  running.
 
 - `barge machine clients <name>` and the app's details dialog list a machine's
   paired clients and can revoke one.
@@ -185,9 +193,8 @@ Where approval happens:
 
 ### Questions for Tom
 
-- Approval from the Mac app as the normal route, with the PC terminal only for
-  the first client: is that right, or do you want approval on the PC's screen
-  (a notification in Gaming Mode) as well?
+- Approval on the PC through the Decky plugin in Gaming Mode and a
+  notification in Desktop Mode, plus any paired client: is that the right set?
 - Per-client keys replacing the single shared key: OK to migrate the current
   key into the list automatically?
 
