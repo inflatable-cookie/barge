@@ -365,7 +365,7 @@ Designed separately, not yet built:
   Link and workflow bindings, `init`, `move` and `doctor` are built; the
   `setting` adapters are not.
 - **Worktree pools:** areas of git worktrees leased through holds; see
-  [vision](vision.md#direction).
+  [worktrees](worktrees.md) (design draft).
 - **The machine daemon's later steps:** the remote-control replacement and
   Tailscale sign-ins ([machines](machines.md#build-order)). Machine control
   steps 1-3 are built.
