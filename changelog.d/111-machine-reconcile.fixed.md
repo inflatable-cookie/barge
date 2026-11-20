@@ -1,0 +1,1 @@
+A machine registered before discovery is recognised when the browse finds it, so the app no longer offers it again under Found on network. The registry records the ID, MAC and broadcast address a registered machine reports, and discovery matches records that have no ID by MAC, resolved address or mDNS host name.

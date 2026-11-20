@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 
 use barge::{Error, ErrorKind, Result};
 use barge_machine::{
-    local_hostname, match_registered, parse_public_key, request_power, sanitize_machine_name,
-    AssumeYes, Confirmation, DaemonClient, DatagramSender, DiscoveredMachine, KeyPair, Machine,
-    MdnsBrowser, PairRole, PairStatus, PowerActionKind, PowerState, Registry, UdpMdnsBrowser,
-    UdpSender, DEFAULT_DISCOVER_TIMEOUT, DEFAULT_POWER_DELAY_S,
+    backfill, follow_addresses, local_hostname, match_registered_with, parse_public_key,
+    request_power, sanitize_machine_name, AssumeYes, Confirmation, DaemonClient, DatagramSender,
+    DiscoveredMachine, KeyPair, Machine, MatchProbe, MdnsBrowser, NetworkProbe, PairRole,
+    PairStatus, PowerActionKind, PowerState, Registry, State, UdpMdnsBrowser, UdpSender,
+    DEFAULT_DISCOVER_TIMEOUT, DEFAULT_POWER_DELAY_S,
 };
 use serde_json::json;
 
@@ -24,6 +25,7 @@ pub(crate) struct Env<'a, S, B> {
     pub(crate) discover: &'a dyn Fn() -> Result<Registry>,
     pub(crate) sender: &'a S,
     pub(crate) browser: &'a B,
+    pub(crate) probe: &'a dyn MatchProbe,
     pub(crate) pair_poll_interval: Duration,
 }
 
@@ -36,9 +38,25 @@ pub(crate) fn machine(arguments: &[String], json: bool) -> Result<()> {
             discover: &discover,
             sender: &UdpSender,
             browser: &UdpMdnsBrowser,
+            probe: &NetworkProbe,
             pair_poll_interval: PAIR_POLL_INTERVAL,
         },
     )
+}
+
+/// Answers nothing: the tests never reach the network.
+#[cfg(test)]
+struct SilentProbe;
+
+#[cfg(test)]
+impl MatchProbe for SilentProbe {
+    fn mac(&self, _found: &DiscoveredMachine) -> Option<String> {
+        None
+    }
+
+    fn resolve(&self, _hostname: &str) -> Vec<std::net::IpAddr> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -57,6 +75,7 @@ pub(crate) fn machine_with<S: DatagramSender, B: MdnsBrowser>(
             discover: &discover,
             sender,
             browser,
+            probe: &SilentProbe,
             pair_poll_interval: Duration::from_millis(10),
         },
     )
@@ -104,13 +123,17 @@ fn discover_machines<S: DatagramSender, B: MdnsBrowser>(
     let found = env.browser.browse(timeout).map_err(machine_error)?;
 
     // Keep registered IP/port current when a paired machine's DHCP lease moves.
-    let _ = barge_machine::follow_addresses(&registry, &found);
+    let _ = follow_addresses(&registry, &found);
     let registered = registry.list().map_err(machine_error)?;
+    let matches: Vec<Option<&Machine>> = found
+        .iter()
+        .map(|item| match_registered_with(item, &registered, env.probe))
+        .collect();
 
     let entries: Vec<serde_json::Value> = found
         .iter()
-        .map(|item| {
-            let reg_name = match_registered(item, &registered).map(|m| m.name().to_string());
+        .zip(&matches)
+        .map(|(item, matched)| {
             json!({
                 "id": item.id,
                 "name": item.name,
@@ -118,7 +141,7 @@ fn discover_machines<S: DatagramSender, B: MdnsBrowser>(
                 "protocol_version": item.protocol_version,
                 "address": item.address,
                 "port": item.port,
-                "registered_as": reg_name,
+                "registered_as": matched.map(Machine::name),
             })
         })
         .collect();
@@ -131,8 +154,8 @@ fn discover_machines<S: DatagramSender, B: MdnsBrowser>(
     } else if found.is_empty() {
         println!("no machines found");
     } else {
-        for item in &found {
-            let status = match match_registered(item, &registered) {
+        for (item, matched) in found.iter().zip(&matches) {
+            let status = match matched {
                 Some(m) => format!("registered as {}", m.name()),
                 None => "not registered".to_string(),
             };
@@ -247,6 +270,18 @@ fn select_discovered<'a>(
         _ => Err(Error::refused(format!(
             "multiple discovered machines match {target:?}; pass the machine ID"
         ))),
+    }
+}
+
+/// Record what a registered machine reported where its record lacks it. A
+/// different machine ID is logged and the record is left alone.
+fn record_reported(registry: &Registry, name: &str, state: &State) {
+    if let Ok(outcome) = backfill(registry, name, state) {
+        if let Some(reported) = outcome.id_mismatch {
+            eprintln!(
+                "barge: {name} reports machine ID {reported}, not the ID it is registered with; the record is unchanged"
+            );
+        }
     }
 }
 
@@ -566,6 +601,7 @@ fn status<S: DatagramSender, B: MdnsBrowser>(
     let machine = registry.get(&name).map_err(machine_error)?;
     let (client, mode) = machine_client(&registry, &machine)?;
     let state = client.state().map_err(machine_error)?;
+    record_reported(&registry, machine.name(), &state);
     if json {
         document(
             "barge.machine-status/1",
@@ -822,6 +858,7 @@ mod tests {
             protocol_version: "1".to_string(),
             address: "192.168.1.42".to_string(),
             port: 9777,
+            host: "bazzite.local".to_string(),
         }]);
         machine_with(
             &arguments(&["discover"]),
@@ -853,6 +890,7 @@ mod tests {
             protocol_version: "1".to_string(),
             address: "192.168.1.99".to_string(),
             port: 9777,
+            host: "bazzite.local".to_string(),
         }]);
         machine_with(&arguments(&["discover"]), true, &registry, &sender, &moved).unwrap();
         assert_eq!(
@@ -875,6 +913,7 @@ mod tests {
             protocol_version: "1".to_string(),
             address: "127.0.0.1".to_string(),
             port,
+            host: "pc.local".to_string(),
         }]);
 
         let daemon_keys = KeyPair::generate().unwrap();

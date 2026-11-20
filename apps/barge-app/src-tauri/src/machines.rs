@@ -9,8 +9,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use barge_machine::{
-    follow_addresses, match_registered, DiscoveredMachine, Machine, MdnsBrowser,
-    PendingPairRequest, Registry, State, UdpMdnsBrowser, DEFAULT_DISCOVER_TIMEOUT,
+    backfill, follow_addresses, match_registered_with, DiscoveredMachine, Machine, MatchProbe,
+    MdnsBrowser, NetworkProbe, PendingPairRequest, Registry, State, UdpMdnsBrowser,
+    DEFAULT_DISCOVER_TIMEOUT,
 };
 use serde::Serialize;
 
@@ -369,12 +370,14 @@ pub fn ensure_registry(
 /// moved to a new address, and return unregistered machines found on the network.
 pub fn discover(observations: &Mutex<Observations>) -> Result<Vec<DiscoveredMachineView>, String> {
     let registry = Registry::discover().map_err(|error| error.to_string())?;
-    discover_with(&registry, &UdpMdnsBrowser, observations)
+    discover_with(&registry, &UdpMdnsBrowser, &NetworkProbe, observations)
 }
 
+/// Found machines that no registered record accounts for.
 pub fn discover_with(
     registry: &Registry,
     browser: &dyn MdnsBrowser,
+    probe: &dyn MatchProbe,
     observations: &Mutex<Observations>,
 ) -> Result<Vec<DiscoveredMachineView>, String> {
     let found = browser
@@ -387,7 +390,7 @@ pub fn discover_with(
     let registered = registry.list().map_err(|error| error.to_string())?;
     Ok(found
         .into_iter()
-        .filter(|item| match_registered(item, &registered).is_none())
+        .filter(|item| match_registered_with(item, &registered, probe).is_none())
         .map(DiscoveredMachineView::from)
         .collect())
 }
@@ -445,9 +448,13 @@ pub fn refresh_registry_with(
                         }
                         Err(error) => (Err(error.to_string()), Vec::new()),
                     };
+                    let machine = match &result {
+                        Ok(state) => reconciled(registry, machine, state),
+                        Err(_) => machine.clone(),
+                    };
                     (
                         Poll {
-                            machine: machine.clone(),
+                            machine,
                             lan,
                             started_at_ms,
                             result,
@@ -486,6 +493,23 @@ pub fn refresh_registry_with(
         notifier.notify(&prompt);
     }
     Ok(())
+}
+
+/// The registered record after recording what its daemon reported, so
+/// discovery matches it by ID from now on.
+fn reconciled(registry: &Registry, machine: &Machine, state: &State) -> Machine {
+    match backfill(registry, machine.name(), state) {
+        Ok(outcome) => {
+            if let Some(reported) = &outcome.id_mismatch {
+                eprintln!(
+                    "barge: {} reports machine ID {reported}, not the ID it is registered with; the record is unchanged",
+                    machine.name()
+                );
+            }
+            outcome.machine
+        }
+        Err(_) => machine.clone(),
+    }
 }
 
 fn pending_prompt(machine_name: &str, req: PendingPairRequest) -> PendingPairPrompt {
@@ -841,6 +865,7 @@ mod tests {
                 protocol_version: "1".to_string(),
                 address: "192.168.1.99".to_string(),
                 port: 9888,
+                host: "bazzite.local".to_string(),
             },
             DiscoveredMachine {
                 id: "mid-2".to_string(),
@@ -849,10 +874,11 @@ mod tests {
                 protocol_version: "1".to_string(),
                 address: "192.168.1.50".to_string(),
                 port: 9777,
+                host: "steamdeck.local".to_string(),
             },
         ]);
 
-        let found = discover_with(&registry, &browser, &observations).unwrap();
+        let found = discover_with(&registry, &browser, &Offline, &observations).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "mid-2");
         assert_eq!(found[0].name, "SteamDeck");
@@ -924,5 +950,105 @@ mod tests {
         assert_eq!(notifier.0.lock().unwrap().len(), 1);
 
         server.join().unwrap();
+    }
+
+    /// Answers nothing, so matching uses the record and the browse alone.
+    struct Offline;
+
+    impl MatchProbe for Offline {
+        fn mac(&self, _found: &DiscoveredMachine) -> Option<String> {
+            None
+        }
+
+        fn resolve(&self, _hostname: &str) -> Vec<std::net::IpAddr> {
+            Vec::new()
+        }
+    }
+
+    struct Browse(Vec<DiscoveredMachine>);
+
+    impl MdnsBrowser for Browse {
+        fn browse(
+            &self,
+            _timeout: std::time::Duration,
+        ) -> barge_machine::Result<Vec<DiscoveredMachine>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn discover_does_not_offer_a_registered_machine_recorded_before_discovery() {
+        // The registered record predates discovery: no ID, and the hostname is
+        // bazzite.local, not the address the browse found it at.
+        let temp = barge::testing::TempDir::new("app-discover-reconcile").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        registry
+            .add(Machine::new("bazzite", "bazzite.local", "00:11:22:33:44:55").unwrap())
+            .unwrap();
+        let observations = Mutex::new(Observations::default());
+        ensure_registry(&registry, &observations).unwrap();
+        let browser = Browse(vec![DiscoveredMachine {
+            id: "mid-1".to_string(),
+            name: "Bazzite".to_string(),
+            mode: "lan".to_string(),
+            protocol_version: "1".to_string(),
+            address: "192.168.1.55".to_string(),
+            port: 9777,
+            host: "Bazzite.local".to_string(),
+        }]);
+
+        let found = discover_with(&registry, &browser, &Offline, &observations).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(registry.get("bazzite").unwrap().id(), None);
+    }
+
+    #[test]
+    fn refresh_records_the_id_and_mac_a_registered_machine_reports() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let temp = barge::testing::TempDir::new("app-refresh-backfill").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        registry
+            .add(
+                Machine::new("bazzite", "127.0.0.1", "00:11:22:33:44:55")
+                    .unwrap()
+                    .with_daemon_port(port)
+                    .unwrap(),
+            )
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            let body = r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-1","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1.255"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let observations = Mutex::new(Observations::default());
+        let pending = Mutex::new(PendingPairs::default());
+        refresh_registry_with(&registry, &observations, &pending, &NoopNotifier).unwrap();
+        server.join().unwrap();
+
+        // The ID is recorded and the MAC it already had is kept.
+        let record = registry.get("bazzite").unwrap();
+        assert_eq!(record.id(), Some("mid-1"));
+        assert_eq!(record.mac(), Some("00:11:22:33:44:55"));
+        assert_eq!(
+            record.broadcast(),
+            std::net::Ipv4Addr::new(192, 168, 1, 255)
+        );
+        assert_eq!(
+            observations.lock().unwrap().snapshot(now_ms())[0].mac,
+            "00:11:22:33:44:55"
+        );
     }
 }

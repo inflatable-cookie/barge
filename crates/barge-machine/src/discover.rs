@@ -6,12 +6,13 @@
 //! returned PTR, SRV, TXT and A/AAAA records.
 
 use std::collections::{BTreeMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ErrorKind, Machine, Registry, Result};
+use crate::daemon::DaemonClient;
+use crate::{Error, ErrorKind, Machine, Registry, Result, State, DEFAULT_BROADCAST};
 
 /// The DNS-SD service type `barged` advertises in LAN mode.
 pub const MDNS_SERVICE_TYPE: &str = "_barged._tcp.local.";
@@ -43,12 +44,45 @@ pub struct DiscoveredMachine {
     pub address: String,
     /// The daemon's TCP port from the SRV record.
     pub port: u16,
+    /// The host name the SRV record names, without the trailing dot (for
+    /// example `Bazzite.local`).
+    pub host: String,
 }
 
 /// Browses `_barged._tcp` on the LAN; tests replace this with a fake.
 pub trait MdnsBrowser {
     /// Discover `barged` instances within `timeout`.
     fn browse(&self, timeout: Duration) -> Result<Vec<DiscoveredMachine>>;
+}
+
+/// The lookups matching makes beyond the browse record. [`NetworkProbe`] asks
+/// the network; tests answer from a fixture.
+pub trait MatchProbe {
+    /// The MAC a found machine reports on `GET /v1/state`, when it answers
+    /// without credentials.
+    fn mac(&self, found: &DiscoveredMachine) -> Option<String>;
+    /// The addresses a host name resolves to.
+    fn resolve(&self, hostname: &str) -> Vec<IpAddr>;
+}
+
+/// The real probe: an unauthenticated state read and the system resolver.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NetworkProbe;
+
+impl MatchProbe for NetworkProbe {
+    fn mac(&self, found: &DiscoveredMachine) -> Option<String> {
+        DaemonClient::for_address(&found.address, found.port)
+            .state()
+            .ok()?
+            .mac
+    }
+
+    fn resolve(&self, hostname: &str) -> Vec<IpAddr> {
+        (hostname, 0)
+            .to_socket_addrs()
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Real mDNS browser sending QU queries over UDP.
@@ -62,12 +96,22 @@ impl MdnsBrowser for UdpMdnsBrowser {
 }
 
 /// Find which registered [`Machine`] corresponds to a discovered instance.
+/// The CLI and the app pass [`NetworkProbe`]; tests pass a fixture.
 ///
-/// Matches by `machine_id` first, then falls back to `(hostname, daemon_port)`
-/// for records registered manually before discovery.
-pub fn match_registered<'a>(
+/// The rules run in order and stop at the first hit:
+/// 1. the machine ID;
+/// 2. the MAC the found machine reports (fetched only when rule 1 misses and a
+///    record without an ID exists);
+/// 3. the record's hostname resolving to the found address, on the same port;
+/// 4. the record's hostname equal, ignoring case, to the found SRV host.
+///
+/// Rules 2 to 4 consider only records with no ID yet. A record that already
+/// holds a different ID is another machine, so it is never matched by name or
+/// address; it stays listed separately until its ID is recorded.
+pub fn match_registered_with<'a>(
     found: &DiscoveredMachine,
     registered: &'a [Machine],
+    probe: &dyn MatchProbe,
 ) -> Option<&'a Machine> {
     if let Some(by_id) = registered
         .iter()
@@ -75,9 +119,106 @@ pub fn match_registered<'a>(
     {
         return Some(by_id);
     }
-    registered
+    let unidentified: Vec<&'a Machine> = registered
         .iter()
-        .find(|machine| machine.hostname() == found.address && machine.daemon_port() == found.port)
+        .filter(|machine| machine.id().is_none())
+        .collect();
+    if unidentified.is_empty() {
+        return None;
+    }
+    if let Some(mac) = probe.mac(found) {
+        if let Some(by_mac) = unidentified.iter().find(|machine| {
+            machine
+                .mac()
+                .is_some_and(|known| known.eq_ignore_ascii_case(&mac))
+        }) {
+            return Some(*by_mac);
+        }
+    }
+    if let Ok(address) = found.address.parse::<IpAddr>() {
+        if let Some(by_address) = unidentified.iter().find(|machine| {
+            machine.daemon_port() == found.port
+                && probe.resolve(machine.hostname()).contains(&address)
+        }) {
+            return Some(*by_address);
+        }
+    }
+    let host = found.host.trim_end_matches('.');
+    unidentified.into_iter().find(|machine| {
+        machine
+            .hostname()
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(host)
+    })
+}
+
+/// The ID a daemon reported that differs from the one a record holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backfilled {
+    /// The record as it now stands.
+    pub machine: Machine,
+    /// The ID the daemon reported, when the record holds a different one. In
+    /// that case nothing was written: the answer came from another machine.
+    pub id_mismatch: Option<String>,
+}
+
+/// Record what a registered machine reported on `GET /v1/state` where the
+/// record lacks it: its machine ID, its MAC and its broadcast address.
+///
+/// An ID already on the record is never overwritten. A broadcast address is
+/// missing while the record still holds the default.
+pub fn backfill(registry: &Registry, name: &str, state: &State) -> Result<Backfilled> {
+    let current = registry.get(name)?;
+    if let Some(reported) = mismatched_id(&current, state) {
+        return Ok(Backfilled {
+            machine: current,
+            id_mismatch: Some(reported.to_string()),
+        });
+    }
+    let filled = fill(&current, state)?;
+    if filled == current {
+        return Ok(Backfilled {
+            machine: current,
+            id_mismatch: None,
+        });
+    }
+    let machine = registry.update(name, |record| {
+        if mismatched_id(record, state).is_none() {
+            *record = fill(record, state)?;
+        }
+        Ok(())
+    })?;
+    Ok(Backfilled {
+        machine,
+        id_mismatch: None,
+    })
+}
+
+fn mismatched_id<'a>(record: &Machine, state: &'a State) -> Option<&'a str> {
+    let reported = state.machine_id.trim();
+    match record.id() {
+        Some(recorded) if !reported.is_empty() && recorded != reported => Some(reported),
+        _ => None,
+    }
+}
+
+fn fill(record: &Machine, state: &State) -> Result<Machine> {
+    let mut next = record.clone();
+    let reported = state.machine_id.trim();
+    if next.id().is_none() && !reported.is_empty() {
+        next = next.with_id(Some(reported.to_string()));
+    }
+    if next.mac().is_none() {
+        if let Some(mac) = &state.mac {
+            next = next.with_mac(mac)?;
+        }
+    }
+    if next.broadcast() == DEFAULT_BROADCAST {
+        if let Some(broadcast) = state.broadcast.filter(|b| *b != DEFAULT_BROADCAST) {
+            next = next.with_broadcast(broadcast);
+        }
+    }
+    Ok(next)
 }
 
 /// Update any registered machine whose `machine_id` matches a discovered
@@ -245,7 +386,7 @@ impl Collector {
     fn finish(self) -> Vec<DiscoveredMachine> {
         let mut by_id: BTreeMap<String, DiscoveredMachine> = BTreeMap::new();
         for (instance, parts) in self.instances {
-            let Some(port) = parts.port else {
+            let (Some(port), Some(target)) = (parts.port, parts.target.clone()) else {
                 continue;
             };
             let Some(id) = parts.txt.get("id").filter(|s| !s.is_empty()).cloned() else {
@@ -297,6 +438,7 @@ impl Collector {
                     protocol_version,
                     address: address.to_string(),
                     port,
+                    host: target.trim_end_matches('.').to_string(),
                 },
             );
         }
@@ -599,6 +741,7 @@ mod tests {
                 protocol_version: "1".to_string(),
                 address: "192.168.1.20".to_string(),
                 port: 9777,
+                host: "bazzite.local".to_string(),
             }]
         );
     }
@@ -613,44 +756,223 @@ mod tests {
         assert!(parse_records(&pkt).is_err());
     }
 
-    #[test]
-    fn match_registered_prefers_machine_id_then_address_and_port() {
-        let found = DiscoveredMachine {
+    /// Answers from a fixture: a MAC for the found machine, and resolutions.
+    /// Literal addresses resolve to themselves, as the system resolver does.
+    #[derive(Default)]
+    struct FakeProbe {
+        mac: Option<String>,
+        resolves: Vec<(&'static str, IpAddr)>,
+        mac_asked: std::cell::Cell<bool>,
+    }
+
+    impl MatchProbe for FakeProbe {
+        fn mac(&self, _found: &DiscoveredMachine) -> Option<String> {
+            self.mac_asked.set(true);
+            self.mac.clone()
+        }
+
+        fn resolve(&self, hostname: &str) -> Vec<IpAddr> {
+            if let Ok(literal) = hostname.parse::<IpAddr>() {
+                return vec![literal];
+            }
+            self.resolves
+                .iter()
+                .filter(|(name, _)| *name == hostname)
+                .map(|(_, ip)| *ip)
+                .collect()
+        }
+    }
+
+    fn found_bazzite(address: &str, port: u16, host: &str) -> DiscoveredMachine {
+        DiscoveredMachine {
             id: "mid-1".to_string(),
             name: "Bazzite".to_string(),
             mode: "lan".to_string(),
             protocol_version: "1".to_string(),
-            address: "192.168.1.50".to_string(),
-            port: 9777,
-        };
+            address: address.to_string(),
+            port,
+            host: host.to_string(),
+        }
+    }
+
+    fn unidentified(name: &str, hostname: &str, port: u16) -> Machine {
+        Machine::new(name, hostname, "00:11:22:33:44:55")
+            .unwrap()
+            .with_daemon_port(port)
+            .unwrap()
+    }
+
+    #[test]
+    fn match_registered_prefers_machine_id_then_address_and_port() {
+        let found = found_bazzite("192.168.1.50", 9777, "other.local");
         let by_id = Machine::discovered("mid-1", "pc", "192.168.1.20", 9777).unwrap();
         let manual = Machine::new("manual", "192.168.1.50", "00:11:22:33:44:ff").unwrap();
+        let probe = FakeProbe::default();
         assert_eq!(
-            match_registered(&found, &[manual.clone(), by_id.clone()]).map(Machine::name),
+            match_registered_with(&found, &[manual.clone(), by_id.clone()], &probe)
+                .map(Machine::name),
             Some("pc")
         );
         assert_eq!(
-            match_registered(&found, &[manual]).map(Machine::name),
+            match_registered_with(&found, &[manual], &probe).map(Machine::name),
             Some("manual")
         );
     }
 
     #[test]
     fn match_registered_matches_by_id_even_when_address_and_port_change() {
-        let found = DiscoveredMachine {
-            id: "mid-1".to_string(),
-            name: "Bazzite".to_string(),
-            mode: "lan".to_string(),
-            protocol_version: "1".to_string(),
-            address: "192.168.1.99".to_string(),
-            port: 9888,
-        };
+        let found = found_bazzite("192.168.1.99", 9888, "bazzite.local");
         let registered = Machine::discovered("mid-1", "bazzite", "192.168.1.20", 9777).unwrap();
         let other = Machine::discovered("mid-2", "other", "192.168.1.99", 9888).unwrap();
+        let probe = FakeProbe::default();
         assert_eq!(
-            match_registered(&found, &[other, registered]).map(Machine::name),
+            match_registered_with(&found, &[other, registered], &probe).map(Machine::name),
             Some("bazzite")
         );
+        assert!(!probe.mac_asked.get(), "an ID match needs no probe");
+    }
+
+    #[test]
+    fn an_unidentified_record_matches_by_its_resolved_address() {
+        let found = found_bazzite("192.168.1.55", 9777, "Bazzite.local");
+        let record = unidentified("bazzite", "bazzite.lan", 9777);
+        let probe = FakeProbe {
+            resolves: vec![("bazzite.lan", "192.168.1.55".parse().unwrap())],
+            ..FakeProbe::default()
+        };
+        assert_eq!(
+            match_registered_with(&found, std::slice::from_ref(&record), &probe).map(Machine::name),
+            Some("bazzite")
+        );
+
+        let wrong_port = found_bazzite("192.168.1.55", 9888, "elsewhere.local");
+        assert_eq!(
+            match_registered_with(&wrong_port, &[record], &probe),
+            None,
+            "an address match also needs the daemon port"
+        );
+    }
+
+    #[test]
+    fn an_unidentified_record_matches_the_mdns_host_ignoring_case() {
+        let found = found_bazzite("192.168.1.55", 9777, "Bazzite.local");
+        let record = unidentified("bazzite", "bazzite.local", 9777);
+        assert_eq!(
+            match_registered_with(&found, &[record], &FakeProbe::default()).map(Machine::name),
+            Some("bazzite")
+        );
+    }
+
+    #[test]
+    fn an_unidentified_record_matches_the_found_mac() {
+        let found = found_bazzite("192.168.1.55", 9777, "elsewhere.local");
+        let record = unidentified("bazzite", "old-name.local", 9777);
+        let probe = FakeProbe {
+            mac: Some("00:11:22:33:44:55".to_string()),
+            ..FakeProbe::default()
+        };
+        assert_eq!(
+            match_registered_with(&found, &[record], &probe).map(Machine::name),
+            Some("bazzite")
+        );
+    }
+
+    #[test]
+    fn a_record_with_another_id_is_never_matched_by_name_address_or_mac() {
+        let found = found_bazzite("192.168.1.55", 9777, "Bazzite.local");
+        let other = Machine::discovered("mid-2", "bazzite", "192.168.1.55", 9777).unwrap();
+        let probe = FakeProbe {
+            mac: Some("00:11:22:33:44:55".to_string()),
+            ..FakeProbe::default()
+        };
+        assert_eq!(
+            match_registered_with(&found, &[other], &probe),
+            None,
+            "the found machine is another machine and stays listed"
+        );
+    }
+
+    #[test]
+    fn the_probe_is_asked_only_when_an_unidentified_record_exists() {
+        let found = found_bazzite("192.168.1.55", 9777, "Bazzite.local");
+        let probe = FakeProbe::default();
+        assert_eq!(match_registered_with(&found, &[], &probe), None);
+        assert!(!probe.mac_asked.get());
+        let identified = Machine::discovered("mid-2", "nas", "192.168.1.30", 9777).unwrap();
+        assert_eq!(match_registered_with(&found, &[identified], &probe), None);
+        assert!(!probe.mac_asked.get());
+    }
+
+    fn state(machine_id: &str, mac: Option<&str>, broadcast: Option<Ipv4Addr>) -> State {
+        State::new(crate::PowerState::Awake, 42)
+            .with_machine_id(machine_id)
+            .with_mac(mac.map(str::to_string))
+            .with_broadcast(broadcast)
+    }
+
+    #[test]
+    fn backfill_records_the_missing_id_mac_and_broadcast_once() {
+        let temp = barge::testing::TempDir::new("backfill-fill").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+        // A record with neither an ID nor a MAC, as one registered by hand before discovery.
+        let bare = Machine::discovered("unused", "bazzite", "bazzite.local", 9777)
+            .unwrap()
+            .with_id(None);
+        registry.add(bare).unwrap();
+        let reported = state(
+            "mid-1",
+            Some("aa:bb:cc:dd:ee:ff"),
+            Some("192.168.1.255".parse().unwrap()),
+        );
+
+        let first = backfill(&registry, "bazzite", &reported).unwrap();
+        assert_eq!(first.id_mismatch, None);
+        assert_eq!(first.machine.id(), Some("mid-1"));
+        assert_eq!(first.machine.mac(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(first.machine.broadcast(), Ipv4Addr::new(192, 168, 1, 255));
+        assert_eq!(registry.get("bazzite").unwrap(), first.machine);
+
+        let second = backfill(&registry, "bazzite", &reported).unwrap();
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn backfill_never_overwrites_a_different_id_or_fills_from_that_machine() {
+        let temp = barge::testing::TempDir::new("backfill-mismatch").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+        registry
+            .add(Machine::discovered("mid-1", "bazzite", "bazzite.local", 9777).unwrap())
+            .unwrap();
+        let other_machine = state(
+            "mid-2",
+            Some("aa:bb:cc:dd:ee:ff"),
+            Some("192.168.1.255".parse().unwrap()),
+        );
+
+        let outcome = backfill(&registry, "bazzite", &other_machine).unwrap();
+        assert_eq!(outcome.id_mismatch.as_deref(), Some("mid-2"));
+        assert_eq!(outcome.machine.id(), Some("mid-1"));
+        assert_eq!(outcome.machine.mac(), None);
+        assert_eq!(registry.get("bazzite").unwrap(), outcome.machine);
+    }
+
+    #[test]
+    fn backfill_keeps_a_mac_and_broadcast_the_record_already_holds() {
+        let temp = barge::testing::TempDir::new("backfill-keep").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+        let record = Machine::discovered("mid-1", "bazzite", "bazzite.local", 9777)
+            .unwrap()
+            .with_mac("00:11:22:33:44:55")
+            .unwrap()
+            .with_broadcast(Ipv4Addr::new(10, 0, 0, 255));
+        registry.add(record.clone()).unwrap();
+        let reported = state(
+            "mid-1",
+            Some("aa:bb:cc:dd:ee:ff"),
+            Some("192.168.1.255".parse().unwrap()),
+        );
+        let outcome = backfill(&registry, "bazzite", &reported).unwrap();
+        assert_eq!(outcome.machine, record);
     }
 
     #[test]
@@ -667,6 +989,7 @@ mod tests {
                 protocol_version: "1".to_string(),
                 address: "192.168.1.99".to_string(),
                 port: 9888,
+                host: "bazzite.local".to_string(),
             },
             DiscoveredMachine {
                 id: "mid-unregistered".to_string(),
@@ -675,6 +998,7 @@ mod tests {
                 protocol_version: "1".to_string(),
                 address: "192.168.1.77".to_string(),
                 port: 9777,
+                host: "steamdeck.local".to_string(),
             },
         ];
         assert!(follow_addresses(&registry, &found).unwrap().is_empty());

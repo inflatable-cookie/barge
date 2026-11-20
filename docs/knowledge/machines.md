@@ -162,6 +162,24 @@ keys.
   the Deck on 2026-11-20), so the client carries its own mDNS browser and
   connects to the address it found. A paired machine is matched by ID, so an
   address change after a DHCP renewal updates itself.
+- A found machine is matched to a registered record by the first rule that
+  hits:
+  1. the machine ID;
+  2. the MAC the found machine reports on `GET /v1/state`, read without
+     credentials. A LAN daemon refuses an unsigned read, so this rule matches
+     only a daemon that answers one;
+  3. the record's hostname resolving to the found address, on the same daemon
+     port;
+  4. the record's hostname equal, ignoring case, to the SRV host (for example
+     `Bazzite.local`).
+  Rules 2 to 4 consider only records with no ID yet. A record that holds another
+  ID is a different machine, so it is listed as found and never matched by name,
+  address or MAC.
+- A registered machine that answers `GET /v1/state` has the machine ID, MAC and
+  broadcast it reports recorded where the record lacks them, so rule 1 holds
+  from then on. An ID already on the record is never overwritten; a different
+  ID is logged, nothing is written from that machine, and the found machine is
+  listed separately.
 
 ### Pairing
 
