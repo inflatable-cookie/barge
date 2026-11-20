@@ -73,7 +73,20 @@ pub fn show(app: &tauri::AppHandle, view: Option<&'static str>) -> Result<(), St
 /// `spawn_blocking`, Reopen via an async spawn), so the AppKit work hops to
 /// the main thread through the event loop instead of forging a thread marker.
 #[cfg(target_os = "macos")]
-fn refresh_dock_icon(app: &tauri::AppHandle) {
+pub(crate) fn refresh_dock_icon(app: &tauri::AppHandle) {
+    // The Dock creates the tile asynchronously after a switch to Regular, so
+    // an icon set in the same turn can land before the tile exists. Set it
+    // now and once more shortly after.
+    let later = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        set_dock_icon(&later);
+    });
+    set_dock_icon(app);
+}
+
+#[cfg(target_os = "macos")]
+fn set_dock_icon(app: &tauri::AppHandle) {
     // Best effort and asynchronous: the window is already opening, so a dead
     // event loop only loses the icon, never the window.
     let _ = app.run_on_main_thread(|| {

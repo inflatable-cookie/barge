@@ -120,6 +120,14 @@ fn run() -> tauri::Result<()> {
         ])
         .build(tauri::generate_context!())?;
     app.run(|app, event| {
+        // AppKit finishes launching after `setup`, and an unbundled binary's
+        // finishLaunching resets the Dock icon to the generic executable one,
+        // undoing the icon `show_main` set from `setup`. Set it again once
+        // the app is ready (app.md, "Window on demand").
+        #[cfg(target_os = "macos")]
+        if matches!(event, tauri::RunEvent::Ready) {
+            commands::window::refresh_dock_icon(app);
+        }
         // A second launch reaches the running app here. Reopen the window
         // rather than leaving the operator with an unreachable app.
         #[cfg(target_os = "macos")]
