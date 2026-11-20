@@ -162,6 +162,7 @@ mod tests {
             hostname: "bazzite.local".into(),
             mac: "00:11:22:33:44:55".into(),
             mode: "lan",
+            paired: true,
             address: "bazzite.local".into(),
             daemon_port: 9777,
             reachable,

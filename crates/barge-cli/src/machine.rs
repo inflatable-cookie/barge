@@ -1,13 +1,12 @@
-use std::ffi::CStr;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use barge::{Error, ErrorKind, Result};
 use barge_machine::{
-    match_registered, parse_public_key, request_power, sanitize_machine_name, AssumeYes,
-    Confirmation, DaemonClient, DatagramSender, DiscoveredMachine, KeyPair, Machine, MdnsBrowser,
-    PairRole, PairStatus, PowerActionKind, PowerState, Registry, UdpMdnsBrowser, UdpSender,
-    DEFAULT_DISCOVER_TIMEOUT, DEFAULT_POWER_DELAY_S,
+    local_hostname, match_registered, parse_public_key, request_power, sanitize_machine_name,
+    AssumeYes, Confirmation, DaemonClient, DatagramSender, DiscoveredMachine, KeyPair, Machine,
+    MdnsBrowser, PairRole, PairStatus, PowerActionKind, PowerState, Registry, UdpMdnsBrowser,
+    UdpSender, DEFAULT_DISCOVER_TIMEOUT, DEFAULT_POWER_DELAY_S,
 };
 use serde_json::json;
 
@@ -102,31 +101,11 @@ fn discover_machines<S: DatagramSender, B: MdnsBrowser>(
     expect_no_positionals(&options)?;
     let timeout = parse_timeout(&options, DEFAULT_DISCOVER_TIMEOUT)?;
     let registry = (env.discover)()?;
-    let mut registered = registry.list().map_err(machine_error)?;
     let found = env.browser.browse(timeout).map_err(machine_error)?;
 
     // Keep registered IP/port current when a paired machine's DHCP lease moves.
-    if registry.exists() {
-        for item in &found {
-            if let Some(existing) = registered
-                .iter()
-                .find(|m| m.id() == Some(item.id.as_str()))
-                .cloned()
-            {
-                if existing.hostname() != item.address || existing.daemon_port() != item.port {
-                    let _ = registry.update(existing.name(), |machine| {
-                        let updated = machine
-                            .clone()
-                            .with_hostname(item.address.clone())?
-                            .with_daemon_port(item.port)?;
-                        *machine = updated;
-                        Ok(())
-                    });
-                }
-            }
-        }
-        registered = registry.list().map_err(machine_error)?;
-    }
+    let _ = barge_machine::follow_addresses(&registry, &found);
+    let registered = registry.list().map_err(machine_error)?;
 
     let entries: Vec<serde_json::Value> = found
         .iter()
@@ -726,26 +705,6 @@ fn parse_timeout(options: &Options, default: Duration) -> Result<Duration> {
         return Err(Error::usage("--timeout must be 0-3600 seconds"));
     }
     Ok(Duration::from_secs_f64(seconds))
-}
-
-fn local_hostname() -> Option<String> {
-    let mut buf = [0 as libc::c_char; 256];
-    // SAFETY: `buf` is a live, writable buffer of `buf.len()` bytes.
-    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
-        return None;
-    }
-    buf[buf.len() - 1] = 0;
-    // SAFETY: `buf` is NUL-terminated above.
-    let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
-        .to_string_lossy()
-        .trim()
-        .to_string();
-    let short = name.split('.').next().unwrap_or("").trim().to_string();
-    if short.is_empty() {
-        None
-    } else {
-        Some(short)
-    }
 }
 
 /// The interactive confirmation: one line from stdin, anything but yes is no.

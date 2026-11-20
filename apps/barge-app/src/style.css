@@ -19,7 +19,11 @@ aside .poodle-sidebar-nav { padding-block: 0; }
    commands/window.rs. The title takes no pointer events, so the whole strip
    keeps dragging the window. */
 .titlebar-brand { margin-left: 90px; font-weight: 700; pointer-events: none; user-select: none; -webkit-user-select: none; }
-.heading { display: flex; align-items: baseline; justify-content: space-between; }
+.heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.heading-actions { display: flex; align-items: center; gap: 8px; }
+.section-label { color: var(--poodle-color-text-secondary); font-size: .85rem; font-weight: 600; margin: 24px 0 12px; }
+.pair-prompts { display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }
+.pair-code-inline { font-family: var(--poodle-typography-code-family); font-variant-numeric: tabular-nums; letter-spacing: .12em; color: var(--poodle-color-text-primary); }
 .observed { color: var(--poodle-color-text-secondary); font-size: .85rem; margin: 0 0 12px; }
 .volumes { padding: 0; list-style: none; }
 .volumes li, .setting { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 16px 0; border-bottom: 1px solid var(--poodle-color-border-subtle); }
@@ -59,3 +63,21 @@ aside .poodle-sidebar-nav { padding-block: 0; }
 
 .facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 24px; }
 .dialog-actions { display: flex; justify-content: space-between; gap: var(--poodle-space-inline-sm); width: 100%; }
+.dialog-actions-end { justify-content: flex-end; }
+
+.found-avatar { display: flex; flex: none; align-items: center; justify-content: center; width: 64px; height: 64px; border-radius: 50%; background: var(--poodle-color-background-surface); border: 1px solid var(--poodle-color-border-subtle); color: var(--poodle-color-text-secondary); }
+
+.pair-code-panel { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 14px; padding: 8px 0; }
+.pair-code-box { padding: 14px 24px; border-radius: var(--poodle-radius-surface); background: var(--poodle-color-background-surface); border: 1px solid var(--poodle-color-border-subtle); }
+.pair-code { font-family: var(--poodle-typography-code-family); font-size: 2rem; font-weight: 700; letter-spacing: .2em; padding-left: .2em; font-variant-numeric: tabular-nums; color: var(--poodle-color-text-primary); }
+.pair-instruction { margin: 0; font-weight: 500; color: var(--poodle-color-text-primary); }
+.pair-waiting { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--poodle-color-text-secondary); font-size: .85rem; }
+
+.clients-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--poodle-color-border-subtle); }
+.clients-section h3 { margin: 0 0 10px; font-size: .85rem; font-weight: 600; color: var(--poodle-color-text-secondary); }
+.clients-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.clients-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--poodle-color-border-subtle); }
+.clients-list li:last-child { border-bottom: 0; }
+.client-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.client-name { display: flex; align-items: center; gap: 8px; font-weight: 500; color: var(--poodle-color-text-primary); }
+.client-meta { font-size: .8rem; color: var(--poodle-color-text-secondary); }

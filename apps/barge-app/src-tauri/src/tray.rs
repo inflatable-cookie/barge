@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::{
     commands::{
         local::{self, DoctorState},
-        machines::{self, MachineState},
+        machines::{self, MachineState, NotifierState, PendingPairState},
         window,
     },
     machine_state::FAST_POLL_MS,
@@ -20,7 +20,7 @@ use crate::{
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIcon,
-    AppHandle, Manager, Wry,
+    AppHandle, Emitter, Manager, Wry,
 };
 
 /// What the background loops last saw. The menu reads it each second.
@@ -84,8 +84,13 @@ pub fn start(app: &AppHandle, icon: tauri::image::Image<'static>) -> tauri::Resu
     let poll_shared = shared.clone();
     std::thread::spawn(move || {
         let observations = poll_app.state::<MachineState>().0.clone();
+        let pending = poll_app.state::<PendingPairState>().0.clone();
+        let notifier = poll_app.state::<NotifierState>().0.clone();
         loop {
-            let result = crate::machines::refresh(&observations);
+            let result = crate::machines::refresh_all(&observations, &pending, notifier.as_ref());
+            if let Ok(prompts) = pending.lock().map(|store| store.snapshot()) {
+                let _ = poll_app.emit("pending-pairs-changed", &prompts);
+            }
             if let Ok(mut state) = poll_shared.lock() {
                 state.poll_error = result.err().map_or_else(String::new, |error| {
                     format!("Could not read machines: {error}")

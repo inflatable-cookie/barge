@@ -4,13 +4,20 @@
 //! power action Barge sent to each machine. Both surfaces read the same
 //! [`MachineView`]s, whose state comes from [`machine_state::status`].
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use barge_machine::{Machine, Registry, State};
+use barge_machine::{
+    follow_addresses, match_registered, DiscoveredMachine, Machine, MdnsBrowser,
+    PendingPairRequest, Registry, State, UdpMdnsBrowser, DEFAULT_DISCOVER_TIMEOUT,
+};
 use serde::Serialize;
 
 use crate::machine_state::{self, Input, LastAction, Status};
+#[cfg(test)]
+use crate::notifications::NoopNotifier;
+use crate::notifications::PairNotifier;
 
 /// Milliseconds since the Unix epoch on this Mac's clock.
 pub fn now_ms() -> u64 {
@@ -25,6 +32,7 @@ pub struct MachineView {
     pub hostname: String,
     pub mac: String,
     pub mode: &'static str,
+    pub paired: bool,
     pub address: String,
     pub daemon_port: u16,
     pub reachable: bool,
@@ -32,6 +40,85 @@ pub struct MachineView {
     /// When Barge received the last successful observation, on this Mac's clock.
     pub seen_at_unix_ms: Option<u64>,
     pub status: Status,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DiscoveredMachineView {
+    pub id: String,
+    pub name: String,
+    pub mode: String,
+    pub protocol_version: String,
+    pub address: String,
+    pub port: u16,
+}
+
+impl From<DiscoveredMachine> for DiscoveredMachineView {
+    fn from(value: DiscoveredMachine) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            mode: value.mode,
+            protocol_version: value.protocol_version,
+            address: value.address,
+            port: value.port,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PendingPairPrompt {
+    pub machine_name: String,
+    pub request_id: String,
+    pub client_name: String,
+    pub code: String,
+    pub created_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PairedClientView {
+    pub id: String,
+    pub name: String,
+    pub paired_at_unix_ms: u64,
+    pub this_client: bool,
+}
+
+/// Pending pairing requests across all paired machines, with one-shot
+/// notification tracking per `request_id`.
+#[derive(Default)]
+pub struct PendingPairs {
+    prompts: Vec<PendingPairPrompt>,
+    notified: HashSet<String>,
+}
+
+impl PendingPairs {
+    /// Replace the active prompts and return only newly observed ones that have
+    /// not triggered a native notification yet.
+    pub fn sync(&mut self, prompts: Vec<PendingPairPrompt>) -> Vec<PendingPairPrompt> {
+        let active: HashSet<String> = prompts
+            .iter()
+            .map(|prompt| prompt.request_id.clone())
+            .collect();
+        self.notified.retain(|id| active.contains(id));
+        let mut fresh = Vec::new();
+        for prompt in &prompts {
+            if self.notified.insert(prompt.request_id.clone()) {
+                fresh.push(prompt.clone());
+            }
+        }
+        self.prompts = prompts;
+        fresh
+    }
+
+    /// Drop a prompt once the operator approves or denies it locally.
+    pub fn remove(&mut self, request_id: &str) {
+        self.prompts
+            .retain(|prompt| prompt.request_id != request_id);
+    }
+
+    pub fn snapshot(&self) -> Vec<PendingPairPrompt> {
+        self.prompts.clone()
+    }
 }
 
 /// One poll's outcome. `started_at_ms` is when the poll began, so it is compared
@@ -87,6 +174,7 @@ impl Entry {
             hostname: machine.hostname().to_owned(),
             mac: machine.mac().unwrap_or("").to_owned(),
             mode: if self.lan { "lan" } else { "tailscale" },
+            paired: self.lan,
             address: if self.lan {
                 machine.hostname()
             } else {
@@ -258,7 +346,10 @@ pub fn ensure_registered(observations: &Mutex<Observations>) -> Result<(), Strin
     ensure_registry(&registry, observations)
 }
 
-fn ensure_registry(registry: &Registry, observations: &Mutex<Observations>) -> Result<(), String> {
+pub fn ensure_registry(
+    registry: &Registry,
+    observations: &Mutex<Observations>,
+) -> Result<(), String> {
     let machines = registry.list().map_err(|error| error.to_string())?;
     let keyed = machines
         .into_iter()
@@ -274,15 +365,58 @@ fn ensure_registry(registry: &Registry, observations: &Mutex<Observations>) -> R
     Ok(())
 }
 
-/// Read every registered machine and record the results.
-pub fn refresh(observations: &Mutex<Observations>) -> Result<(), String> {
+/// Browse `_barged._tcp` on the LAN, update any registered machine whose ID
+/// moved to a new address, and return unregistered machines found on the network.
+pub fn discover(observations: &Mutex<Observations>) -> Result<Vec<DiscoveredMachineView>, String> {
     let registry = Registry::discover().map_err(|error| error.to_string())?;
-    refresh_registry(&registry, observations)
+    discover_with(&registry, &UdpMdnsBrowser, observations)
 }
 
+pub fn discover_with(
+    registry: &Registry,
+    browser: &dyn MdnsBrowser,
+    observations: &Mutex<Observations>,
+) -> Result<Vec<DiscoveredMachineView>, String> {
+    let found = browser
+        .browse(DEFAULT_DISCOVER_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    let changed = follow_addresses(registry, &found).map_err(|error| error.to_string())?;
+    if !changed.is_empty() {
+        ensure_registry(registry, observations)?;
+    }
+    let registered = registry.list().map_err(|error| error.to_string())?;
+    Ok(found
+        .into_iter()
+        .filter(|item| match_registered(item, &registered).is_none())
+        .map(DiscoveredMachineView::from)
+        .collect())
+}
+
+#[cfg(test)]
 fn refresh_registry(registry: &Registry, observations: &Mutex<Observations>) -> Result<(), String> {
+    let pending = Mutex::new(PendingPairs::default());
+    refresh_registry_with(registry, observations, &pending, &NoopNotifier)
+}
+
+/// Read every registered machine, poll pending pair requests on reachable
+/// paired machines, and trigger native notifications for newly arrived ones.
+pub fn refresh_all(
+    observations: &Mutex<Observations>,
+    pending: &Mutex<PendingPairs>,
+    notifier: &dyn PairNotifier,
+) -> Result<(), String> {
+    let registry = Registry::discover().map_err(|error| error.to_string())?;
+    refresh_registry_with(&registry, observations, pending, notifier)
+}
+
+pub fn refresh_registry_with(
+    registry: &Registry,
+    observations: &Mutex<Observations>,
+    pending: &Mutex<PendingPairs>,
+    notifier: &dyn PairNotifier,
+) -> Result<(), String> {
     let machines = registry.list().map_err(|error| error.to_string())?;
-    let polls = std::thread::scope(|scope| {
+    let outcomes = std::thread::scope(|scope| {
         let handles: Vec<_> = machines
             .iter()
             .map(|machine| {
@@ -290,16 +424,36 @@ fn refresh_registry(registry: &Registry, observations: &Mutex<Observations>) -> 
                     let started_at_ms = now_ms();
                     let key = registry.key(machine.name());
                     let lan = matches!(&key, Ok(Some(_)));
-                    let result = key
-                        .and_then(|_| client(registry, machine))
-                        .and_then(|client| client.state())
-                        .map_err(|error| error.to_string());
-                    Poll {
-                        machine: machine.clone(),
-                        lan,
-                        started_at_ms,
-                        result,
-                    }
+                    let daemon = key.and_then(|_| client(registry, machine));
+                    let (result, machine_pending) = match daemon {
+                        Ok(daemon_client) => {
+                            let state = daemon_client.state().map_err(|error| error.to_string());
+                            let prompts = if state.is_ok() && lan {
+                                daemon_client
+                                    .pending_pairs()
+                                    .map(|list| {
+                                        list.requests
+                                            .into_iter()
+                                            .map(|req| pending_prompt(machine.name(), req))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            (state, prompts)
+                        }
+                        Err(error) => (Err(error.to_string()), Vec::new()),
+                    };
+                    (
+                        Poll {
+                            machine: machine.clone(),
+                            lan,
+                            started_at_ms,
+                            result,
+                        },
+                        machine_pending,
+                    )
                 })
             })
             .collect();
@@ -308,11 +462,41 @@ fn refresh_registry(registry: &Registry, observations: &Mutex<Observations>) -> 
             .map(|handle| handle.join().map_err(|_| "Machine check failed".to_owned()))
             .collect::<Result<Vec<_>, _>>()
     })?;
+    let mut polls = Vec::with_capacity(outcomes.len());
+    let mut prompts = Vec::new();
+    for (poll, machine_pending) in outcomes {
+        polls.push(poll);
+        prompts.extend(machine_pending);
+    }
+    prompts.sort_by(|a, b| {
+        a.created_at_unix_ms
+            .cmp(&b.created_at_unix_ms)
+            .then_with(|| a.machine_name.cmp(&b.machine_name))
+            .then_with(|| a.request_id.cmp(&b.request_id))
+    });
     observations
         .lock()
         .map_err(|error| error.to_string())?
         .apply(polls);
+    let fresh = pending
+        .lock()
+        .map_err(|error| error.to_string())?
+        .sync(prompts);
+    for prompt in fresh {
+        notifier.notify(&prompt);
+    }
     Ok(())
+}
+
+fn pending_prompt(machine_name: &str, req: PendingPairRequest) -> PendingPairPrompt {
+    PendingPairPrompt {
+        machine_name: machine_name.to_owned(),
+        request_id: req.request_id,
+        client_name: req.client_name,
+        code: req.code,
+        created_at_unix_ms: req.created_at_unix_ms,
+        expires_at_unix_ms: req.expires_at_unix_ms,
+    }
 }
 
 #[cfg(test)]
@@ -622,5 +806,123 @@ mod tests {
         let failed = observations.lock().unwrap().snapshot(now_ms());
         assert!(!failed[0].reachable);
         assert_eq!(failed[0].seen_at_unix_ms, first[0].seen_at_unix_ms);
+    }
+
+    #[test]
+    fn discover_filters_registered_machines_and_follows_moved_addresses() {
+        struct FakeBrowser(Vec<DiscoveredMachine>);
+        impl MdnsBrowser for FakeBrowser {
+            fn browse(
+                &self,
+                _timeout: std::time::Duration,
+            ) -> barge_machine::Result<Vec<DiscoveredMachine>> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let temp = barge::testing::TempDir::new("app-discover-follow").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        registry
+            .add(
+                Machine::discovered("mid-1", "bazzite", "192.168.1.20", 9777)
+                    .unwrap()
+                    .with_mac("00:11:22:33:44:55")
+                    .unwrap(),
+            )
+            .unwrap();
+        let observations = Mutex::new(Observations::default());
+        ensure_registry(&registry, &observations).unwrap();
+
+        let browser = FakeBrowser(vec![
+            DiscoveredMachine {
+                id: "mid-1".to_string(),
+                name: "Bazzite".to_string(),
+                mode: "lan".to_string(),
+                protocol_version: "1".to_string(),
+                address: "192.168.1.99".to_string(),
+                port: 9888,
+            },
+            DiscoveredMachine {
+                id: "mid-2".to_string(),
+                name: "SteamDeck".to_string(),
+                mode: "lan".to_string(),
+                protocol_version: "1".to_string(),
+                address: "192.168.1.50".to_string(),
+                port: 9777,
+            },
+        ]);
+
+        let found = discover_with(&registry, &browser, &observations).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "mid-2");
+        assert_eq!(found[0].name, "SteamDeck");
+
+        let updated = registry.get("bazzite").unwrap();
+        assert_eq!(updated.hostname(), "192.168.1.99");
+        assert_eq!(updated.daemon_port(), 9888);
+
+        let views = observations.lock().unwrap().snapshot(now_ms());
+        assert_eq!(views[0].address, "192.168.1.99");
+        assert_eq!(views[0].daemon_port, 9888);
+    }
+
+    #[test]
+    fn refresh_polls_pending_pairs_and_notifies_once_per_request() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        #[derive(Default)]
+        struct RecordingNotifier(Mutex<Vec<PendingPairPrompt>>);
+        impl PairNotifier for RecordingNotifier {
+            fn notify(&self, prompt: &PendingPairPrompt) {
+                self.0.lock().unwrap().push(prompt.clone());
+            }
+        }
+
+        let temp = barge::testing::TempDir::new("app-pending-pairs").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        registry
+            .add(Machine::discovered("mid-1", "bazzite", "127.0.0.1", port).unwrap())
+            .unwrap();
+        registry.pair_client("bazzite", "cid-1", &[7; 32]).unwrap();
+
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let n = stream.read(&mut request).unwrap();
+                let text = String::from_utf8_lossy(&request[..n]);
+                let body = if text.starts_with("GET /v1/state ") {
+                    r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-1"}"#
+                } else {
+                    r#"{"schema":"barge.pair-pending/1","requests":[{"request_id":"req-1","client_name":"Steam Deck","code":"340092","created_at_unix_ms":100,"expires_at_unix_ms":120100}]}"#
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let observations = Mutex::new(Observations::default());
+        let pending = Mutex::new(PendingPairs::default());
+        let notifier = RecordingNotifier::default();
+
+        refresh_registry_with(&registry, &observations, &pending, &notifier).unwrap();
+        assert_eq!(pending.lock().unwrap().snapshot().len(), 1);
+        assert_eq!(notifier.0.lock().unwrap().len(), 1);
+        assert_eq!(notifier.0.lock().unwrap()[0].code, "340092");
+
+        // Second poll sees the same pending request and does not notify again.
+        refresh_registry_with(&registry, &observations, &pending, &notifier).unwrap();
+        assert_eq!(pending.lock().unwrap().snapshot().len(), 1);
+        assert_eq!(notifier.0.lock().unwrap().len(), 1);
+
+        server.join().unwrap();
     }
 }

@@ -11,10 +11,12 @@ mod state;
 mod wol;
 pub use daemon::{request_power, AssumeYes, Confirmation, DaemonClient};
 pub use discover::{
-    browse_at, match_registered, DiscoveredMachine, MdnsBrowser, UdpMdnsBrowser,
+    browse_at, follow_addresses, match_registered, DiscoveredMachine, MdnsBrowser, UdpMdnsBrowser,
     DEFAULT_DISCOVER_TIMEOUT, MDNS_SERVICE_TYPE,
 };
-pub use pair::{parse_public_key, verification_code, DerivedPairing, KeyPair, PairRole};
+pub use pair::{
+    local_hostname, parse_public_key, verification_code, DerivedPairing, KeyPair, PairRole,
+};
 pub use protocol::{
     Cancel, CancelResult, ClientList, ClientRevoked, DaemonError, PairApproved, PairDecision,
     PairDenied, PairRequest, PairResponse, PairStatus, PairStatusResponse, PairedClient, Pending,

@@ -1,6 +1,6 @@
 # Barge app
 
-Status: Machines and Storage read views built; the Machines cards were reworked on Tom's 2026-11-19 feedback and tightened after PR #106 (instant wait, one countdown, one actions menu). Moves, Activity and notifications remain planned.
+Status: Machines and Storage read views built; the Machines cards were reworked on Tom's 2026-11-19 feedback, tightened after PR #106 (instant wait, one countdown, one actions menu), and updated on Tom's 2026-11-20 ruling for mDNS discovery, six-digit pairing, approval prompts and paired clients. Moves, Activity and general notifications remain planned.
 
 The Barge app is a macOS menu-bar app for the two things an operator checks
 most often: the machines Barge controls, and the storage it manages. It sits
@@ -153,22 +153,38 @@ Quit
 - **Grid:** cards are at least 380 px wide, with generous gaps; the grid wraps
   by width, and one machine fills the row rather than sitting cramped.
 - **Details dialog:** opened from the card's menu (Details…): connection mode,
-  address, port, MAC, last observation and the last error, with Pair… and
-  Remove… (Remove asks first). A dialog rather than a page keeps the window to
-  one level of navigation.
+  address, port, MAC, last observation, the last error, and the machine's
+  paired clients with Revoke… (confirmed), plus Pair… and Remove… (Remove asks
+  first). A dialog rather than a page keeps the window to one level of
+  navigation.
 - **Ages** come from the window's own one-second clock and are never in the
   future: an observation stamped slightly ahead reads "now". (Poodle's
   `TimeAgo` keeps a private clock that ticks every 30 s, so a fresh poll read
   "in 5s".)
-- **Empty:** a short line and the Add machine button.
+- **Empty:** a short line when nothing is registered or discovered, and the Add
+  by address button.
 - **Waiting:** after an action, a machine is polled every 2 s until the target
   state is observed or its timeout passes, then at the refresh interval (see
   [machines](machines.md#states)).
-- **Add, pair and remove a machine:**
-  - LAN mode: paste the key that `barged pair` printed;
-  - Tailscale mode: enter the tailnet name.
+- **Add, pair and approve:**
+  Tom's 2026-11-20 ruling ([machines](machines.md#discovery-and-pairing)): the
+  desktop app finds and pairs machines on the network itself with no manual
+  entry of hosts, MACs or keys.
+  - **Discovery:** the Machines view browses `_barged._tcp` and lists
+    unregistered machines as cards with Add. A registered machine found under a
+    new address (same machine ID) updates itself. A small "Add by address"
+    fallback covers networks without mDNS.
+  - **Pairing:** Add runs the pairing flow through `barge-machine`, taking
+    host, port, machine ID, MAC and broadcast from discovery and `GET /v1/state`,
+    and shows the six-digit code with "Approve on the PC or another paired
+    device" until approved, denied or expired.
+  - **Approving others:** for each paired machine, Barge polls
+    `GET /v1/pair/pending` and shows a prompt (in the window and as a native
+    notification) with the requesting client's name, the six-digit code,
+    Approve and Deny.
 
-  The app writes the same records the CLI does. See [Keys](#keys).
+  The app writes the same records and per-client credentials the CLI does. See
+  [Keys](#keys).
 
 ### Storage
 

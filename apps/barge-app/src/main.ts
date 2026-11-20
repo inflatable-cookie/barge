@@ -1,7 +1,18 @@
 import { mount } from "svelte";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App.svelte";
-import type { AppApi, Preferences, VolumeSummary, MachineView, DoctorStatus } from "./types";
+import type {
+  AppApi,
+  DiscoveredMachineView,
+  DoctorStatus,
+  MachineView,
+  PairPollView,
+  PairStartView,
+  PairedClientView,
+  PendingPairPrompt,
+  Preferences,
+  VolumeSummary,
+} from "./types";
 import "@inflatable-cookie/poodle-core/tokens/styles.css";
 import "@inflatable-cookie/poodle-core/tokens/themes.css";
 import "./style.css";
@@ -15,8 +26,15 @@ const api: AppApi = {
   quit: () => invoke("quit_app"),
   machines: () => invoke<MachineView[]>("machines_list"),
   refreshMachines: () => invoke<MachineView[]>("machines_refresh"),
-  addMachine: (input) => invoke("machines_add", { input }),
-  pairMachine: (name, key) => invoke("machines_pair", { name, key }),
+  discoverMachines: () => invoke<DiscoveredMachineView[]>("machines_discover"),
+  startPair: (input) => invoke<PairStartView>("machines_pair_start", { input }),
+  pollPair: (requestId) => invoke<PairPollView>("machines_pair_poll", { requestId }),
+  cancelPair: (requestId) => invoke("machines_pair_cancel", { requestId }),
+  pendingPairs: () => invoke<PendingPairPrompt[]>("machines_pending_pairs"),
+  approvePair: (machineName, requestId) => invoke("machines_approve_pair", { machineName, requestId }),
+  denyPair: (machineName, requestId) => invoke("machines_deny_pair", { machineName, requestId }),
+  machineClients: (name) => invoke<PairedClientView[]>("machines_clients", { name }),
+  revokeClient: (name, clientId) => invoke("machines_revoke_client", { name, clientId }),
   removeMachine: (name) => invoke("machines_remove", { name }),
   beginMachineAction: (name, operation) => invoke<MachineView[]>("machines_begin", { name, operation }),
   machineAction: (name, operation) => invoke("machines_action", { name, operation }),

@@ -7,12 +7,14 @@ mod commands;
 mod machine_state;
 mod machines;
 mod menu_plan;
+mod notifications;
 mod preferences;
 mod settings;
 mod storage;
 mod tray;
 
-use tauri::Manager;
+use std::sync::Arc;
+use tauri::{Emitter, Manager};
 
 fn main() {
     if let Err(error) = run() {
@@ -43,8 +45,30 @@ fn run() -> tauri::Result<()> {
                 .get()
                 .map(|preferences| preferences.show_window_at_launch)
                 .unwrap_or(true);
+            let pending_state = commands::machines::PendingPairState::default();
+            let pending_arc = Arc::clone(&pending_state.0);
+            let app_handle = app.handle().clone();
+            let notifier = notifications::MacOsPairNotifier::new(Arc::new(
+                move |machine_name, request_id, approve| {
+                    if let Ok(registry) = barge_machine::Registry::discover() {
+                        let _ = commands::machines::decide_pair_in(
+                            &registry,
+                            &pending_arc,
+                            machine_name,
+                            request_id,
+                            approve,
+                        );
+                        if let Ok(prompts) = pending_arc.lock().map(|store| store.snapshot()) {
+                            let _ = app_handle.emit("pending-pairs-changed", &prompts);
+                        }
+                    }
+                },
+            ));
             app.manage(store);
             app.manage(commands::machines::MachineState::default());
+            app.manage(pending_state);
+            app.manage(commands::machines::PairSessionState::default());
+            app.manage(commands::machines::NotifierState(Arc::new(notifier)));
             app.manage(commands::local::DoctorState::default());
             app.manage(longhorn_tauri_settings::TauriSettingsState::new(
                 std::sync::Arc::new(settings),
@@ -74,8 +98,15 @@ fn run() -> tauri::Result<()> {
             commands::local::open_moonlight,
             commands::machines::machines_list,
             commands::machines::machines_refresh,
-            commands::machines::machines_add,
-            commands::machines::machines_pair,
+            commands::machines::machines_discover,
+            commands::machines::machines_pair_start,
+            commands::machines::machines_pair_poll,
+            commands::machines::machines_pair_cancel,
+            commands::machines::machines_pending_pairs,
+            commands::machines::machines_approve_pair,
+            commands::machines::machines_deny_pair,
+            commands::machines::machines_clients,
+            commands::machines::machines_revoke_client,
             commands::machines::machines_remove,
             commands::machines::machines_begin,
             commands::machines::machines_action,

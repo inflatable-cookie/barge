@@ -18,8 +18,15 @@ export interface AppApi {
   machines(): Promise<MachineView[]>;
   /** Polls every daemon and returns the machines as they now stand. */
   refreshMachines(): Promise<MachineView[]>;
-  addMachine(input: NewMachine): Promise<void>;
-  pairMachine(name: string, key: string): Promise<void>;
+  discoverMachines(): Promise<DiscoveredMachineView[]>;
+  startPair(input: PairStartInput): Promise<PairStartView>;
+  pollPair(requestId: string): Promise<PairPollView>;
+  cancelPair(requestId: string): Promise<void>;
+  pendingPairs(): Promise<PendingPairPrompt[]>;
+  approvePair(machineName: string, requestId: string): Promise<void>;
+  denyPair(machineName: string, requestId: string): Promise<void>;
+  machineClients(name: string): Promise<PairedClientView[]>;
+  revokeClient(name: string, clientId: string): Promise<void>;
   removeMachine(name: string): Promise<void>;
   /** Records the click in the shared state at once and returns the machines as they now stand. */
   beginMachineAction(name: string, operation: string): Promise<MachineView[]>;
@@ -55,10 +62,55 @@ export interface MachineStatus {
   waiting: boolean;
 }
 export interface MachineView {
-  name: string; hostname: string; mac: string; mode: "lan" | "tailscale";
-  address: string; daemon_port: number; reachable: boolean; error: string | null;
-  seen_at_unix_ms: number | null; status: MachineStatus;
+  name: string;
+  hostname: string;
+  mac: string;
+  mode: "lan" | "tailscale";
+  paired: boolean;
+  address: string;
+  daemon_port: number;
+  reachable: boolean;
+  error: string | null;
+  seen_at_unix_ms: number | null;
+  status: MachineStatus;
 }
-export interface NewMachine {
-  name: string; hostname: string; mac: string; tailscale_name: string | null; key: string | null;
+export interface DiscoveredMachineView {
+  id: string;
+  name: string;
+  mode: string;
+  protocol_version: string;
+  address: string;
+  port: number;
+}
+export interface PairStartInput {
+  address: string;
+  port: number;
+  name: string | null;
+  machine_id: string | null;
+  existing_name: string | null;
+}
+export interface PairStartView {
+  request_id: string;
+  code: string;
+  expires_at_unix_ms: number;
+  machine_name: string;
+}
+export type PairOutcome = "pending" | "approved" | "denied" | "expired";
+export interface PairPollView {
+  status: PairOutcome;
+  machine_name: string;
+}
+export interface PendingPairPrompt {
+  machine_name: string;
+  request_id: string;
+  client_name: string;
+  code: string;
+  created_at_unix_ms: number;
+  expires_at_unix_ms: number;
+}
+export interface PairedClientView {
+  id: string;
+  name: string;
+  paired_at_unix_ms: number;
+  this_client: boolean;
 }
