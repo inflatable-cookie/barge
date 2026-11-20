@@ -584,3 +584,92 @@ fn status_reports_each_root_with_the_lease_that_reserves_it() {
         .unwrap_err();
     assert_eq!(unknown.kind(), ErrorKind::NotFound, "{unknown}");
 }
+
+/// Set one lease record's state on disk, to reach states only a return or an
+/// interrupted return leaves behind.
+fn set_lease_state(fixture: &Fixture, lease_id: &str, state: &str) {
+    let path = fixture
+        .barge
+        .state_dir()
+        .join("worktree-leases")
+        .join(format!("{lease_id}.json"));
+    let mut document: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    document["state"] = json!(state);
+    fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+}
+
+#[test]
+fn a_run_hold_is_refused_for_every_lease_that_is_not_leased() {
+    let (fixture, origin) = setup("origin-run-states", 4, json!([]), &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let returned = fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+    assert_eq!(returned.action, ReturnAction::Returned);
+    for state in ["returned", "returning", "interrupted"] {
+        set_lease_state(&fixture, &leased.lease_id, state);
+        let refused = fixture
+            .barge
+            .worktree_hold(&leased.lease_id, Mode::Shared)
+            .unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::Refused, "{state}: {refused}");
+    }
+    let unknown = fixture
+        .barge
+        .worktree_hold("no-such-lease", Mode::Shared)
+        .unwrap_err();
+    assert_eq!(unknown.kind(), ErrorKind::NotFound, "{unknown}");
+}
+
+#[test]
+fn a_run_hold_never_waits_for_a_return_and_blocks_one_while_it_lasts() {
+    let (fixture, origin) = setup("origin-run-fence", 2, json!([]), &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let area = pool_area(&fixture, &leased);
+
+    // A return holds its root exclusively; a run must refuse rather than wait.
+    let fence = area
+        .try_hold(&leased.root_id, Mode::Exclusive)
+        .unwrap()
+        .expect("the root is free to fence");
+    let refused = fixture
+        .barge
+        .worktree_hold(&leased.lease_id, Mode::Shared)
+        .unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::Refused, "{refused}");
+    drop(fence);
+
+    // Two shared runs may share the checkout; a return and an exclusive run may not.
+    let first = fixture
+        .barge
+        .worktree_hold(&leased.lease_id, Mode::Shared)
+        .unwrap();
+    assert_eq!(first.lease().lease_id, leased.lease_id);
+    let second = fixture
+        .barge
+        .worktree_hold(&leased.lease_id, Mode::Shared)
+        .unwrap();
+    let exclusive = fixture
+        .barge
+        .worktree_hold(&leased.lease_id, Mode::Exclusive)
+        .unwrap_err();
+    assert_eq!(exclusive.kind(), ErrorKind::Refused, "{exclusive}");
+    let blocked = fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap_err();
+    assert_eq!(blocked.kind(), ErrorKind::Refused, "{blocked}");
+    assert_eq!(
+        state_of(&fixture, &leased.lease_id),
+        WorktreeLeaseState::Leased
+    );
+
+    drop(first);
+    drop(second);
+    let returned = fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+    assert_eq!(returned.action, ReturnAction::Returned);
+}

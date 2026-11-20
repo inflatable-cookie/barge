@@ -89,7 +89,8 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 - **Hold.** An advisory `flock` on the root's lock file, exclusive or shared.
   A consumer that keeps the descriptor inheritable passes the hold to its child
   processes, so the root stays held until the whole process tree has exited.
-  Dropping the `Hold` records the release time.
+  Dropping the `Hold` records the release time. `barge worktree run` is the CLI
+  form of this for a process that is not Rust ([worktrees](worktrees.md#run)).
 - **Pin.** A durable record that protects a root from prune and eviction
   whether or not anything holds it. Oxide pins its selected output roots.
 - **Trash.** `<area>/.trash/`. Eviction renames a root here before deleting it.
@@ -273,7 +274,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
   `root pin|unpin|evict <namespace>/<area> <id>`;
 - `prune --volume v [--dry-run]`;
 - `scratch new | scratch sweep`;
-- `worktree lease | lease get | return | status` ([worktrees](worktrees.md#step-1-as-built));
+- `worktree lease | lease get | return | run | status` ([worktrees](worktrees.md#step-1-as-built));
 - `status`;
 - `layout show | layout set`;
 - `path <class> [--project p]`; `env [--shell zsh|bash|fish]`;

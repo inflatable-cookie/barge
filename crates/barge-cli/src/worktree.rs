@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use barge::worktree::{LeaseRequest, WorktreeLease, WorktreePool};
-use barge::{Barge, Error, Result};
+use barge::{Barge, Error, Mode, Result};
 use serde_json::json;
 
 use crate::args::{expect_no_positionals, Options};
@@ -19,9 +19,10 @@ pub(crate) fn worktree(arguments: &[String], json: bool) -> Result<()> {
         "lease" if rest.first().map(String::as_str) == Some("get") => lease_get(&rest[1..], json),
         "lease" => lease(rest, json),
         "return" => give_back(rest, json),
+        "run" => run(rest),
         "status" => status(rest, json),
         other => Err(Error::usage(format!(
-            "unknown worktree command {other:?}; use lease, lease get, return or status"
+            "unknown worktree command {other:?}; use lease, lease get, return, run or status"
         ))),
     }
 }
@@ -102,6 +103,32 @@ fn give_back(arguments: &[String], json: bool) -> Result<()> {
         );
         Ok(())
     }
+}
+
+/// Hold a leased checkout while a command runs in it. On success this replaces
+/// the process with the command, so it returns only when the command could not
+/// start: the error is then the answer, and nothing ran.
+fn run(arguments: &[String]) -> Result<()> {
+    let Some(split) = arguments.iter().position(|argument| argument == "--") else {
+        return Err(Error::usage(
+            "worktree run needs -- before the command to run",
+        ));
+    };
+    let (option_arguments, command) = (&arguments[..split], &arguments[split + 1..]);
+    let Some((program, command_arguments)) = command.split_first() else {
+        return Err(Error::usage("worktree run needs a command after --"));
+    };
+    let options = Options::parse(option_arguments, &["lease"], &["exclusive"])?;
+    expect_no_positionals(&options)?;
+    let lease_id = options.required("lease")?;
+    let mode = if options.flag("exclusive") {
+        Mode::Exclusive
+    } else {
+        Mode::Shared
+    };
+    let barge = Barge::open()?;
+    let held = barge.worktree_hold(&lease_id, mode)?;
+    Err(held.exec(program, command_arguments))
 }
 
 fn status(arguments: &[String], json: bool) -> Result<()> {

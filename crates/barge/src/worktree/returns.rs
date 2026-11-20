@@ -133,7 +133,7 @@ pub(crate) fn give_back(
 }
 
 /// The pool whose area name is `slug`.
-fn pool_for_slug<'a>(pools: &'a [Pool], slug: &str) -> Result<Option<&'a Pool>> {
+pub(super) fn pool_for_slug<'a>(pools: &'a [Pool], slug: &str) -> Result<Option<&'a Pool>> {
     for pool in pools {
         if pool.slug()? == slug {
             return Ok(Some(pool));

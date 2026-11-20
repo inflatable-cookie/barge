@@ -46,6 +46,8 @@ usage: barge [--json] <command>
   worktree lease get --request ID | --lease ID
   worktree return --lease ID [--request ID] [--disposable]
                                           reset the checkout and free its root
+  worktree run --lease ID [--exclusive] -- CMD [ARGS...]
+                                          run CMD in the checkout, holding it
   worktree status [--repo R]              pools, roots and the leases on them
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
