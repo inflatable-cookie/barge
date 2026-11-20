@@ -161,9 +161,10 @@ What Nucleus needs from Barge, and this contract gives it:
   (`leased`, `returning`, `returned`, `interrupted`);
 - a return fenced to its lease ID and against new holds, whose replay never
   touches a root that has been leased again;
-- exactly one lease per task, kept through revisions, review, restart and
-  unsettled effects. Nucleus holds the lease for the task's whole life and
-  returns it only at closeout;
+- one live lease per allocation, kept through revisions, review, restart and
+  unsettled effects. A task has one allocation at a time; replacing a lost
+  checkout or moving hosts ends that allocation and takes a new request ID.
+  Nucleus returns the last lease only at closeout;
 - a return that refuses dirty or unproven work and leaves it with Nucleus,
   with `--disposable` carrying Nucleus's own publication evidence.
 
