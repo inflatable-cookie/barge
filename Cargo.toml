@@ -45,8 +45,10 @@ httparse = "1.10.1"
 
 # Machine request authentication and the menu-bar app's Tauri runtime.
 getrandom = "0.3.4"
+hkdf = "0.12.4"
 hmac = "0.12.1"
 sha2 = "0.10.9"
+x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
 tauri = { version = "2.12.7", features = ["tray-icon"] }
 tauri-build = { version = "2.7.6", features = [] }
 tauri-plugin-autostart = "2.7.0"

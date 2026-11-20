@@ -5,6 +5,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
+/// Client ID request header for per-client LAN keys.
+pub const CLIENT_ID: &str = "x-barge-client-id";
 /// Timestamp request header.
 pub const TIMESTAMP: &str = "x-barge-timestamp";
 /// Nonce request header.

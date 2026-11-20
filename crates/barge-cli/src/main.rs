@@ -15,7 +15,6 @@ use barge::{Error, Result};
 mod area;
 mod args;
 mod bind;
-mod console;
 mod doctor;
 mod human;
 mod init;

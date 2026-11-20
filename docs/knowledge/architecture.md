@@ -285,7 +285,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
   ([resources](resources.md#reaching-tools-and-agents-without-coupling));
 - `move --plan | --apply [--retarget-unrecorded]`;
 - `doctor`;
-- `machine add | list | remove | wake | pair | unpair | status | sleep | restart | shutdown | cancel`
+- `machine discover | add | list | remove | wake | pair | unpair | clients | revoke | status | sleep | restart | shutdown | cancel`
   ([machines](machines.md)).
 
 `--json` prints one document with a top-level `schema` field

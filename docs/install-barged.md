@@ -45,21 +45,40 @@ Create `~/.config/barged/config.json`. For LAN mode use the PC's LAN address:
 {
   "listen": "192.168.1.20:9777",
   "mode": "lan",
-  "key_file": "~/.config/barged/lan.key"
+  "name": "Bazzite PC"
 }
 ```
 
-`barged` binds exactly this address, so it stops starting if the PC's LAN
-address changes. Give the PC a DHCP reservation on the router. Bazzite's default
+`barged` binds this address (plus loopback `127.0.0.1:9777` for local approval
+UIs) and advertises `_barged._tcp` over mDNS through Avahi, so clients find it
+automatically on the LAN. `name` is optional and defaults to the host name.
+Give the PC a DHCP reservation on the router, or let discovery update a
+registered machine's address by its stable machine ID. Bazzite's default
 firewall zone (FedoraWorkstation) already allows high ports such as 9777; on
 other distributions, open the port, for example with
 `sudo firewall-cmd --add-port=9777/tcp --permanent && sudo firewall-cmd --reload`.
 
-Run `~/.local/bin/barged pair --config ~/.config/barged/config.json` on the PC.
-Copy the printed key securely; it is shown only then. Running pair again replaces
-it and unpairs all clients. On the Mac, after registering the machine below,
-run `barge machine pair pc` and paste the key into stdin, followed by Enter.
-`barge machine unpair pc` removes the Mac's copy.
+`barged` generates its machine ID and `clients.json` under
+`~/.local/state/barged` (or `state_dir` if set). If an existing config sets
+`"key_file"`, `barged` migrates that shared key into `clients.json` as the
+`"legacy"` client on first start so previously paired clients keep working.
+
+New clients pair one at a time without printing a key on the server: start
+pairing on the client (for example `barge machine pair pc`), check that the
+six-digit code matches, and approve it either from the desktop notification on
+the PC, the Decky plugin on localhost, another already-paired client, or in a
+terminal with:
+
+```sh
+~/.local/bin/barged pair --approve --config ~/.config/barged/config.json
+```
+
+To inspect or revoke paired clients locally on the PC:
+
+```sh
+~/.local/bin/barged clients list --config ~/.config/barged/config.json
+~/.local/bin/barged clients remove <client-id> --config ~/.config/barged/config.json
+```
 
 For Tailscale instead, use this config (omitting `mode` also works):
 
@@ -114,7 +133,19 @@ The rule grants `org.freedesktop.login1.suspend`, `…reboot` and `…power-off`
 every process running as that account, not just `barged`, and leaves every
 other action alone. The daemon never runs a shell command.
 
-## 6. Register the machine on the Mac
+## 6. Register and pair the machine on the Mac
+
+In LAN mode, discover and add the machine without typing its IP or MAC:
+
+```sh
+barge machine discover
+barge machine add "Bazzite PC" --name pc
+barge machine pair pc             # prints the 6-digit code and waits for approval
+barge machine clients pc          # list paired clients on pc
+barge machine revoke pc <id>      # revoke a paired client
+```
+
+Or register manually (and for Tailscale mode):
 
 ```sh
 barge machine add --name pc --hostname pc.local \
@@ -157,7 +188,7 @@ curl http://pc.tail1234.ts.net:9777/v1/state
 systemctl --user disable --now barged
 sudo rm /etc/polkit-1/rules.d/50-barged-power.rules
 rm ~/.local/bin/barged ~/.config/barged/config.json
-# In LAN mode also remove ~/.config/barged/lan.key and unpair on the Mac.
+# In LAN mode also remove ~/.local/state/barged (and any ~/.config/barged/lan.key) and unpair on the Mac.
 rm ~/.config/systemd/user/barged.service
 systemctl --user daemon-reload
 ```

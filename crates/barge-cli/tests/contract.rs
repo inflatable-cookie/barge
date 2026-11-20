@@ -17,8 +17,7 @@ mod support;
 use std::path::PathBuf;
 
 use support::{
-    parse_document, register_machine, run_with_stdin, stderr, stdout, stub_daemon_routes, Contract,
-    Fixture,
+    parse_document, register_machine, stderr, stdout, stub_daemon_routes, Contract, Fixture,
 };
 
 use serde_json::{json, Value};
@@ -202,6 +201,26 @@ fn every_documented_success_document_matches_its_commands_output() {
     // The machine documents, against a loopback daemon.
     let (port, _requests) = stub_daemon_routes(vec![
         (
+            "/v1/pair/req-1",
+            200,
+            r#"{"schema":"barge.pair-status/1","request_id":"req-1","status":"approved","client_id":"cid-1"}"#,
+        ),
+        (
+            "/v1/pair",
+            202,
+            r#"{"schema":"barge.pair-response/1","request_id":"req-1","public_key":"de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f","expires_at_unix_ms":9999999999999}"#,
+        ),
+        (
+            "/v1/clients/cid-1",
+            200,
+            r#"{"schema":"barge.client-revoked/1","client_id":"cid-1"}"#,
+        ),
+        (
+            "/v1/clients",
+            200,
+            r#"{"schema":"barge.clients/1","clients":[{"id":"cid-1","name":"MacBook","paired_at_unix_ms":42}]}"#,
+        ),
+        (
             "/v1/power/cancel",
             200,
             r#"{"schema":"barge.power-cancel-result/1","cancelled":true}"#,
@@ -214,18 +233,23 @@ fn every_documented_success_document_matches_its_commands_output() {
         (
             "/v1/state",
             200,
-            r#"{"schema":"barge.machine-state/1","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042}}"#,
+            r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042},"machine_id":"mid-1","mac":"00:11:22:33:44:ff","broadcast":"127.0.0.1"}"#,
         ),
     ]);
     register_machine(&fixture, port);
+    parse_document(&fixture.json(&["machine", "discover", "--timeout", "0"]));
     parse_document(&fixture.json(&["machine", "list"]));
-    let paired = run_with_stdin(
-        &fixture,
-        &["--json", "machine", "pair", "pc"],
-        &format!("{}\n", "ab".repeat(32)),
-    );
+    let paired = fixture.json(&["machine", "pair", "pc", "--client-name", "MacBook"]);
     assert!(paired.status.success(), "{}", stderr(&paired));
     parse_document(&paired);
+    let clients = fixture.json(&["machine", "clients", "pc"]);
+    assert!(clients.status.success(), "{}", stderr(&clients));
+    parse_document(&clients);
+    let revoked = fixture.json(&["machine", "revoke", "pc", "cid-1"]);
+    assert!(revoked.status.success(), "{}", stderr(&revoked));
+    parse_document(&revoked);
+    let paired_again = fixture.json(&["machine", "pair", "pc", "--client-name", "MacBook"]);
+    assert!(paired_again.status.success(), "{}", stderr(&paired_again));
     let unpaired = fixture.json(&["machine", "unpair", "pc"]);
     assert!(unpaired.status.success(), "{}", stderr(&unpaired));
     parse_document(&unpaired);

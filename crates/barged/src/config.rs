@@ -1,11 +1,12 @@
-//! The daemon's configuration: what it binds to, and which tailnet nodes may
-//! ask it to do anything.
+//! The daemon's configuration: what it binds to, where its state lives, and
+//! which callers may control it.
 //!
 //! `listen` is one address. A wildcard (`0.0.0.0` or `::`) is refused unless
 //! `allow_wildcard` is true, the opt-in for a LAN install that listens on every
 //! interface. In Tailscale mode the named tailnet address is the first half of
 //! the trust model (docs/knowledge/machines.md, "Protocol and trust").
 
+use std::ffi::CStr;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -21,10 +22,17 @@ pub const DEFAULT_TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// The address `barged` binds: the machine's Tailscale address in production.
+    /// The address `barged` binds: the machine's Tailscale or LAN address.
     pub listen: SocketAddr,
+    /// Display name advertised over mDNS in LAN mode; defaults to the hostname.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub mode: AuthMode,
+    /// Directory where `barged` keeps its machine ID and paired clients list.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// Legacy shared key file; migrated into the per-client list on first start.
     #[serde(default)]
     pub key_file: Option<PathBuf>,
     /// Permit a wildcard `listen` address, which binds every interface.
@@ -74,10 +82,12 @@ impl Config {
                 self.listen
             )));
         }
-        if self.mode == AuthMode::Lan {
-            if self.key_file.is_none() {
-                return Err(Error::new("LAN mode needs key_file"));
+        if let Some(name) = &self.name {
+            if name.trim().is_empty() {
+                return Err(Error::new("name must not be empty"));
             }
+        }
+        if self.mode == AuthMode::Lan {
             return Ok(());
         }
         if self.allowed_nodes.is_empty() {
@@ -94,19 +104,80 @@ impl Config {
     }
 
     pub fn key_path(&self) -> Option<PathBuf> {
-        self.key_file.as_ref().map(|path| {
-            if let Ok(rest) = path.strip_prefix("~") {
-                std::env::var_os("HOME")
-                    .map_or_else(|| path.clone(), |home| PathBuf::from(home).join(rest))
-            } else {
-                path.clone()
-            }
-        })
+        self.key_file.as_deref().map(expand_tilde)
+    }
+
+    /// The directory where `barged` persists `machine-id` and `clients.json`.
+    pub fn resolved_state_dir(&self) -> PathBuf {
+        if let Some(dir) = self.state_dir.as_deref() {
+            return expand_tilde(dir);
+        }
+        if let Some(parent) = self
+            .key_path()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+        {
+            return parent;
+        }
+        if let Some(dir) = std::env::var_os("BARGED_STATE_DIR").filter(|v| !v.is_empty()) {
+            return PathBuf::from(dir);
+        }
+        if let Some(dir) = std::env::var_os("STATE_DIRECTORY").filter(|v| !v.is_empty()) {
+            return PathBuf::from(dir);
+        }
+        if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(dir).join("barged");
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home).join(".local/state/barged");
+        }
+        PathBuf::from("/var/lib/barged")
+    }
+
+    /// Display name advertised in mDNS TXT records.
+    pub fn display_name(&self) -> String {
+        if let Some(name) = self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return name.to_string();
+        }
+        system_hostname().unwrap_or_else(|| "barged".to_string())
     }
 
     /// The allowlist this config declares.
     pub fn allowlist(&self) -> crate::Allowlist {
         crate::Allowlist::new(self.allowed_nodes.iter().cloned())
+    }
+}
+
+fn expand_tilde(path: &Path) -> PathBuf {
+    if let Ok(rest) = path.strip_prefix("~") {
+        std::env::var_os("HOME")
+            .map_or_else(|| path.to_path_buf(), |home| PathBuf::from(home).join(rest))
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn system_hostname() -> Option<String> {
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: `buf` is a live, writable buffer of `buf.len()` bytes.
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    buf[buf.len() - 1] = 0;
+    // SAFETY: `buf` is NUL-terminated above.
+    let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    let short = name.split('.').next().unwrap_or("").trim().to_string();
+    if short.is_empty() {
+        None
+    } else {
+        Some(short)
     }
 }
 
@@ -138,9 +209,13 @@ mod tests {
     }
 
     #[test]
-    fn lan_wildcard_requires_explicit_opt_in() {
+    fn lan_config_needs_no_key_file_and_wildcard_requires_explicit_opt_in() {
+        let minimal_lan = br#"{"listen":"192.168.1.20:9777","mode":"lan"}"#;
+        assert_eq!(Config::parse(minimal_lan).unwrap().mode, AuthMode::Lan);
+
         let denied = br#"{"listen":"0.0.0.0:9777","mode":"lan","key_file":"/test/key"}"#;
-        let allowed = br#"{"listen":"0.0.0.0:9777","mode":"lan","key_file":"/test/key","allow_wildcard":true}"#;
+        let allowed =
+            br#"{"listen":"0.0.0.0:9777","mode":"lan","key_file":"/test/key","allow_wildcard":true}"#;
         assert!(Config::parse(denied).is_err());
         assert_eq!(Config::parse(allowed).unwrap().mode, AuthMode::Lan);
     }

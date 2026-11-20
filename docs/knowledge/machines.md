@@ -1,7 +1,6 @@
 # Machines
 
-Status: design outline approved by Tom, 2026-11-18. Build steps 1, 2 and LAN authentication are
-complete; later steps remain unbuilt.
+Status: design outline approved by Tom, 2026-11-18. Build steps 1, 2, LAN authentication and the daemon/CLI step of discovery and pairing are complete; the Mac app and Decky plugin UIs remain unbuilt.
 
 Barge manages the machines it distributes resources across. The first is the
 Bazzite PC: wake it, see its state, and sleep, restart or shut it down. This
@@ -102,18 +101,25 @@ exit 2 — and is refused where the machine is built.
 - Tailscale mode (the default for existing configs) binds the configured tailnet
   address and authorizes callers through Tailscale `whois` and an allowlist.
   Tailscale encrypts traffic and is recommended across networks.
-- LAN mode uses a shared 256-bit key installed once on each client. Requests
-  carry an HMAC of the method, path, timestamp, nonce and body digest; the
-  daemon checks a 60-second clock window and rejects repeated nonces. Re-pairing
-  the daemon replaces the key and invalidates old clients. The key is stored
-  separately from `machines.json`, owner-only. Removing a machine removes its
-  stored key before the name can be reused.
+- LAN mode assigns each paired client its own 256-bit key (`clients.json`,
+  owner-only). Requests carry `x-barge-client-id` alongside an HMAC of the
+  method, path, timestamp, nonce and body digest; the daemon checks a
+  60-second clock window and rejects repeated nonces. On upgrade from a shared
+  `key_file`, the existing key migrates automatically into `clients.json` as
+  the `"legacy"` client so existing clients without `x-barge-client-id` keep
+  working until revoked. On the client, credentials are stored separately from
+  `machines.json`, owner-only. Removing a machine removes its stored
+  credentials before the name can be reused.
 - LAN HTTP authenticates requests but does not encrypt them. Someone on the LAN
   can see that a power action happened, but cannot forge or replay it. Keep
   clocks synchronized. Bind a specific LAN address; wildcard binding requires
   `allow_wildcard` and produces a warning.
-- Endpoints: `GET /v1/state`, `POST /v1/power` (`{action, delay_s}`),
-  `POST /v1/power/cancel`. Every response carries a `schema` field, under the
+- Endpoints: `GET /v1/state` (`barge.machine-state/2`, reporting `machine_id`
+  and the bound interface's `mac` and `broadcast` when known), `POST /v1/power`
+  (`{action, delay_s}`), `POST /v1/power/cancel`, plus the LAN pairing and
+  client endpoints (`POST /v1/pair`, `GET /v1/pair/<id>`, `GET /v1/pair/pending`,
+  `POST /v1/pair/<id>/approve`, `POST /v1/pair/<id>/deny`, `GET /v1/clients`,
+  `DELETE /v1/clients/<id>`). Every response carries a `schema` field, under the
   same contract as the CLI's JSON; a non-2xx response is a
   `barge.daemon-error/1` document. State reports the action counting down and
   its deadline when one is pending, and a second action is refused `409` until
@@ -128,45 +134,72 @@ exit 2 — and is refused where the machine is built.
 
 ## Discovery and pairing
 
-Status: design approved by Tom, 2026-11-20. Nothing here is built yet.
+Status: daemon and CLI step built; the Mac app and Decky plugin UIs follow
+against this protocol.
 
 Tom, 2026-11-20: for release, the Steam Deck plugin and the desktop app find
 machines on the network themselves, with no manual entry of hosts, MACs or
-keys. Today a client needs the host, port, MAC and broadcast address typed in,
-plus the LAN key that `barged pair` printed, and pairing again unpairs every
-client.
+keys.
 
 ### Discovery
 
 - `barged` advertises `_barged._tcp` over mDNS (DNS-SD) on its LAN address.
-  TXT records carry its machine ID (a stable random ID made at first start),
-  its display name, its mode (`lan` or `tailscale`) and its protocol version.
-  On Bazzite it registers through Avahi, which ships with the OS; no new
-  service is installed.
-- `GET /v1/state` also reports the machine ID, the MAC of the interface it
-  binds, and that interface's broadcast address. A client records them at
-  pairing, so Wake still works when the machine is off and not advertising.
+  TXT records carry:
+  - `id`: stable random machine ID (32 lowercase hex characters created on first start)
+  - `name`: display name (from config `name`, defaulting to the short OS hostname)
+  - `mode`: `"lan"`
+  - `version`: `"1"` (protocol version)
+  On Bazzite it registers through Avahi over D-Bus (`org.freedesktop.Avahi`),
+  which ships with the OS; no new service is installed. If Avahi is absent,
+  `barged` logs once and keeps serving.
+- `GET /v1/state` (`barge.machine-state/2`) also reports `machine_id`, the
+  bound interface's `mac`, and that interface's `broadcast` address. A client
+  records them at pairing, so Wake still works when the machine is off and not
+  advertising.
 - Clients browse `_barged._tcp` themselves and list each machine they find
   that they haven't paired, with an Add button. They can't lean on the
   system resolver: SteamOS doesn't resolve `.local` names (found setting up
-  the Deck on 2026-11-20), so the plugin carries its own mDNS browser and
+  the Deck on 2026-11-20), so the client carries its own mDNS browser and
   connects to the address it found. A paired machine is matched by ID, so an
   address change after a DHCP renewal updates itself.
 
 ### Pairing
 
 Each client gets its own key, so adding or removing one never touches the
-others. The shared key becomes the first entry of the list on upgrade, so the
-Mac keeps working.
+others. Any existing `key_file` shared key becomes the first entry of the list
+(`id = "legacy"`, `name = "legacy"`) on upgrade, so existing clients keep working.
 
-1. The client sends `POST /v1/pair` with its name and an X25519 public key.
-   The daemon replies with its own public key and holds the request open for
-   two minutes.
-2. Both sides derive the shared key with X25519 and HKDF, and each shows a
-   six-digit code computed from both public keys.
-3. Someone approves the request on a device that's already trusted after
-   checking the codes match. Matching codes prove no one on the LAN swapped
-   the keys in between. The daemon then saves the client's key and name.
+1. The client sends `POST /v1/pair` (`barge.pair-request/1`) with
+   `client_name` and `public_key` (32-byte X25519 public key as 64 lowercase
+   hex characters). The daemon replies `202` (`barge.pair-response/1`) with
+   `request_id`, its ephemeral `public_key` (64 lowercase hex characters), and
+   `expires_at_unix_ms` (two minutes from creation).
+2. Both sides derive the 256-bit HMAC key and the 6-digit verification code as
+   follows:
+   - **Shared secret:** `shared = X25519(local_secret, peer_public)` (32 bytes;
+     reject all-zero / non-contributory outputs).
+   - **Key derivation:** `HKDF-SHA256` (RFC 5869) with `IKM = shared`,
+     `salt = client_public || daemon_public` (64 bytes, raw client public key
+     followed by raw daemon public key), `info = "barge-pair-v1"` (ASCII),
+     output length `32` bytes.
+   - **Six-digit code:**
+     `digest = SHA-256("barge-pair-code-v1\0" || client_public || daemon_public)`
+     (19-byte prefix including the NUL byte, followed by the two 32-byte raw
+     public keys). Interpret `digest[0..4]` as a big-endian unsigned 32-bit
+     integer `n`, and format `n % 1_000_000` as 6 zero-padded decimal digits.
+   - **Fixed test vector** (for cross-client verification):
+     - `client_secret`: `77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a`
+     - `client_public`: `8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a`
+     - `daemon_secret`: `5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb`
+     - `daemon_public`: `de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f`
+     - `derived_key`: `18d60e9b82dc130c6972596a7b47f3c1381520faa8704ded8429c85231323ea8`
+     - `code`: `340092`
+3. The client polls `GET /v1/pair/<request_id>` (`barge.pair-status/1`) until
+   `status` is `approved` (which returns `client_id`), `denied` or `expired`.
+4. Someone approves or denies the request on a trusted surface after checking
+   the codes match (`GET /v1/pair/pending`, `POST /v1/pair/<id>/approve`,
+   `POST /v1/pair/<id>/deny`), allowed for any signed paired client or callers
+   on localhost (`127.0.0.1` / `::1`).
 
 Where approval happens (Tom, 2026-11-20: a seamless experience needs a UI on
 the PC, not a terminal):
@@ -177,17 +210,20 @@ the PC, not a terminal):
   the PC it talks to its own `barged` over localhost.
 - **On the PC, in Desktop Mode:** `barged` sends a desktop notification with
   the code and Approve and Deny actions, through the session's
-  `org.freedesktop.Notifications` service. It already runs as a user unit in
-  that session.
+  `org.freedesktop.Notifications` service (no-op when absent). It already runs
+  as a user unit in that session.
 - **From any paired client,** such as the Mac app, with the same code and
   buttons, for when the PC is in another room.
 - `barged pair --approve` in a terminal stays as the fallback when no UI is
   running.
 
-- `barge machine clients <name>` and the app's details dialog list a machine's
-  paired clients and can revoke one.
-- Requests stay HMAC-signed as today, with each client's own key; the daemon
-  picks the key by a client ID header.
+- `barge machine clients <name>` (`GET /v1/clients`) and the app's details
+  dialog list a machine's paired clients and can revoke one (`barge machine
+  revoke <name> <client>`, `DELETE /v1/clients/<id>`, or locally `barged
+  clients remove <id>`).
+- Requests stay HMAC-signed as today, with each client's own key; the client
+  sends `x-barge-client-id: <id>` and the daemon picks the matching key (or
+  `"legacy"` when the header is omitted).
 - Out of scope: discovery across networks (Tailscale has its own names) and
   pairing over Tailscale, which already identifies callers through `whois`.
 

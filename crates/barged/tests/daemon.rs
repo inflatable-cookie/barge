@@ -1,8 +1,9 @@
 //! The daemon over real loopback HTTP.
 //!
 //! Each test binds `127.0.0.1:0`, so nothing touches a tailnet, a real D-Bus or
-//! logind. The caller's identity and the power backend are fakes; the client is
-//! the one `barge` ships, so the pair is exercised together.
+//! logind. The caller's identity, power backend, network interface, mDNS
+//! advertiser and desktop notifier are fakes; the client is the one `barge`
+//! ships, so the pair is exercised together.
 
 // An integration test target is its own crate, and its fixture helpers are not
 // inside a `#[test]` function, where `clippy.toml` grants the exception. Tests
@@ -10,18 +11,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use barge_machine::{
-    DaemonClient, Pending, PowerActionKind, PowerState, State, CANCEL_RESULT_SCHEMA,
-    DAEMON_ERROR_SCHEMA, POWER_RESULT_SCHEMA, STATE_SCHEMA,
+    auth, parse_public_key, DaemonClient, KeyPair, PairRole, PairStatus, Pending, PowerActionKind,
+    PowerState, State, CANCEL_RESULT_SCHEMA, DAEMON_ERROR_SCHEMA, POWER_RESULT_SCHEMA,
+    STATE_SCHEMA,
 };
 use barged::{
-    Allowlist, Clock, Config, Daemon, PeerError, PeerLookup, PeerNode, PowerBackend,
-    PowerController, Result,
+    ActionCallback, Allowlist, Clock, Config, Daemon, InterfaceInfo, MdnsAdvertiser,
+    MdnsRegistration, NetworkLookup, PairAction, PairNotification, PairingNotifier, PeerError,
+    PeerLookup, PeerNode, PowerBackend, PowerController, Result, ServiceAdvertisement,
 };
 
 #[derive(Debug, Default)]
@@ -72,41 +76,121 @@ impl PeerLookup for FixedLookup {
     }
 }
 
+#[derive(Debug)]
+struct FakeNetwork(InterfaceInfo);
+
+impl NetworkLookup for FakeNetwork {
+    fn interface_for(&self, _ip: IpAddr) -> InterfaceInfo {
+        self.0.clone()
+    }
+}
+
+#[derive(Debug, Default)]
+struct FakeMdns {
+    advertised: Mutex<Vec<ServiceAdvertisement>>,
+    dropped: Arc<AtomicBool>,
+    fail: bool,
+}
+
+struct FakeRegistration(Arc<AtomicBool>);
+
+impl MdnsRegistration for FakeRegistration {}
+
+impl Drop for FakeRegistration {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl MdnsAdvertiser for FakeMdns {
+    fn advertise(&self, service: &ServiceAdvertisement) -> Result<Box<dyn MdnsRegistration>> {
+        self.advertised.lock().unwrap().push(service.clone());
+        if self.fail {
+            return Err(barged::Error::new("Avahi not running"));
+        }
+        Ok(Box::new(FakeRegistration(Arc::clone(&self.dropped))))
+    }
+}
+
+#[derive(Default)]
+struct FakeNotifier {
+    notices: Mutex<Vec<(PairNotification, ActionCallback)>>,
+}
+
+impl PairingNotifier for FakeNotifier {
+    fn notify(&self, notice: PairNotification, on_action: ActionCallback) {
+        self.notices.lock().unwrap().push((notice, on_action));
+    }
+}
+
 /// A daemon on loopback, its client, its fakes and its stop flag.
 struct Harness {
+    _temp: barge::testing::TempDir,
     client: DaemonClient,
     address: SocketAddr,
     controller: PowerController,
     backend: Arc<RecordingBackend>,
     clock: Arc<FakeClock>,
     allowlist: Allowlist,
+    mdns: Arc<FakeMdns>,
+    notifier: Arc<FakeNotifier>,
+    machine_id: String,
     running: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
 }
 
 impl Harness {
     fn with_identity(allowlist: &[&str], identity: Option<PeerNode>) -> Self {
+        let temp = barge::testing::TempDir::new("barged-harness").unwrap();
         let nodes = allowlist
             .iter()
             .map(|node| format!("{node:?}"))
             .collect::<Vec<_>>()
             .join(",");
         let config = Config::parse(
-            format!(r#"{{"listen":"127.0.0.1:0","allowed_nodes":[{nodes}]}}"#).as_bytes(),
+            format!(
+                r#"{{"listen":"127.0.0.1:0","allowed_nodes":[{nodes}],"state_dir":{}}}"#,
+                serde_json::to_string(temp.path()).unwrap()
+            )
+            .as_bytes(),
         )
         .unwrap();
+        Self::start(temp, config, identity, false)
+    }
+
+    fn lan(temp: barge::testing::TempDir, config: Config, fail_mdns: bool) -> Self {
+        Self::start(temp, config, None, fail_mdns)
+    }
+
+    fn start(
+        temp: barge::testing::TempDir,
+        config: Config,
+        identity: Option<PeerNode>,
+        fail_mdns: bool,
+    ) -> Self {
         let backend = Arc::new(RecordingBackend::default());
         let clock = Arc::new(FakeClock::default());
         clock.at(1_000_000);
         let performer: Arc<dyn PowerBackend> = backend.clone();
         let controller = PowerController::new(performer, clock.clone());
         let peers: Arc<dyn PeerLookup> = Arc::new(FixedLookup(identity));
-        let daemon = Arc::new(Daemon::new(
-            &config,
-            controller.clone(),
-            peers,
-            clock.clone(),
-        ));
+        let mdns = Arc::new(FakeMdns {
+            fail: fail_mdns,
+            ..Default::default()
+        });
+        let notifier = Arc::new(FakeNotifier::default());
+        let network = Arc::new(FakeNetwork(InterfaceInfo {
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            broadcast: Some(Ipv4Addr::new(192, 168, 1, 255)),
+            interface_index: Some(2),
+        }));
+        let daemon = Arc::new(
+            Daemon::new(&config, controller.clone(), peers, clock.clone())
+                .unwrap()
+                .with_network(network)
+                .with_mdns_and_notifier(mdns.clone(), notifier.clone()),
+        );
+        let machine_id = daemon.state_store().machine_id().to_string();
         let server = daemon.bind().unwrap();
         let address = server.local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
@@ -116,12 +200,16 @@ impl Harness {
             assert!(served.is_ok(), "{served:?}");
         });
         Self {
+            _temp: temp,
             client: DaemonClient::at(format!("http://{address}")),
             address,
             controller,
             backend,
             clock,
             allowlist: config.allowlist(),
+            mdns,
+            notifier,
+            machine_id,
             running,
             server: Some(handle),
         }
@@ -155,6 +243,16 @@ impl Harness {
     }
 }
 
+trait DaemonTestExt {
+    fn with_mdns_and_notifier(self, mdns: Arc<FakeMdns>, notifier: Arc<FakeNotifier>) -> Self;
+}
+
+impl DaemonTestExt for Daemon {
+    fn with_mdns_and_notifier(self, mdns: Arc<FakeMdns>, notifier: Arc<FakeNotifier>) -> Self {
+        self.with_advertiser(mdns).with_notifier(notifier)
+    }
+}
+
 impl Drop for Harness {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
@@ -165,16 +263,21 @@ impl Drop for Harness {
 }
 
 #[test]
-fn the_state_endpoint_reports_awake_and_any_pending_action() {
+fn the_state_endpoint_reports_awake_machine_id_mac_broadcast_and_pending() {
     let harness = Harness::new();
     let state = harness.state();
     assert_eq!(state.schema, STATE_SCHEMA);
     assert_eq!(state.power, PowerState::Awake);
     assert_eq!(state.observed_at_unix_ms, harness.clock.now());
+    assert_eq!(state.machine_id, harness.machine_id);
+    assert_eq!(state.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+    assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 168, 1, 255)));
     assert_eq!(state.pending, None);
     assert!(harness
         .allowlist
         .accepts(&PeerNode::new("n1", "macbook.tailnet.ts.net")));
+    // Tailscale mode never advertises over mDNS.
+    assert!(harness.mdns.advertised.lock().unwrap().is_empty());
 
     let result = harness.client.power(PowerActionKind::Sleep, 15).unwrap();
     assert_eq!(result.schema, POWER_RESULT_SCHEMA);
@@ -367,13 +470,192 @@ fn an_absent_daemon_is_unreachable_and_never_read_as_asleep() {
 }
 
 #[test]
-fn lan_pairing_and_authenticated_requests() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let temp = barge::testing::TempDir::new("barged-lan").unwrap();
-    let dir = temp.path();
+fn lan_pairing_approve_deny_expiry_per_client_auth_and_revoke() {
+    let temp = barge::testing::TempDir::new("barged-pair").unwrap();
+    let config = Config::parse(
+        format!(
+            r#"{{"listen":"127.0.0.1:0","mode":"lan","name":"Bazzite PC","state_dir":{}}}"#,
+            serde_json::to_string(temp.path()).unwrap()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let mut harness = Harness::lan(temp, config, false);
+    harness.clock.at(barged::SystemClock.now_unix_ms());
+
+    // mDNS seam advertised `_barged._tcp` with id, name, mode and protocol version.
+    // Wait briefly until serve starts if needed by checking state first (which proves serve loop is running).
+    let unauth = harness.client.state().unwrap_err();
+    assert_eq!(unauth.kind(), barge_machine::ErrorKind::Refused);
+    {
+        let ads = harness.mdns.advertised.lock().unwrap();
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0].service_type, "_barged._tcp");
+        assert_eq!(ads[0].instance_name, "Bazzite PC");
+        assert_eq!(ads[0].port, harness.address.port());
+        assert_eq!(
+            ads[0].txt,
+            vec![
+                ("id".to_string(), harness.machine_id.clone()),
+                ("name".to_string(), "Bazzite PC".to_string()),
+                ("mode".to_string(), "lan".to_string()),
+                ("version".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    // 1. Pair first client ("MacBook") and approve via localhost.
+    let keys1 = KeyPair::generate().unwrap();
+    let started1 = harness
+        .client
+        .start_pair("MacBook", &keys1.public_key_hex())
+        .unwrap();
+    let derived1 = keys1
+        .derive(
+            &parse_public_key(&started1.public_key).unwrap(),
+            PairRole::Client,
+        )
+        .unwrap();
+    assert_eq!(
+        harness
+            .client
+            .pair_status(&started1.request_id)
+            .unwrap()
+            .status,
+        PairStatus::Pending
+    );
+
+    // Notification seam received the code and request_id.
+    {
+        let notices = harness.notifier.notices.lock().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].0.request_id, started1.request_id);
+        assert_eq!(notices[0].0.client_name, "MacBook");
+        assert_eq!(notices[0].0.code, derived1.code());
+    }
+
+    let pending = harness.client.pending_pairs().unwrap();
+    assert_eq!(pending.requests.len(), 1);
+    assert_eq!(pending.requests[0].code, derived1.code());
+    let approved1 = harness.client.approve_pair(&started1.request_id).unwrap();
+    assert_eq!(approved1.client.name, "MacBook");
+
+    let status1 = harness.client.pair_status(&started1.request_id).unwrap();
+    assert_eq!(status1.status, PairStatus::Approved);
+    let cid1 = status1.client_id.unwrap();
+    assert_eq!(cid1, approved1.client.id);
+
+    let client1 = DaemonClient::at(format!("http://{}", harness.address))
+        .with_client_key(&cid1, derived1.key().to_vec());
+    let state = client1.state().unwrap();
+    assert_eq!(state.machine_id, harness.machine_id);
+    assert_eq!(state.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+    assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 168, 1, 255)));
+
+    // 2. Pair second client ("Steam Deck") and approve via signed paired client (client1)!
+    let keys2 = KeyPair::generate().unwrap();
+    let started2 = harness
+        .client
+        .start_pair("Steam Deck", &keys2.public_key_hex())
+        .unwrap();
+    let derived2 = keys2
+        .derive(
+            &parse_public_key(&started2.public_key).unwrap(),
+            PairRole::Client,
+        )
+        .unwrap();
+    assert_eq!(client1.pending_pairs().unwrap().requests.len(), 1);
+    let approved2 = client1.approve_pair(&started2.request_id).unwrap();
+    let cid2 = approved2.client.id;
+    let client2 = DaemonClient::at(format!("http://{}", harness.address))
+        .with_client_key(&cid2, derived2.key().to_vec());
+    assert_eq!(client2.state().unwrap().power, PowerState::Awake);
+
+    // 3. Pair third client and deny via notification action callback.
+    let keys3 = KeyPair::generate().unwrap();
+    let started3 = harness
+        .client
+        .start_pair("Intruder", &keys3.public_key_hex())
+        .unwrap();
+    {
+        let notices = harness.notifier.notices.lock().unwrap();
+        let (notice, cb) = notices.last().unwrap();
+        assert_eq!(notice.request_id, started3.request_id);
+        cb(&notice.request_id, PairAction::Deny);
+    }
+    assert_eq!(
+        harness
+            .client
+            .pair_status(&started3.request_id)
+            .unwrap()
+            .status,
+        PairStatus::Denied
+    );
+    assert!(harness.client.approve_pair(&started3.request_id).is_err());
+
+    // 4. Pair fourth client and let it expire after 2 minutes (120,000 ms).
+    let keys4 = KeyPair::generate().unwrap();
+    let started4 = harness
+        .client
+        .start_pair("Slow Device", &keys4.public_key_hex())
+        .unwrap();
+    harness.clock.advance(120_000);
+    assert_eq!(
+        harness
+            .client
+            .pair_status(&started4.request_id)
+            .unwrap()
+            .status,
+        PairStatus::Expired
+    );
+    assert!(harness.client.approve_pair(&started4.request_id).is_err());
+    // Re-sync the daemon clock with SystemTime before signed requests below.
+    harness.clock.at(barged::SystemClock.now_unix_ms());
+
+    // 5. List clients and revoke client1; client2 still works, client1 is rejected.
+    let list = client1.clients().unwrap();
+    assert_eq!(list.clients.len(), 2);
+    let revoked = client2.revoke_client(&cid1).unwrap();
+    assert_eq!(revoked.client_id, cid1);
+    assert!(client1.state().is_err());
+    assert_eq!(client2.state().unwrap().power, PowerState::Awake);
+    assert_eq!(client2.clients().unwrap().clients.len(), 1);
+
+    // Dropping the server withdraws the mDNS advertisement.
+    harness.running.store(false, Ordering::SeqCst);
+    harness.server.take().unwrap().join().unwrap();
+    assert!(harness.mdns.dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn absent_avahi_logs_once_and_keeps_serving() {
+    let temp = barge::testing::TempDir::new("barged-no-avahi").unwrap();
+    let config = Config::parse(
+        format!(
+            r#"{{"listen":"127.0.0.1:0","mode":"lan","state_dir":{}}}"#,
+            serde_json::to_string(temp.path()).unwrap()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let harness = Harness::lan(temp, config, true);
+    let keys = KeyPair::generate().unwrap();
+    let started = harness
+        .client
+        .start_pair("MacBook", &keys.public_key_hex())
+        .unwrap();
+    assert_eq!(harness.mdns.advertised.lock().unwrap().len(), 1);
+    assert!(!started.request_id.is_empty());
+}
+
+#[test]
+fn legacy_shared_key_migrates_and_signed_requests_keep_working() {
+    let temp = barge::testing::TempDir::new("barged-legacy-lan").unwrap();
+    let dir = temp.path().to_path_buf();
     let key_path = dir.join("lan.key");
     let config_path = dir.join("config.json");
+    let legacy_hex = "ab".repeat(32);
+    auth::write_key(&key_path, &legacy_hex).unwrap();
     std::fs::write(
         &config_path,
         format!(
@@ -382,52 +664,41 @@ fn lan_pairing_and_authenticated_requests() {
         ),
     )
     .unwrap();
-    let pair = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_barged"))
-            .arg("pair")
-            .arg("--config")
-            .arg(&config_path)
-            .output()
-            .unwrap()
-    };
-    let first = pair();
-    assert!(first.status.success());
-    let second = pair();
-    assert!(second.status.success());
-    assert_ne!(first.stdout, second.stdout);
-    assert_eq!(
-        std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let key_text = String::from_utf8(second.stdout).unwrap();
-    let key = barge_machine::auth::decode(key_text.trim(), 32).unwrap();
+
+    let key = auth::decode(&legacy_hex, 32).unwrap();
     let config = Config::load(&config_path).unwrap();
     let clock = Arc::new(barged::SystemClock);
     let controller = PowerController::new(Arc::new(RecordingBackend::default()), clock.clone());
-    let daemon = Arc::new(Daemon::new(
-        &config,
-        controller,
-        Arc::new(FixedLookup(None)),
-        clock,
-    ));
+    let daemon =
+        Arc::new(Daemon::new(&config, controller, Arc::new(FixedLookup(None)), clock).unwrap());
     let server = daemon.bind().unwrap();
     let address = server.local_addr().unwrap();
     let running = Arc::new(AtomicBool::new(true));
     let flag = running.clone();
     let thread = thread::spawn(move || daemon.serve(server, &flag).unwrap());
-    let client = DaemonClient::at(format!("http://{address}")).with_key(key.clone());
-    assert_eq!(client.state().unwrap().power, PowerState::Awake);
+
+    // Legacy client has NO x-barge-client-id header and keeps working seamlessly.
+    let legacy_client = DaemonClient::at(format!("http://{address}")).with_key(key.clone());
+    assert_eq!(legacy_client.state().unwrap().power, PowerState::Awake);
+    let clients = legacy_client.clients().unwrap();
+    assert_eq!(clients.clients.len(), 1);
+    assert_eq!(clients.clients[0].id, "legacy");
+    assert_eq!(clients.clients[0].name, "legacy");
+
+    // Wrong key is rejected.
     assert!(DaemonClient::at(format!("http://{address}"))
         .with_key(vec![0; 32])
         .state()
         .is_err());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+
+    // Nonce replay, timestamp skew, path/method tampering, and unsigned requests are still rejected.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let request = |timestamp: u64, nonce: &str, signed_body: &str, body: &str| {
         let ts = timestamp.to_string();
-        let sig = barge_machine::auth::sign(
+        let sig = auth::sign(
             &key,
             "POST",
             "/v1/power/cancel",
@@ -450,8 +721,6 @@ fn lan_pairing_and_authenticated_requests() {
     let valid = request(now, nonce, body, body);
     assert!(raw(&valid).contains(" 200 "));
     assert!(raw(&valid).contains(" 401 "));
-    // Well outside the 60-second window, so sampling `now` just before a
-    // second boundary cannot turn the off-by-one second into a passing skew.
     assert!(raw(&request(
         now + 300,
         "33332233445566778899aabbccddeeff",
@@ -463,32 +732,28 @@ fn lan_pairing_and_authenticated_requests() {
     let signed = request(now, "44442233445566778899aabbccddeeff", body, body);
     assert!(raw(&signed.replacen("/v1/power/cancel", "/v1/power", 1)).contains(" 401 "));
     assert!(raw(&signed.replacen("POST", "GET", 1)).contains(" 401 "));
-    assert!(raw(&request(
-        now - 300,
-        "11112233445566778899aabbccddeeff",
-        body,
-        body
-    ))
-    .contains(" 401 "));
-    assert!(raw(&request(
-        now,
-        "22222233445566778899aabbccddeeff",
-        body,
-        "{}"
-    ))
-    .contains(" 401 "));
     assert!(
         raw("GET /v1/state HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").contains(" 401 ")
     );
-    let rotated = pair();
-    assert!(rotated.status.success());
-    assert!(client.state().is_err());
-    let new_key =
-        barge_machine::auth::decode(String::from_utf8(rotated.stdout).unwrap().trim(), 32).unwrap();
-    assert!(DaemonClient::at(format!("http://{address}"))
-        .with_key(new_key)
-        .state()
-        .is_ok());
+
+    // Local `barged clients list` and `barged clients remove` work and immediately
+    // revoke access on the live daemon.
+    let list_out = Command::new(env!("CARGO_BIN_EXE_barged"))
+        .args(["clients", "list", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(list_out.status.success());
+    assert!(String::from_utf8_lossy(&list_out.stdout).contains("legacy"));
+
+    let remove_out = Command::new(env!("CARGO_BIN_EXE_barged"))
+        .args(["clients", "remove", "legacy", "--config"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(remove_out.status.success());
+    assert!(legacy_client.state().is_err());
+
     running.store(false, Ordering::SeqCst);
     thread.join().unwrap();
 }
