@@ -1,13 +1,48 @@
-//! Machine registry reads and daemon actions.
+//! Machine registry reads, mDNS discovery, X25519 pairing, approvals, clients and daemon actions.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use barge_machine::{
+    local_hostname, parse_public_key, sanitize_machine_name, DaemonClient, KeyPair, Machine,
+    PairRole, PairStatus, PowerActionKind, Registry, UdpSender, DEFAULT_POWER_DELAY_S,
+};
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
+
 use crate::machine_state::LastAction;
-use crate::machines::{self, now_ms, MachineView, Observations};
-use barge_machine::{Machine, PowerActionKind, Registry, UdpSender, DEFAULT_POWER_DELAY_S};
+use crate::machines::{
+    self, now_ms, DiscoveredMachineView, MachineView, Observations, PairedClientView,
+    PendingPairPrompt, PendingPairs,
+};
+use crate::notifications::{NoopNotifier, PairNotifier};
 
 #[derive(Default)]
 pub struct MachineState(pub Arc<Mutex<Observations>>);
+
+#[derive(Default)]
+pub struct PendingPairState(pub Arc<Mutex<PendingPairs>>);
+
+#[derive(Clone)]
+pub struct ActivePairSession {
+    address: String,
+    port: u16,
+    requested_name: Option<String>,
+    machine_id: Option<String>,
+    existing_name: Option<String>,
+    key: [u8; 32],
+}
+
+#[derive(Default)]
+pub struct PairSessionState(pub Arc<Mutex<HashMap<String, ActivePairSession>>>);
+
+pub struct NotifierState(pub Arc<dyn PairNotifier>);
+
+impl Default for NotifierState {
+    fn default() -> Self {
+        Self(Arc::new(NoopNotifier))
+    }
+}
 
 /// What the registry names, with the shared observations, without touching
 /// the network. The tray's poll thread fills the same observations, so the
@@ -29,14 +64,32 @@ pub async fn machines_list(
 /// slow machine holds only its own poll, never the whole list.
 #[tauri::command]
 pub async fn machines_refresh(
+    app: tauri::AppHandle,
     state: tauri::State<'_, MachineState>,
+    pending: tauri::State<'_, PendingPairState>,
+    notifier: tauri::State<'_, NotifierState>,
 ) -> Result<Vec<MachineView>, String> {
     let observations = Arc::clone(&state.0);
+    let pending_state = Arc::clone(&pending.0);
+    let notifier = Arc::clone(&notifier.0);
     super::blocking(move || {
-        machines::refresh(&observations)?;
+        machines::refresh_all(&observations, &pending_state, notifier.as_ref())?;
+        if let Ok(prompts) = pending_state.lock().map(|store| store.snapshot()) {
+            let _ = app.emit("pending-pairs-changed", &prompts);
+        }
         snapshot(&observations)
     })
     .await
+}
+
+/// Browse `_barged._tcp` on the LAN, update moved addresses for registered
+/// machines, and return unregistered machines found on the network.
+#[tauri::command]
+pub async fn machines_discover(
+    state: tauri::State<'_, MachineState>,
+) -> Result<Vec<DiscoveredMachineView>, String> {
+    let observations = Arc::clone(&state.0);
+    super::blocking(move || machines::discover(&observations)).await
 }
 
 /// The machines as they stand now: state is recomputed at the current time, so
@@ -48,42 +101,62 @@ pub fn snapshot(observations: &Mutex<Observations>) -> Result<Vec<MachineView>, 
         .map_err(|error| error.to_string())
 }
 
-#[derive(serde::Deserialize)]
-pub struct NewMachine {
-    name: String,
-    hostname: String,
-    mac: String,
-    tailscale_name: Option<String>,
-    key: Option<String>,
+#[derive(Deserialize)]
+pub struct PairStartInput {
+    pub address: String,
+    pub port: u16,
+    pub name: Option<String>,
+    pub machine_id: Option<String>,
+    pub existing_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PairStartView {
+    pub request_id: String,
+    pub code: String,
+    pub expires_at_unix_ms: u64,
+    pub machine_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PairPollView {
+    pub status: &'static str,
+    pub machine_name: String,
 }
 
 #[tauri::command]
-pub async fn machines_add(input: NewMachine) -> Result<(), String> {
+pub async fn machines_pair_start(
+    sessions: tauri::State<'_, PairSessionState>,
+    input: PairStartInput,
+) -> Result<PairStartView, String> {
+    let sessions = Arc::clone(&sessions.0);
+    super::blocking(move || pair_start_in(&sessions, input)).await
+}
+
+#[tauri::command]
+pub async fn machines_pair_poll(
+    sessions: tauri::State<'_, PairSessionState>,
+    state: tauri::State<'_, MachineState>,
+    request_id: String,
+) -> Result<PairPollView, String> {
+    let sessions = Arc::clone(&sessions.0);
+    let observations = Arc::clone(&state.0);
     super::blocking(move || {
-        if let Some(key) = &input.key {
-            if barge_machine::auth::decode(key.trim(), 32).is_none() {
-                return Err("Key must be 64 lowercase hexadecimal characters".into());
-            }
-        } else if input
-            .tailscale_name
-            .as_deref()
-            .is_none_or(|name| name.trim().is_empty())
-        {
-            return Err("Enter a Tailscale name or a LAN key".into());
-        }
-        let machine = Machine::new(&input.name, &input.hostname, &input.mac)
-            .map_err(|error| error.to_string())?
-            .with_tailscale_name(
-                input
-                    .tailscale_name
-                    .filter(|value| !value.trim().is_empty()),
-            );
         let registry = Registry::discover().map_err(|error| error.to_string())?;
-        registry.add(machine).map_err(|error| error.to_string())?;
-        if let Some(key) = input.key {
-            registry.pair(&input.name, &key).map_err(|error| {
-                format!("Machine added, but pairing failed: {error}. Pair it again or remove it.")
-            })?;
+        pair_poll_in(&registry, &sessions, &observations, &request_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn machines_pair_cancel(
+    sessions: tauri::State<'_, PairSessionState>,
+    request_id: String,
+) -> Result<(), String> {
+    let sessions = Arc::clone(&sessions.0);
+    super::blocking(move || {
+        if let Ok(mut guard) = sessions.lock() {
+            guard.remove(&request_id);
         }
         Ok(())
     })
@@ -91,24 +164,377 @@ pub async fn machines_add(input: NewMachine) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn machines_pair(name: String, key: String) -> Result<(), String> {
+pub async fn machines_pending_pairs(
+    pending: tauri::State<'_, PendingPairState>,
+) -> Result<Vec<PendingPairPrompt>, String> {
+    let pending = Arc::clone(&pending.0);
     super::blocking(move || {
-        Registry::discover()
-            .and_then(|registry| registry.pair(&name, &key))
+        pending
+            .lock()
+            .map(|store| store.snapshot())
             .map_err(|error| error.to_string())
     })
     .await
 }
 
 #[tauri::command]
-pub async fn machines_remove(name: String) -> Result<(), String> {
+pub async fn machines_approve_pair(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingPairState>,
+    machine_name: String,
+    request_id: String,
+) -> Result<(), String> {
+    let pending = Arc::clone(&pending.0);
     super::blocking(move || {
-        Registry::discover()
-            .and_then(|registry| registry.remove(&name))
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let registry = Registry::discover().map_err(|error| error.to_string())?;
+        decide_pair_in(&registry, &pending, &machine_name, &request_id, true)?;
+        if let Ok(prompts) = pending.lock().map(|store| store.snapshot()) {
+            let _ = app.emit("pending-pairs-changed", &prompts);
+        }
+        Ok(())
     })
     .await
+}
+
+#[tauri::command]
+pub async fn machines_deny_pair(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingPairState>,
+    machine_name: String,
+    request_id: String,
+) -> Result<(), String> {
+    let pending = Arc::clone(&pending.0);
+    super::blocking(move || {
+        let registry = Registry::discover().map_err(|error| error.to_string())?;
+        decide_pair_in(&registry, &pending, &machine_name, &request_id, false)?;
+        if let Ok(prompts) = pending.lock().map(|store| store.snapshot()) {
+            let _ = app.emit("pending-pairs-changed", &prompts);
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn machines_clients(name: String) -> Result<Vec<PairedClientView>, String> {
+    super::blocking(move || {
+        let registry = Registry::discover().map_err(|error| error.to_string())?;
+        clients_in(&registry, &name)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn machines_revoke_client(
+    state: tauri::State<'_, MachineState>,
+    name: String,
+    client_id: String,
+) -> Result<(), String> {
+    let observations = Arc::clone(&state.0);
+    super::blocking(move || {
+        let registry = Registry::discover().map_err(|error| error.to_string())?;
+        revoke_client_in(&registry, &observations, &name, &client_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn machines_remove(
+    state: tauri::State<'_, MachineState>,
+    name: String,
+) -> Result<(), String> {
+    let observations = Arc::clone(&state.0);
+    super::blocking(move || {
+        let registry = Registry::discover().map_err(|error| error.to_string())?;
+        registry.remove(&name).map_err(|error| error.to_string())?;
+        machines::ensure_registered(&observations)
+    })
+    .await
+}
+
+pub fn pair_start_in(
+    sessions: &Mutex<HashMap<String, ActivePairSession>>,
+    input: PairStartInput,
+) -> Result<PairStartView, String> {
+    let address = input.address.trim().to_string();
+    if address.is_empty() {
+        return Err("Enter a machine address".into());
+    }
+    if input.port == 0 {
+        return Err("Port must be 1-65535".into());
+    }
+    let client_name = local_hostname().unwrap_or_else(|| "Barge".to_string());
+    let keys = KeyPair::generate().map_err(|error| error.to_string())?;
+    let client = DaemonClient::at(base_url(&address, input.port));
+    let started = client
+        .start_pair(&client_name, &keys.public_key_hex())
+        .map_err(|error| error.to_string())?;
+    let daemon_pub = parse_public_key(&started.public_key).map_err(|error| error.to_string())?;
+    let derived = keys
+        .derive(&daemon_pub, PairRole::Client)
+        .map_err(|error| error.to_string())?;
+    let display_name = input
+        .existing_name
+        .as_deref()
+        .or(input.name.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&address)
+        .trim()
+        .to_string();
+    let session = ActivePairSession {
+        address,
+        port: input.port,
+        requested_name: input.name.filter(|value| !value.trim().is_empty()),
+        machine_id: input.machine_id.filter(|value| !value.trim().is_empty()),
+        existing_name: input.existing_name.filter(|value| !value.trim().is_empty()),
+        key: *derived.key(),
+    };
+    sessions
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(started.request_id.clone(), session);
+    Ok(PairStartView {
+        request_id: started.request_id,
+        code: derived.code().to_string(),
+        expires_at_unix_ms: started.expires_at_unix_ms,
+        machine_name: display_name,
+    })
+}
+
+pub fn pair_poll_in(
+    registry: &Registry,
+    sessions: &Mutex<HashMap<String, ActivePairSession>>,
+    observations: &Mutex<Observations>,
+    request_id: &str,
+) -> Result<PairPollView, String> {
+    let session = sessions
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(request_id)
+        .cloned()
+        .ok_or_else(|| "Pairing session is no longer active".to_string())?;
+    let display_name = session
+        .existing_name
+        .as_deref()
+        .or(session.requested_name.as_deref())
+        .unwrap_or(&session.address)
+        .to_string();
+    let base = base_url(&session.address, session.port);
+    let unauth = DaemonClient::at(&base);
+    let status = unauth
+        .pair_status(request_id)
+        .map_err(|error| error.to_string())?;
+    match status.status {
+        PairStatus::Pending => Ok(PairPollView {
+            status: "pending",
+            machine_name: display_name,
+        }),
+        PairStatus::Denied => {
+            remove_session(sessions, request_id);
+            Ok(PairPollView {
+                status: "denied",
+                machine_name: display_name,
+            })
+        }
+        PairStatus::Expired => {
+            remove_session(sessions, request_id);
+            Ok(PairPollView {
+                status: "expired",
+                machine_name: display_name,
+            })
+        }
+        PairStatus::Approved => {
+            remove_session(sessions, request_id);
+            let client_id = status
+                .client_id
+                .ok_or_else(|| "Daemon approved pairing without a client ID".to_string())?;
+            let saved_name = complete_pairing(registry, &session, &base, &client_id)?;
+            machines::ensure_registry(registry, observations)?;
+            Ok(PairPollView {
+                status: "approved",
+                machine_name: saved_name,
+            })
+        }
+    }
+}
+
+fn remove_session(sessions: &Mutex<HashMap<String, ActivePairSession>>, request_id: &str) {
+    if let Ok(mut guard) = sessions.lock() {
+        guard.remove(request_id);
+    }
+}
+
+fn complete_pairing(
+    registry: &Registry,
+    session: &ActivePairSession,
+    base: &str,
+    client_id: &str,
+) -> Result<String, String> {
+    let authed = DaemonClient::at(base).with_client_key(client_id, session.key.to_vec());
+    let state = authed.state().map_err(|error| error.to_string())?;
+    let machine_id = if !state.machine_id.trim().is_empty() {
+        Some(state.machine_id.clone())
+    } else {
+        session.machine_id.clone()
+    };
+
+    let registered = registry.list().map_err(|error| error.to_string())?;
+    let target_name = session.existing_name.clone().or_else(|| {
+        machine_id.as_deref().and_then(|id| {
+            registered
+                .iter()
+                .find(|entry| entry.id() == Some(id))
+                .map(|entry| entry.name().to_string())
+        })
+    });
+
+    if let Some(existing_name) = target_name {
+        registry
+            .update(&existing_name, |record| {
+                let mut next = record
+                    .clone()
+                    .with_hostname(session.address.clone())?
+                    .with_daemon_port(session.port)?;
+                if let Some(id) = &machine_id {
+                    next = next.with_id(Some(id.clone()));
+                }
+                if let Some(mac) = &state.mac {
+                    next = next.with_mac(mac)?;
+                }
+                if let Some(broadcast) = state.broadcast {
+                    next = next.with_broadcast(broadcast);
+                }
+                *record = next;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+        registry
+            .pair_client(&existing_name, client_id, &session.key)
+            .map_err(|error| error.to_string())?;
+        return Ok(existing_name);
+    }
+
+    let base_name = session
+        .requested_name
+        .as_deref()
+        .unwrap_or(&session.address);
+    let local_name = unique_machine_name(base_name, &registered);
+    let mut machine = if let Some(id) = machine_id {
+        Machine::discovered(id, &local_name, &session.address, session.port)
+            .map_err(|error| error.to_string())?
+    } else if let Some(mac) = &state.mac {
+        Machine::new(&local_name, &session.address, mac)
+            .map_err(|error| error.to_string())?
+            .with_daemon_port(session.port)
+            .map_err(|error| error.to_string())?
+    } else {
+        return Err("Daemon did not report a machine ID or MAC address".into());
+    };
+    if let Some(mac) = &state.mac {
+        machine = machine.with_mac(mac).map_err(|error| error.to_string())?;
+    }
+    if let Some(broadcast) = state.broadcast {
+        machine = machine.with_broadcast(broadcast);
+    }
+    registry.add(machine).map_err(|error| error.to_string())?;
+    registry
+        .pair_client(&local_name, client_id, &session.key)
+        .map_err(|error| error.to_string())?;
+    Ok(local_name)
+}
+
+fn unique_machine_name(raw: &str, registered: &[Machine]) -> String {
+    let base = sanitize_machine_name(raw);
+    if !registered.iter().any(|entry| entry.name() == base) {
+        return base;
+    }
+    for n in 2..1000 {
+        let suffix = format!("-{n}");
+        let max_stem = 64_usize.saturating_sub(suffix.len());
+        let stem: String = base.chars().take(max_stem).collect();
+        let candidate = format!("{stem}{suffix}");
+        if !registered.iter().any(|entry| entry.name() == candidate) {
+            return candidate;
+        }
+    }
+    base
+}
+
+fn base_url(address: &str, port: u16) -> String {
+    if address.contains(':') && !address.starts_with('[') {
+        format!("http://[{address}]:{port}")
+    } else {
+        format!("http://{address}:{port}")
+    }
+}
+
+pub fn decide_pair_in(
+    registry: &Registry,
+    pending: &Mutex<PendingPairs>,
+    machine_name: &str,
+    request_id: &str,
+    approve: bool,
+) -> Result<(), String> {
+    let machine = registry
+        .get(machine_name)
+        .map_err(|error| error.to_string())?;
+    let daemon = client(registry, &machine)?;
+    let result = if approve {
+        daemon.approve_pair(request_id).map(|_| ())
+    } else {
+        daemon.deny_pair(request_id).map(|_| ())
+    };
+    if let Ok(mut store) = pending.lock() {
+        store.remove(request_id);
+    }
+    result.map_err(|error| error.to_string())
+}
+
+pub fn clients_in(registry: &Registry, name: &str) -> Result<Vec<PairedClientView>, String> {
+    let machine = registry.get(name).map_err(|error| error.to_string())?;
+    let creds = registry
+        .credentials(machine.name())
+        .map_err(|error| error.to_string())?;
+    let self_id = creds
+        .as_ref()
+        .map(|item| item.client_id.as_deref().unwrap_or("legacy").to_string());
+    let daemon = client(registry, &machine)?;
+    let list = daemon.clients().map_err(|error| error.to_string())?;
+    Ok(list
+        .clients
+        .into_iter()
+        .map(|entry| PairedClientView {
+            this_client: self_id.as_deref() == Some(entry.id.as_str()),
+            id: entry.id,
+            name: entry.name,
+            paired_at_unix_ms: entry.paired_at_unix_ms,
+        })
+        .collect())
+}
+
+pub fn revoke_client_in(
+    registry: &Registry,
+    observations: &Mutex<Observations>,
+    name: &str,
+    client_id: &str,
+) -> Result<(), String> {
+    let machine = registry.get(name).map_err(|error| error.to_string())?;
+    let local_creds = registry
+        .credentials(machine.name())
+        .map_err(|error| error.to_string())?;
+    let daemon = client(registry, &machine)?;
+    let revoked = daemon
+        .revoke_client(client_id)
+        .map_err(|error| error.to_string())?;
+    let revoked_self = local_creds.as_ref().is_some_and(|creds| {
+        creds.client_id.as_deref() == Some(revoked.client_id.as_str())
+            || (creds.client_id.is_none() && revoked.client_id == "legacy")
+    });
+    if revoked_self {
+        let _ = registry.unpair(machine.name());
+        machines::ensure_registry(registry, observations)?;
+    }
+    Ok(())
 }
 
 /// Run one action and record what the daemon accepted. A refusal records
@@ -266,6 +692,7 @@ fn cancel(client: &barge_machine::DaemonClient) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use barge_machine::{PairResponse, PairStatusResponse};
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -344,6 +771,244 @@ mod tests {
         )))
         .unwrap_err();
         assert!(error.contains("did not cancel"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pair_start_and_poll_approved_registers_machine_and_credentials() {
+        let temp = barge::testing::TempDir::new("app-pair-approved").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        let sessions = Mutex::new(HashMap::new());
+        let observations = Mutex::new(Observations::default());
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let daemon_keys = KeyPair::generate().unwrap();
+        let daemon_pub = daemon_keys.public_key_hex();
+
+        let server = std::thread::spawn(move || {
+            let mut derived_key = None;
+            let mut code = None;
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let text = String::from_utf8_lossy(&buf[..n]);
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+                let (status, reply) = if text.starts_with("POST /v1/pair ") {
+                    let req: barge_machine::PairRequest = serde_json::from_str(body).unwrap();
+                    let client_pub = parse_public_key(&req.public_key).unwrap();
+                    let derived = daemon_keys.derive(&client_pub, PairRole::Daemon).unwrap();
+                    derived_key = Some(derived.key().to_vec());
+                    code = Some(derived.code().to_string());
+                    (
+                        202,
+                        serde_json::to_string(&PairResponse::new("req-1", &daemon_pub, 9_999_999))
+                            .unwrap(),
+                    )
+                } else if step == 1 && text.starts_with("GET /v1/pair/req-1 ") {
+                    (
+                        200,
+                        serde_json::to_string(&PairStatusResponse::new(
+                            "req-1",
+                            PairStatus::Pending,
+                            None,
+                        ))
+                        .unwrap(),
+                    )
+                } else if text.starts_with("GET /v1/pair/req-1 ") {
+                    (
+                        200,
+                        serde_json::to_string(&PairStatusResponse::new(
+                            "req-1",
+                            PairStatus::Approved,
+                            Some("cid-app".to_string()),
+                        ))
+                        .unwrap(),
+                    )
+                } else {
+                    assert!(text.contains("x-barge-client-id: cid-app"), "{text}");
+                    (
+                        200,
+                        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-bazzite","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1.255"}"#.to_string(),
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+            (derived_key.unwrap(), code.unwrap())
+        });
+
+        let started = pair_start_in(
+            &sessions,
+            PairStartInput {
+                address: "127.0.0.1".to_string(),
+                port,
+                name: Some("Bazzite".to_string()),
+                machine_id: Some("mid-bazzite".to_string()),
+                existing_name: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(started.code.len(), 6);
+
+        let pending =
+            pair_poll_in(&registry, &sessions, &observations, &started.request_id).unwrap();
+        assert_eq!(pending.status, "pending");
+
+        let approved =
+            pair_poll_in(&registry, &sessions, &observations, &started.request_id).unwrap();
+        assert_eq!(approved.status, "approved");
+        assert_eq!(approved.machine_name, "bazzite");
+
+        let (expected_key, expected_code) = server.join().unwrap();
+        assert_eq!(started.code, expected_code);
+
+        let saved = registry.get("bazzite").unwrap();
+        assert_eq!(saved.id(), Some("mid-bazzite"));
+        assert_eq!(saved.mac(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(saved.broadcast(), std::net::Ipv4Addr::new(192, 168, 1, 255));
+        let creds = registry.credentials("bazzite").unwrap().unwrap();
+        assert_eq!(creds.client_id.as_deref(), Some("cid-app"));
+        assert_eq!(creds.key, expected_key);
+        assert!(sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pair_poll_denied_and_expired_clean_up_session() {
+        for (pair_status, expected) in [
+            (PairStatus::Denied, "denied"),
+            (PairStatus::Expired, "expired"),
+        ] {
+            let temp = barge::testing::TempDir::new("app-pair-outcome").unwrap();
+            let registry = Registry::open(temp.child("state")).unwrap();
+            let sessions = Mutex::new(HashMap::new());
+            let observations = Mutex::new(Observations::default());
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let daemon_keys = KeyPair::generate().unwrap();
+            let daemon_pub = daemon_keys.public_key_hex();
+
+            let server = std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut buf = [0_u8; 4096];
+                    let n = stream.read(&mut buf).unwrap();
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    let (status, reply) = if text.starts_with("POST /v1/pair ") {
+                        (
+                            202,
+                            serde_json::to_string(&PairResponse::new(
+                                "req-1",
+                                &daemon_pub,
+                                9_999_999,
+                            ))
+                            .unwrap(),
+                        )
+                    } else {
+                        (
+                            200,
+                            serde_json::to_string(&PairStatusResponse::new(
+                                "req-1",
+                                pair_status,
+                                None,
+                            ))
+                            .unwrap(),
+                        )
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .unwrap();
+                }
+            });
+
+            let started = pair_start_in(
+                &sessions,
+                PairStartInput {
+                    address: "127.0.0.1".to_string(),
+                    port,
+                    name: None,
+                    machine_id: None,
+                    existing_name: None,
+                },
+            )
+            .unwrap();
+            let outcome =
+                pair_poll_in(&registry, &sessions, &observations, &started.request_id).unwrap();
+            assert_eq!(outcome.status, expected);
+            assert!(sessions.lock().unwrap().is_empty());
+            assert!(registry.list().unwrap().is_empty());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn clients_revoke_and_pair_decision_commands_work() {
+        let temp = barge::testing::TempDir::new("app-clients-decide").unwrap();
+        let registry = Registry::open(temp.child("state")).unwrap();
+        let observations = Mutex::new(Observations::default());
+        let pending = Mutex::new(PendingPairs::default());
+        pending.lock().unwrap().sync(vec![PendingPairPrompt {
+            machine_name: "bazzite".to_string(),
+            request_id: "req-9".to_string(),
+            client_name: "Deck".to_string(),
+            code: "123456".to_string(),
+            created_at_unix_ms: 10,
+            expires_at_unix_ms: 120_010,
+        }]);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        registry
+            .add(Machine::discovered("mid-1", "bazzite", "127.0.0.1", port).unwrap())
+            .unwrap();
+        registry
+            .pair_client("bazzite", "cid-mac", &[5; 32])
+            .unwrap();
+
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let text = String::from_utf8_lossy(&buf[..n]);
+                let body = if text.starts_with("POST /v1/pair/req-9/approve ") {
+                    r#"{"schema":"barge.pair-approved/1","request_id":"req-9","client":{"id":"cid-deck","name":"Deck","paired_at_unix_ms":200}}"#
+                } else if text.starts_with("GET /v1/clients ") {
+                    r#"{"schema":"barge.clients/1","clients":[{"id":"cid-mac","name":"Mac","paired_at_unix_ms":100},{"id":"cid-deck","name":"Deck","paired_at_unix_ms":200}]}"#
+                } else if text.starts_with("DELETE /v1/clients/cid-mac ") {
+                    r#"{"schema":"barge.client-revoked/1","client_id":"cid-mac"}"#
+                } else {
+                    panic!("unexpected request: {text}");
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        decide_pair_in(&registry, &pending, "bazzite", "req-9", true).unwrap();
+        assert!(pending.lock().unwrap().snapshot().is_empty());
+
+        let clients = clients_in(&registry, "bazzite").unwrap();
+        assert_eq!(clients.len(), 2);
+        assert!(clients[0].this_client);
+        assert!(!clients[1].this_client);
+
+        revoke_client_in(&registry, &observations, "bazzite", "cid-mac").unwrap();
+        assert!(registry.credentials("bazzite").unwrap().is_none());
         server.join().unwrap();
     }
 }

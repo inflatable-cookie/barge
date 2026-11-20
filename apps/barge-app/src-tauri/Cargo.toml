@@ -25,9 +25,22 @@ longhorn-tauri-settings.workspace = true
 longhorn-storage-layout.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc2.workspace = true
 objc2-app-kit.workspace = true
-objc2-foundation.workspace = true
+objc2-foundation = { workspace = true, features = ["NSArray", "NSBundle", "NSError", "NSSet", "NSString"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+  "UNNotification",
+  "UNNotificationAction",
+  "UNNotificationCategory",
+  "UNNotificationContent",
+  "UNNotificationRequest",
+  "UNNotificationResponse",
+  "UNNotificationSound",
+  "UNNotificationTrigger",
+  "UNUserNotificationCenter",
+  "block2",
+] }
 
 [dev-dependencies]
 barge = { workspace = true, features = ["testing"] }

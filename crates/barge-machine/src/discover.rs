@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ErrorKind, Machine, Result};
+use crate::{Error, ErrorKind, Machine, Registry, Result};
 
 /// The DNS-SD service type `barged` advertises in LAN mode.
 pub const MDNS_SERVICE_TYPE: &str = "_barged._tcp.local.";
@@ -78,6 +78,40 @@ pub fn match_registered<'a>(
     registered
         .iter()
         .find(|machine| machine.hostname() == found.address && machine.daemon_port() == found.port)
+}
+
+/// Update any registered machine whose `machine_id` matches a discovered
+/// instance under a new IP address or daemon port.
+///
+/// Returns the names of registered machines whose address or port changed.
+pub fn follow_addresses(
+    registry: &Registry,
+    discovered: &[DiscoveredMachine],
+) -> Result<Vec<String>> {
+    if !registry.exists() || discovered.is_empty() {
+        return Ok(Vec::new());
+    }
+    let registered = registry.list()?;
+    let mut updated_names = Vec::new();
+    for item in discovered {
+        if let Some(existing) = registered
+            .iter()
+            .find(|machine| machine.id() == Some(item.id.as_str()))
+        {
+            if existing.hostname() != item.address || existing.daemon_port() != item.port {
+                registry.update(existing.name(), |machine| {
+                    let updated = machine
+                        .clone()
+                        .with_hostname(item.address.clone())?
+                        .with_daemon_port(item.port)?;
+                    *machine = updated;
+                    Ok(())
+                })?;
+                updated_names.push(existing.name().to_string());
+            }
+        }
+    }
+    Ok(updated_names)
 }
 
 /// Browse mDNS responders via `target` (multicast `224.0.0.251:5353` in
@@ -599,5 +633,78 @@ mod tests {
             match_registered(&found, &[manual]).map(Machine::name),
             Some("manual")
         );
+    }
+
+    #[test]
+    fn match_registered_matches_by_id_even_when_address_and_port_change() {
+        let found = DiscoveredMachine {
+            id: "mid-1".to_string(),
+            name: "Bazzite".to_string(),
+            mode: "lan".to_string(),
+            protocol_version: "1".to_string(),
+            address: "192.168.1.99".to_string(),
+            port: 9888,
+        };
+        let registered = Machine::discovered("mid-1", "bazzite", "192.168.1.20", 9777).unwrap();
+        let other = Machine::discovered("mid-2", "other", "192.168.1.99", 9888).unwrap();
+        assert_eq!(
+            match_registered(&found, &[other, registered]).map(Machine::name),
+            Some("bazzite")
+        );
+    }
+
+    #[test]
+    fn follow_addresses_updates_matching_machine_id_and_leaves_others_alone() {
+        let temp = barge::testing::TempDir::new("follow-addresses").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+
+        // Empty / non-existent machines.json is a no-op and writes nothing.
+        let found = vec![
+            DiscoveredMachine {
+                id: "mid-1".to_string(),
+                name: "Bazzite".to_string(),
+                mode: "lan".to_string(),
+                protocol_version: "1".to_string(),
+                address: "192.168.1.99".to_string(),
+                port: 9888,
+            },
+            DiscoveredMachine {
+                id: "mid-unregistered".to_string(),
+                name: "SteamDeck".to_string(),
+                mode: "lan".to_string(),
+                protocol_version: "1".to_string(),
+                address: "192.168.1.77".to_string(),
+                port: 9777,
+            },
+        ];
+        assert!(follow_addresses(&registry, &found).unwrap().is_empty());
+        assert!(!registry.exists());
+
+        registry
+            .add(
+                Machine::discovered("mid-1", "bazzite", "192.168.1.20", 9777)
+                    .unwrap()
+                    .with_mac("00:11:22:33:44:ff")
+                    .unwrap(),
+            )
+            .unwrap();
+        registry
+            .add(Machine::discovered("mid-2", "nas", "192.168.1.30", 9777).unwrap())
+            .unwrap();
+
+        let changed = follow_addresses(&registry, &found).unwrap();
+        assert_eq!(changed, vec!["bazzite".to_string()]);
+
+        let updated = registry.get("bazzite").unwrap();
+        assert_eq!(updated.hostname(), "192.168.1.99");
+        assert_eq!(updated.daemon_port(), 9888);
+        assert_eq!(updated.mac(), Some("00:11:22:33:44:ff"));
+
+        let untouched = registry.get("nas").unwrap();
+        assert_eq!(untouched.hostname(), "192.168.1.30");
+        assert_eq!(untouched.daemon_port(), 9777);
+
+        // Calling again with the same address makes no further updates.
+        assert!(follow_addresses(&registry, &found).unwrap().is_empty());
     }
 }

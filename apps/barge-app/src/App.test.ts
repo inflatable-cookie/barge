@@ -24,7 +24,19 @@ function fixture(volumes: VolumeSummary[] = []): AppApi {
     quit: vi.fn().mockResolvedValue(undefined),
     machines: vi.fn().mockResolvedValue([]),
     refreshMachines: vi.fn(),
-    addMachine: vi.fn(), pairMachine: vi.fn(), removeMachine: vi.fn(), beginMachineAction: vi.fn(), machineAction: vi.fn(), moonlight: vi.fn(),
+    discoverMachines: vi.fn().mockResolvedValue([]),
+    startPair: vi.fn(),
+    pollPair: vi.fn(),
+    cancelPair: vi.fn().mockResolvedValue(undefined),
+    pendingPairs: vi.fn().mockResolvedValue([]),
+    approvePair: vi.fn().mockResolvedValue(undefined),
+    denyPair: vi.fn().mockResolvedValue(undefined),
+    machineClients: vi.fn().mockResolvedValue([]),
+    revokeClient: vi.fn().mockResolvedValue(undefined),
+    removeMachine: vi.fn(),
+    beginMachineAction: vi.fn(),
+    machineAction: vi.fn(),
+    moonlight: vi.fn(),
   };
   // A recorded click answers with the machines as they stand; a test that wants
   // a different answer stubs it. Polls delegate to the snapshot unless a test
@@ -179,7 +191,7 @@ describe("Machines", () => {
   const AWAKE = ["Restart", "Shut down", "Open Moonlight", "Details"];
   function machine(fields: Partial<MachineView> & { status: MachineStatus }): MachineView {
     return {
-      name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", address: "bazzite.local",
+      name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", paired: true, address: "bazzite.local",
       daemon_port: 9777, reachable: true, error: null, seen_at_unix_ms: now(), ...fields,
     };
   }
@@ -237,10 +249,10 @@ describe("Machines", () => {
     return { promise, finish, fail };
   }
 
-  it("shows an empty state with the add button when nothing is registered", async () => {
+  it("shows an empty state with Add by address when nothing is registered or discovered", async () => {
     render(App, { props: { api: fixture() } });
-    expect(await screen.findByText(/No machines yet/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add machine" })).toBeInTheDocument();
+    expect(await screen.findByText(/No machines found on the network/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add by address" })).toBeInTheDocument();
     expect(screen.queryByText("This Mac")).not.toBeInTheDocument();
   });
 
@@ -482,12 +494,12 @@ describe("Machines", () => {
     render(App, { props: { api } });
     await waitFor(() => expect(api.machines).toHaveBeenCalled());
     // Loading: neither cards nor the empty state.
-    expect(screen.queryByText(/No machines yet/)).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Add machine" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/No machines found/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add by address" })).not.toBeInTheDocument();
     snapshot.finish([]);
     // An actually empty registry does show it.
-    expect(await screen.findByText(/No machines yet/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add machine" })).toBeInTheDocument();
+    expect(await screen.findByText(/No machines found on the network/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add by address" })).toBeInTheDocument();
   });
 
   it("shows a failed cancel and keeps the countdown visible", async () => {
@@ -517,6 +529,183 @@ describe("Machines", () => {
     await vi.waitFor(() => expect(screen.getByText(/cancel timeout/)).toBeInTheDocument());
     await vi.advanceTimersByTimeAsync(10_000);
     expect(screen.getByText(/cancel timeout/)).toBeInTheDocument();
+  });
+
+  it("lists found machines as cards with Add and starts pairing from discovery", async () => {
+    const api = fixture();
+    vi.mocked(api.discoverMachines).mockResolvedValue([
+      {
+        id: "mid-bazzite",
+        name: "Bazzite",
+        mode: "lan",
+        protocol_version: "1",
+        address: "192.168.1.42",
+        port: 9777,
+      },
+    ]);
+    vi.mocked(api.startPair).mockResolvedValue({
+      request_id: "req-1",
+      code: "340092",
+      expires_at_unix_ms: Date.now() + 120_000,
+      machine_name: "Bazzite",
+    });
+    vi.mocked(api.pollPair).mockResolvedValue({ status: "pending", machine_name: "Bazzite" });
+
+    render(App, { props: { api } });
+    const foundCard = await screen.findByLabelText("Bazzite discovered machine");
+    expect(within(foundCard).getByText("Found on network")).toBeInTheDocument();
+    expect(within(foundCard).getByText("LAN · 192.168.1.42:9777")).toBeInTheDocument();
+    expect(screen.queryByText(/No machines found on the network/)).not.toBeInTheDocument();
+
+    await fireEvent.click(within(foundCard).getByRole("button", { name: "Add" }));
+    expect(api.startPair).toHaveBeenCalledWith({
+      address: "192.168.1.42",
+      port: 9777,
+      name: "Bazzite",
+      machine_id: "mid-bazzite",
+      existing_name: null,
+    });
+    expect(await screen.findByLabelText("Pairing code")).toHaveTextContent("340092");
+    expect(screen.getByText("Approve on the PC or another paired device")).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(api.cancelPair).toHaveBeenCalledWith("req-1");
+  });
+
+  it.each([
+    ["approved", "Paired", /is paired and ready/],
+    ["denied", "Pairing denied", /was denied/],
+    ["expired", "Pairing expired", /expired before it was approved/],
+  ] as const)("shows pairing %s outcome", async (outcome, heading, detail) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = fixture();
+    vi.mocked(api.discoverMachines).mockResolvedValue([
+      {
+        id: "mid-bazzite",
+        name: "Bazzite",
+        mode: "lan",
+        protocol_version: "1",
+        address: "192.168.1.42",
+        port: 9777,
+      },
+    ]);
+    vi.mocked(api.startPair).mockResolvedValue({
+      request_id: "req-outcome",
+      code: "340092",
+      expires_at_unix_ms: Date.now() + 120_000,
+      machine_name: "Bazzite",
+    });
+    vi.mocked(api.pollPair)
+      .mockResolvedValueOnce({ status: "pending", machine_name: "Bazzite" })
+      .mockResolvedValueOnce({ status: outcome, machine_name: "bazzite" });
+
+    render(App, { props: { api } });
+    const foundCard = await screen.findByLabelText("Bazzite discovered machine");
+    await fireEvent.click(within(foundCard).getByRole("button", { name: "Add" }));
+    expect(await screen.findByLabelText("Pairing code")).toHaveTextContent("340092");
+
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await screen.findByText(heading)).toBeInTheDocument();
+    expect(screen.getByText(detail)).toBeInTheDocument();
+  });
+
+  it("offers Add by address as a fallback for networks without mDNS", async () => {
+    const api = fixture();
+    vi.mocked(api.startPair).mockResolvedValue({
+      request_id: "req-addr",
+      code: "654321",
+      expires_at_unix_ms: Date.now() + 120_000,
+      machine_name: "gaming-pc",
+    });
+    vi.mocked(api.pollPair).mockResolvedValue({ status: "pending", machine_name: "gaming-pc" });
+
+    render(App, { props: { api } });
+    await fireEvent.click(await screen.findByRole("button", { name: "Add by address" }));
+    const addressInput = await screen.findByLabelText(/Address/);
+    await fireEvent.input(addressInput, { target: { value: "10.0.0.15" } });
+    await fireEvent.input(screen.getByLabelText("Port"), { target: { value: "9888" } });
+    await fireEvent.input(screen.getByLabelText("Name"), { target: { value: "gaming-pc" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Pair" }));
+
+    await waitFor(() =>
+      expect(api.startPair).toHaveBeenCalledWith({
+        address: "10.0.0.15",
+        port: 9888,
+        name: "gaming-pc",
+        machine_id: null,
+        existing_name: null,
+      })
+    );
+    expect(await screen.findByLabelText("Pairing code")).toHaveTextContent("654321");
+  });
+
+  it("shows pending pairing approval prompts and approves or denies them", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([awake()]);
+    vi.mocked(api.pendingPairs).mockResolvedValue([
+      {
+        machine_name: "bazzite",
+        request_id: "req-deck",
+        client_name: "Steam Deck",
+        code: "340092",
+        created_at_unix_ms: Date.now() - 5_000,
+        expires_at_unix_ms: Date.now() + 115_000,
+      },
+      {
+        machine_name: "bazzite",
+        request_id: "req-ipad",
+        client_name: "iPad",
+        code: "112233",
+        created_at_unix_ms: Date.now() - 2_000,
+        expires_at_unix_ms: Date.now() + 118_000,
+      },
+    ]);
+
+    render(App, { props: { api } });
+    const prompts = await screen.findByLabelText("Pairing requests");
+    expect(within(prompts).getByText("Steam Deck wants to pair with bazzite")).toBeInTheDocument();
+    expect(within(prompts).getByText("340092")).toBeInTheDocument();
+
+    const [firstApprove] = within(prompts).getAllByRole("button", { name: "Approve" });
+    await fireEvent.click(firstApprove);
+    await waitFor(() => expect(api.approvePair).toHaveBeenCalledWith("bazzite", "req-deck"));
+    await waitFor(() => expect(screen.queryByText("Steam Deck wants to pair with bazzite")).not.toBeInTheDocument());
+
+    const denyBtn = within(prompts).getByRole("button", { name: "Deny" });
+    await fireEvent.click(denyBtn);
+    await waitFor(() => expect(api.denyPair).toHaveBeenCalledWith("bazzite", "req-ipad"));
+    await waitFor(() => expect(screen.queryByLabelText("Pairing requests")).not.toBeInTheDocument());
+  });
+
+  it("lists paired clients in the machine details dialog and confirms before revoking", async () => {
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([awake()]);
+    vi.mocked(api.machineClients)
+      .mockResolvedValueOnce([
+        { id: "cid-mac", name: "MacBook Pro", paired_at_unix_ms: Date.now() - 60_000, this_client: true },
+        { id: "cid-deck", name: "Steam Deck", paired_at_unix_ms: Date.now() - 120_000, this_client: false },
+      ])
+      .mockResolvedValueOnce([
+        { id: "cid-mac", name: "MacBook Pro", paired_at_unix_ms: Date.now() - 60_000, this_client: true },
+      ]);
+
+    render(App, { props: { api } });
+    const dialog = await openDetails(await card());
+    const clientsSection = within(dialog).getByLabelText("Paired clients");
+    expect(await within(clientsSection).findByText("MacBook Pro")).toBeInTheDocument();
+    expect(within(clientsSection).getByText("This Mac")).toBeInTheDocument();
+    expect(within(clientsSection).getByText("Steam Deck")).toBeInTheDocument();
+
+    const revokeButtons = within(clientsSection).getAllByRole("button", { name: "Revoke…" });
+    await fireEvent.click(revokeButtons[1]);
+
+    expect(await screen.findByText("Revoke Steam Deck?")).toBeInTheDocument();
+    expect(api.revokeClient).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+    await waitFor(() => expect(api.revokeClient).toHaveBeenCalledWith("bazzite", "cid-deck"));
+    await waitFor(() => expect(within(clientsSection).queryByText("Steam Deck")).not.toBeInTheDocument());
   });
 });
 

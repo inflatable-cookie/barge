@@ -6,6 +6,7 @@
 //! the 6-digit verification code from `SHA-256("barge-pair-code-v1\0" ||
 //! client_pub || daemon_pub)`.
 
+use std::ffi::CStr;
 use std::fmt;
 
 use hkdf::Hkdf;
@@ -142,6 +143,28 @@ pub fn verification_code(client_pub: &[u8; 32], daemon_pub: &[u8; 32]) -> String
     let digest = hasher.finalize();
     let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
     format!("{value:06}")
+}
+
+/// The local machine's short hostname (before any `.local` or domain suffix),
+/// used as the default client display name when initiating pairing.
+pub fn local_hostname() -> Option<String> {
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: `buf` is a live, writable buffer of `buf.len()` bytes.
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    buf[buf.len() - 1] = 0;
+    // SAFETY: `buf` is NUL-terminated above.
+    let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    let short = name.split('.').next().unwrap_or("").trim().to_string();
+    if short.is_empty() {
+        None
+    } else {
+        Some(short)
+    }
 }
 
 #[cfg(test)]
