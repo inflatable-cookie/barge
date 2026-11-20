@@ -1,9 +1,10 @@
 # Worktree pools
 
 Status: step 1 is built (the git module, pools, lease, return and status, with
-the CLI). Tom approved this design on 2026-11-20; what step 1 changed from it is
-in [step 1 as built](#step-1-as-built). Warm-path key checks and `prune` are
-step 2.
+the CLI), and so is the consumer hold seam, `barge worktree run`
+([run](#run)). Tom approved this design on 2026-11-20; what step 1 changed from
+it is in [step 1 as built](#step-1-as-built). Warm-path key checks and `prune`
+are step 2.
 
 Barge keeps a warm pool of git worktrees per repository on Stash and leases
 them to agents. An agent starts in a checkout that already has its dependencies
@@ -24,8 +25,10 @@ mechanic is a small git module.
   every worktree.
 - **A lease reserves a root** until it is returned. A durable record keeps
   the root assigned between runs, and a pin protects it from eviction.
-  Consumers take cooperative holds while they use the root. Return requires
-  an exclusive hold before it can reset the checkout.
+  A consumer holds the root while it uses it: a Rust caller through the
+  library's hold, and any other process through
+  [`barge worktree run`](#run). Return requires an exclusive hold before it
+  can reset the checkout.
 - **Eviction** is the class's LRU rule through `evict` and trash, as for any
   expendable area. A leased root is never evicted.
 
@@ -94,6 +97,26 @@ barge worktree return --lease <id> [--disposable] --request <id> --json
   of `leased`, `returning`, `returned` and `interrupted`.
 - Return is idempotent by lease ID. Replaying an old return after the root has
   been leased again reports the old result and never touches the root.
+
+## Run
+
+```
+barge worktree run --lease <id> [--exclusive] -- <command> [args...]
+```
+
+The seam for a process that is not Rust: Nucleus, a shell, a T3 or Paseo
+host. It takes a shared hold on the lease's root (exclusive with
+`--exclusive`), keeps the descriptor inheritable and replaces itself with the
+command, run in the checkout. The hold lives as long as the command and any
+child that keeps the descriptor. Barge stays out of the process tree.
+
+- Refused before the command starts when the lease is not `leased` (unknown,
+  `returning`, `returned` or `interrupted`), or when a return holds the root.
+  A run never waits for a return: the error says so, and nothing runs.
+- A return started while the command runs is refused until the hold is gone,
+  so a return that needs the root retries after the run exits.
+- Errors before the command starts use the CLI's error contract under
+  `--json`. After it starts, the exit status is the command's own.
 
 ## Warm paths
 
@@ -174,6 +197,9 @@ What Nucleus needs from Barge, and this contract gives it:
 - a return that refuses dirty or unproven work and leaves it with Nucleus,
   with `--disposable` carrying Nucleus's own publication evidence.
 
+- a hold seam: `barge worktree run` keeps a checkout held for as long as a
+  host's command and its children run, and a return is refused meanwhile;
+
 Nucleus still proves a clean tree at admission and an idle, tool-free tree at
 closeout, and removes only its own registration.
 
@@ -184,8 +210,9 @@ whole surface; holds do the coordination), and running installs.
 
 ## Build order
 
-1. Built: git module, pools, `lease`, `return`, `lease get`, `status`, with tests
-   against real temporary repositories. See [step 1 as built](#step-1-as-built).
+1. Built: git module, pools, `lease`, `return`, `lease get`, `status` and `run`,
+   with tests against real temporary repositories. See
+   [step 1 as built](#step-1-as-built).
 2. Warm paths with key-file validation, and `prune`.
 3. Nucleus integration: the Nucleus planner briefs its allocator change
    against this contract.
@@ -194,7 +221,8 @@ whole surface; holds do the coordination), and running installs.
 ## Step 1 as built
 
 The code is `crates/barge/src/worktree/`, the CLI is `barge worktree`, and the
-tests are `crates/barge/tests/worktrees.rs`, which build their own origin
+tests are `crates/barge/tests/worktrees.rs` and
+`crates/barge-cli/tests/worktree_run.rs`, which build their own origin
 repositories in temporary folders.
 
 On disk, in the account state directory:
@@ -215,6 +243,7 @@ barge worktree lease --repo <origin> --base <sha> --branch <name> --request <id>
   [--base-name <name>] [--label <task>] [--wait <seconds>] [--json]
 barge worktree lease get (--request <id> | --lease <id>) [--json]
 barge worktree return --lease <id> [--request <id>] [--disposable] [--json]
+barge worktree run --lease <id> [--exclusive] -- <command> [args...]
 barge worktree status [--repo <origin>] [--json]
 ```
 

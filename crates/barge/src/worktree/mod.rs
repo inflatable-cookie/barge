@@ -13,6 +13,7 @@ mod lease;
 mod leases;
 mod pools;
 mod returns;
+mod run;
 mod status;
 
 use std::fs;
@@ -22,10 +23,12 @@ use std::time::Duration;
 pub use leases::{LeaseRequest, WorktreeLease, WorktreeLeaseState, LEASE_SCHEMA};
 pub use pools::POOLS_SCHEMA;
 pub use returns::{ReturnAction, WorktreeReturn};
+pub use run::WorktreeHold;
 pub use status::{WorktreePool, WorktreeRoot};
 
 use crate::area::{Area, Location, BARGE_DIR};
 use crate::error::{Error, Result};
+use crate::hold::Mode;
 use crate::layout::{Class, Placement};
 use crate::Barge;
 use pools::{Pool, NAMESPACE};
@@ -69,6 +72,13 @@ impl Barge {
         disposable: bool,
     ) -> Result<WorktreeReturn> {
         returns::give_back(self, lease_id, request, disposable)
+    }
+
+    /// Hold a lease's checkout for a command, without waiting. Refused unless the
+    /// lease is `leased` and no return holds its root. Dropping the hold releases
+    /// it; `WorktreeHold::exec` keeps it for the command and its children.
+    pub fn worktree_hold(&self, lease_id: &str, mode: Mode) -> Result<WorktreeHold> {
+        run::hold(self, lease_id, mode)
     }
 
     /// Every declared pool, or the one for `repo`, with its roots and leases.
