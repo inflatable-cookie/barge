@@ -273,6 +273,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
   `root pin|unpin|evict <namespace>/<area> <id>`;
 - `prune --volume v [--dry-run]`;
 - `scratch new | scratch sweep`;
+- `worktree lease | lease get | return | status` ([worktrees](worktrees.md#step-1-as-built));
 - `status`;
 - `layout show | layout set`;
 - `path <class> [--project p]`; `env [--shell zsh|bash|fish]`;
@@ -364,8 +365,8 @@ Designed separately, not yet built:
 - **Tool adapters** for cache and kept placements ([resources](resources.md#adapters)).
   Link and workflow bindings, `init`, `move` and `doctor` are built; the
   `setting` adapters are not.
-- **Worktree pools:** areas of git worktrees leased through holds; see
-  [worktrees](worktrees.md) (design draft).
+- **Worktree pools:** areas of git worktrees, leased through durable records
+  and pins; step 1 is built, see [worktrees](worktrees.md).
 - **The machine daemon's later steps:** the remote-control replacement and
   Tailscale sign-ins ([machines](machines.md#build-order)). Machine control
   steps 1-3 are built.

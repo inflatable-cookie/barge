@@ -81,6 +81,9 @@ below read `_name`, `_key` and `_state`.
 | `barge.machine-status/1` | `machine_name: string`, `mode: string`, `machine_state: machine-state` | machine status |
 | `barge.machine-power/1` | `machine_name: string`, `action: string`, `deadline_unix_ms: int` | machine sleep, restart, shutdown |
 | `barge.machine-cancel/1` | `machine_name: string`, `cancelled: bool` | machine cancel |
+| `barge.worktree-lease/1` | `lease: worktree-lease` | worktree lease, worktree lease get |
+| `barge.worktree-return/1` | `action: string`, `lease: worktree-lease` | worktree return |
+| `barge.worktree-status/1` | `pools: [worktree-pool]` | worktree status |
 
 ## Error documents
 
@@ -138,5 +141,8 @@ input only. Input that cannot be read is `usage`.
 | `machine` | `name: string`, `hostname: string`, `tailscale_name: string?`, `mac: string`, `broadcast: string`, `port: int`, `daemon_port: int` |
 | `machine-state` | `schema: string`, `power: string`, `observed_at_unix_ms: int`, `pending?: pending` |
 | `pending` | `action: string`, `deadline_unix_ms: int` |
+| `worktree-lease` | `schema: string`, `lease_id: string`, `request: string`, `repo: string`, `base: string`, `base_name?: string`, `branch: string`, `label?: string`, `pool: string`, `root_id: string`, `path: string`, `head: string`, `state: string`, `disposable: bool`, `created_unix_ms: int`, `updated_unix_ms: int` |
+| `worktree-pool` | `repo: string`, `pool: string`, `warm: int`, `max: int`, `location?: string`, `unavailable?: string`, `roots: [worktree-root]` |
+| `worktree-root` | `id: string`, `path: string`, `held: bool`, `state: string`, `lease_id?: string`, `request?: string`, `branch?: string` |
 
 `doctor` and `init --check` can exit 1 while emitting their success document when they detect drift.

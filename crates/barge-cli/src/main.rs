@@ -30,6 +30,7 @@ mod status;
 mod survey;
 mod usage;
 mod volume;
+mod worktree;
 
 use crate::output::report_error;
 use crate::usage::usage_text;
@@ -125,6 +126,10 @@ fn dispatch(command: &str, rest: &[String], json: bool) -> Result<ExitCode> {
         }
         "machine" => {
             machine::machine(rest, json)?;
+            ExitCode::SUCCESS
+        }
+        "worktree" => {
+            worktree::worktree(rest, json)?;
             ExitCode::SUCCESS
         }
         other => {
