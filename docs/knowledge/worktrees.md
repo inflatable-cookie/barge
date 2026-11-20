@@ -184,8 +184,10 @@ whole surface; holds do the coordination), and running installs.
    against this contract.
 4. Later: pairing a leased worktree with a warm Oxide slot.
 
-## Questions for Tom
+## Rulings
 
-- Pool sizes: `warm: 2, max: 6` per active repository as the default?
-- Warm paths are opt-in per pool. Start with Barge's own repository as the
-  first pool and widen after it works?
+Tom, 2026-11-20, approving this design:
+
+- Pool sizes default to `warm: 2, max: 6` per active repository.
+- Barge's own repository is the first pool; widen to other repositories after
+  it works.
