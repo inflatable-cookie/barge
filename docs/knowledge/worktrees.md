@@ -22,9 +22,10 @@ mechanic is a small git module.
 - **A worktree is a root** in that area: a `git worktree add` from one shared
   bare clone of the repository, kept in the pool. Barge owns the clone and
   every worktree.
-- **A lease is a hold** on that root. The hold is inherited by the agent's
-  child processes, so a root is busy for exactly as long as something from the
-  lease is still running. Barge never scans or kills processes to find out.
+- **A lease reserves a root** until it is returned. A durable record keeps
+  the root assigned between runs, and a pin protects it from eviction.
+  Consumers take cooperative holds while they use the root. Return requires
+  an exclusive hold before it can reset the checkout.
 - **Eviction** is the class's LRU rule through `evict` and trash, as for any
   expendable area. A leased root is never evicted.
 
@@ -216,12 +217,11 @@ barge worktree return --lease <id> [--request <id>] [--disposable] [--json]
 barge worktree status [--repo <origin>] [--json]
 ```
 
-Where step 1 departs from the text above, or fills a gap:
+Implementation details and differences from the approved design:
 
-- **A lease is a record and a pin.** The record reserves the root between runs,
-  and the pin keeps prune and eviction away from it. A hold cannot outlive the
-  CLI call that took it, so holds stay with consumers. Return takes an exclusive
-  hold to fence the root while it resets.
+- **Lease reservations use a record and a pin.** The allocation must survive
+  the CLI call that created it. Holds live as long as a process keeps their
+  file descriptors open.
 - **The pool declares its origin.** `repo` is the canonical identity, and
   `origin` is the URL the clone fetches from. A local path or an scp-style URL
   cannot be fetched from its identity alone.
