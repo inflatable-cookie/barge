@@ -610,6 +610,21 @@ describe("Machines", () => {
     expect(screen.getByText(detail)).toBeInTheDocument();
   });
 
+  it("does not offer a registered machine under Found on network when discovery reconciles it", async () => {
+    // Tom, 2026-11-20: bazzite is registered before discovery existed (hostname
+    // bazzite.local, no ID yet) and the browse finds it at 192.168.1.55. Discovery
+    // reconciles the two, so the window gets no found machine to offer.
+    const api = fixture();
+    vi.mocked(api.machines).mockResolvedValue([awake()]);
+    vi.mocked(api.discoverMachines).mockResolvedValue([]);
+    render(App, { props: { api } });
+    const region = await card();
+    expect(within(region).getByText("Awake")).toBeInTheDocument();
+    await waitFor(() => expect(api.discoverMachines).toHaveBeenCalled());
+    expect(screen.queryByText("Found on network")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Add" })).not.toBeInTheDocument();
+  });
+
   it("offers Add by address as a fallback for networks without mDNS", async () => {
     const api = fixture();
     vi.mocked(api.startPair).mockResolvedValue({

@@ -93,6 +93,11 @@ impl DaemonClient {
         self
     }
 
+    /// Connect to a daemon at a discovered address, without authentication.
+    pub fn for_address(address: &str, port: u16) -> Self {
+        Self::at(format!("http://{}:{port}", bracket_host(address)))
+    }
+
     /// Connect to the machine's LAN hostname using a legacy shared key.
     pub fn for_lan(machine: &Machine, key: Vec<u8>) -> Self {
         let host = machine.hostname();
