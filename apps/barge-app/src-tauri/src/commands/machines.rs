@@ -698,6 +698,43 @@ mod tests {
 
     const T0: u64 = 1_000_000;
 
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        let header_end = loop {
+            if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break position + 4;
+            }
+
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(
+                read, 0,
+                "connection closed before request headers completed"
+            );
+            request.extend_from_slice(&buffer[..read]);
+        };
+
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        let body_start = header_end;
+        let body_end = body_start + content_length;
+        let body_received = request.len().saturating_sub(body_start);
+        if body_received < content_length {
+            let old_len = request.len();
+            request.resize(body_end, 0);
+            stream.read_exact(&mut request[old_len..]).unwrap();
+        }
+
+        String::from_utf8(request).unwrap()
+    }
+
     #[test]
     fn a_click_records_a_wait_only_where_the_state_can_predict_one() {
         assert_eq!(clicked("wake", T0), Some(LastAction::wake(T0)));
@@ -755,8 +792,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 2048];
-            let _ = stream.read(&mut request).unwrap();
+            let _request = read_request(&mut stream);
             let body = r#"{"schema":"barge.power-cancel-result/1","cancelled":false}"#;
             write!(
                 stream,
@@ -791,9 +827,7 @@ mod tests {
             let mut code = None;
             for step in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0_u8; 4096];
-                let n = stream.read(&mut buf).unwrap();
-                let text = String::from_utf8_lossy(&buf[..n]);
+                let text = read_request(&mut stream);
                 let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
                 let (status, reply) = if text.starts_with("POST /v1/pair ") {
                     let req: barge_machine::PairRequest = serde_json::from_str(body).unwrap();
@@ -897,9 +931,7 @@ mod tests {
             let server = std::thread::spawn(move || {
                 for _ in 0..2 {
                     let (mut stream, _) = listener.accept().unwrap();
-                    let mut buf = [0_u8; 4096];
-                    let n = stream.read(&mut buf).unwrap();
-                    let text = String::from_utf8_lossy(&buf[..n]);
+                    let text = read_request(&mut stream);
                     let (status, reply) = if text.starts_with("POST /v1/pair ") {
                         (
                             202,
@@ -977,9 +1009,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0_u8; 4096];
-                let n = stream.read(&mut buf).unwrap();
-                let text = String::from_utf8_lossy(&buf[..n]);
+                let text = read_request(&mut stream);
                 let body = if text.starts_with("POST /v1/pair/req-9/approve ") {
                     r#"{"schema":"barge.pair-approved/1","request_id":"req-9","client":{"id":"cid-deck","name":"Deck","paired_at_unix_ms":200}}"#
                 } else if text.starts_with("GET /v1/clients ") {
