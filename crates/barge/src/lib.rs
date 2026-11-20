@@ -32,6 +32,7 @@ mod tool_steps;
 mod trash;
 pub mod volume;
 pub mod workflow;
+pub mod worktree;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

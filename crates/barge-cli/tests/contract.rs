@@ -21,7 +21,7 @@ use support::{
     Fixture,
 };
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// `barge volume register` plus the layout and folders the rest needs.
 fn fixture() -> Fixture {
@@ -306,10 +306,82 @@ fn every_documented_success_document_matches_its_commands_output() {
         "the plan retargets the unrecorded known link"
     );
 
+    // Worktree pools: a placement, a declared pool over a local origin, then a
+    // lease, its read-back, the status and a return, each held to the contract.
+    let placed = fixture.json(&[
+        "layout",
+        "set",
+        "worktrees",
+        "--volume",
+        "Builds",
+        "--path",
+        "worktrees",
+    ]);
+    assert!(placed.status.success(), "{}", stderr(&placed));
+    let origin = fixture.temp.folder("origin").unwrap();
+    let base = worktree_origin(&origin);
+    let origin_text = origin.to_string_lossy().into_owned();
+    let pools = json!({
+        "schema": "barge.worktree-pools/1",
+        "pools": [{ "repo": origin_text.to_ascii_lowercase(), "origin": origin_text, "max": 2 }],
+    });
+    std::fs::write(fixture.state.join("worktree-pools.json"), pools.to_string()).unwrap();
+    let leased = fixture.json(&[
+        "worktree",
+        "lease",
+        "--repo",
+        &origin_text,
+        "--base",
+        &base,
+        "--base-name",
+        "main",
+        "--branch",
+        "task/contract",
+        "--request",
+        "contract-1",
+    ]);
+    assert!(leased.status.success(), "{}", stderr(&leased));
+    let lease_id = parse_document(&leased)["data"]["lease"]["lease_id"]
+        .as_str()
+        .expect("a lease id")
+        .to_string();
+    let read_back = fixture.json(&["worktree", "lease", "get", "--request", "contract-1"]);
+    assert!(read_back.status.success(), "{}", stderr(&read_back));
+    parse_document(&read_back);
+    let status = fixture.json(&["worktree", "status"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    parse_document(&status);
+    let returned = fixture.json(&["worktree", "return", "--lease", &lease_id]);
+    assert!(returned.status.success(), "{}", stderr(&returned));
+    parse_document(&returned);
+
     // The other direction: a documented schema no command produced would let a
     // stale row pass unnoticed.
     let unseen = support::contract().unseen();
     assert!(unseen.is_empty(), "no command produced {unseen:?}");
+}
+
+/// A local origin repository with one commit on `main`. Returns the commit.
+fn worktree_origin(origin: &std::path::Path) -> String {
+    let git = |arguments: &[&str]| -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(origin)
+            .args(arguments)
+            .env("GIT_AUTHOR_NAME", "Barge Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Barge Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {arguments:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    git(&["init", "--quiet", "-b", "main"]);
+    std::fs::write(origin.join("README.md"), "base\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "--quiet", "-m", "base"]);
+    git(&["rev-parse", "HEAD"])
 }
 
 #[test]

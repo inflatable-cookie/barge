@@ -1,7 +1,9 @@
 # Worktree pools
 
-Status: design draft for Tom's sign-off, 2026-11-20, revised after the Nucleus
-planner's review. Nothing here is built.
+Status: step 1 is built (the git module, pools, lease, return and status, with
+the CLI). Tom approved this design on 2026-11-20; what step 1 changed from it is
+in [step 1 as built](#step-1-as-built). Warm-path key checks and `prune` are
+step 2.
 
 Barge keeps a warm pool of git worktrees per repository on Stash and leases
 them to agents. An agent starts in a checkout that already has its dependencies
@@ -125,13 +127,16 @@ At return, Barge removes only what it can name:
 
 ## Pools
 
-A pool is declared once per repository in the account layout:
+A pool is declared once per repository in `worktree-pools.json`, in the account
+state directory:
 
 ```json
-{ "repo": "github.com/inflatable-cookie/barge",
-  "warm": 2, "max": 6,
-  "warm_paths": [{ "path": "apps/barge-app/node_modules", "keys": ["apps/barge-app/bun.lock"] }],
-  "disposable": ["apps/barge-app/dist", ".effigy"] }
+{ "schema": "barge.worktree-pools/1",
+  "pools": [{ "repo": "github.com/inflatable-cookie/barge",
+              "origin": "https://github.com/inflatable-cookie/barge.git",
+              "warm": 2, "max": 6,
+              "warm_paths": [{ "path": "apps/barge-app/node_modules", "keys": ["apps/barge-app/bun.lock"] }],
+              "disposable": ["apps/barge-app/dist", ".effigy"] }] }
 ```
 
 - `warm` trees are kept ready; `max` caps the pool. Beyond `max`, a lease
@@ -177,12 +182,61 @@ whole surface; holds do the coordination), and running installs.
 
 ## Build order
 
-1. Git module, pools, `lease`, `return`, `lease get`, `status`, with tests
-   against real temporary repositories.
+1. Built: git module, pools, `lease`, `return`, `lease get`, `status`, with tests
+   against real temporary repositories. See [step 1 as built](#step-1-as-built).
 2. Warm paths with key-file validation, and `prune`.
 3. Nucleus integration: the Nucleus planner briefs its allocator change
    against this contract.
 4. Later: pairing a leased worktree with a warm Oxide slot.
+
+## Step 1 as built
+
+The code is `crates/barge/src/worktree/`, the CLI is `barge worktree`, and the
+tests are `crates/barge/tests/worktrees.rs`, which build their own origin
+repositories in temporary folders.
+
+On disk, in the account state directory:
+
+- `worktree-pools.json` (`barge.worktree-pools/1`) declares the pools. Barge
+  reads it and never writes it. Step 1 has no declare verb, so the operator
+  writes the file.
+- `worktree-leases/<lease-id>.json` (`barge.worktree-lease/1`) is one durable
+  record per lease, published before the call replies.
+
+On the volume, the `worktrees` class placement gives the volume and the path.
+Each pool is the area `worktrees/<slug>` at `<path>/<slug>`, with its bare clone
+at `<area>/.barge/clone.git`. Each root is `wt-<id>/`, and its checkout is
+`wt-<id>/checkout`.
+
+```
+barge worktree lease --repo <origin> --base <sha> --branch <name> --request <id>
+  [--base-name <name>] [--label <task>] [--wait <seconds>] [--json]
+barge worktree lease get (--request <id> | --lease <id>) [--json]
+barge worktree return --lease <id> [--request <id>] [--disposable] [--json]
+barge worktree status [--repo <origin>] [--json]
+```
+
+Where step 1 departs from the text above, or fills a gap:
+
+- **A lease is a record and a pin.** The record reserves the root between runs,
+  and the pin keeps prune and eviction away from it. A hold cannot outlive the
+  CLI call that took it, so holds stay with consumers. Return takes an exclusive
+  hold to fence the root while it resets.
+- **The pool declares its origin.** `repo` is the canonical identity, and
+  `origin` is the URL the clone fetches from. A local path or an scp-style URL
+  cannot be fetched from its identity alone.
+- **`--request` on return is optional.** When it is given, it must match the
+  lease's request.
+- **`warm` is recorded, not enforced.** Roots are made on demand, up to `max`.
+  Keeping `warm` trees ready belongs to `prune`, in step 2.
+- **Pool roots do not count toward the volume reserve**, so reserve pruning does
+  not evict them. An operator can still evict a free root by hand. The next lease
+  clears the stale git metadata for it.
+- **An interrupted return is finished without a second preflight.** The first
+  preflight accepted the work. The root stays out of the pool until the next
+  return finishes it.
+- **Warm paths are kept on return.** Their key files are stored, but not checked
+  until step 2.
 
 ## Rulings
 

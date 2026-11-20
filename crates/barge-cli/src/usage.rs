@@ -40,6 +40,13 @@ usage: barge [--json] <command>
                                           write the AGENTS.md scratch block;
                                           --check reports it and writes nothing
   prune --volume V [--dry-run]            evict idle roots to meet policy
+  worktree lease --repo R --base SHA --branch B --request ID
+    [--base-name N] [--label L] [--wait SECONDS]
+                                          lease a checkout on a new branch
+  worktree lease get --request ID | --lease ID
+  worktree return --lease ID [--request ID] [--disposable]
+                                          reset the checkout and free its root
+  worktree status [--repo R]              pools, roots and the leases on them
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
   machine add --name N --hostname H --mac MAC [--tailscale-name N]
