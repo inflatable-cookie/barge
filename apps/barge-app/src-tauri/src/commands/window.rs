@@ -74,8 +74,6 @@ pub fn show(app: &tauri::AppHandle, view: Option<&'static str>) -> Result<(), St
 /// the main thread through the event loop instead of forging a thread marker.
 #[cfg(target_os = "macos")]
 pub(crate) fn refresh_dock_icon(app: &tauri::AppHandle) {
-    // Best effort and asynchronous: the window is already opening, so a dead
-    // event loop only loses the icon, never the window.
     // The Dock creates the tile asynchronously after a switch to Regular, so
     // an icon set in the same turn can land before the tile exists. Set it
     // now and once more shortly after.
@@ -89,6 +87,8 @@ pub(crate) fn refresh_dock_icon(app: &tauri::AppHandle) {
 
 #[cfg(target_os = "macos")]
 fn set_dock_icon(app: &tauri::AppHandle) {
+    // Best effort and asynchronous: the window is already opening, so a dead
+    // event loop only loses the icon, never the window.
     let _ = app.run_on_main_thread(|| {
         use objc2::{AllocAnyThread, MainThreadMarker};
         use objc2_app_kit::{NSApplication, NSImage};
