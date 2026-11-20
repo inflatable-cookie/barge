@@ -25,7 +25,7 @@ pub fn show(app: &tauri::AppHandle, view: Option<&'static str>) -> Result<(), St
     {
         app.set_activation_policy(tauri::ActivationPolicy::Regular)
             .map_err(|error| error.to_string())?;
-        refresh_dock_icon();
+        refresh_dock_icon(app);
     }
     if let Some(window) = app.get_webview_window("main") {
         if let Some(view) = view {
@@ -68,23 +68,33 @@ pub fn show(app: &tauri::AppHandle, view: Option<&'static str>) -> Result<(), St
 /// prefers the `.icns`) on every switch to Regular covers dev and release
 /// alike; a bundled app already has the icon, and setting it again is
 /// harmless.
+///
+/// `show` reaches here from worker threads (the tray menu via
+/// `spawn_blocking`, Reopen via an async spawn), so the AppKit work hops to
+/// the main thread through the event loop instead of forging a thread marker.
 #[cfg(target_os = "macos")]
-fn refresh_dock_icon() {
-    use objc2::{AllocAnyThread, MainThreadMarker};
-    use objc2_app_kit::{NSApplication, NSImage};
-    use objc2_foundation::NSData;
+fn refresh_dock_icon(app: &tauri::AppHandle) {
+    // Best effort and asynchronous: the window is already opening, so a dead
+    // event loop only loses the icon, never the window.
+    let _ = app.run_on_main_thread(|| {
+        use objc2::{AllocAnyThread, MainThreadMarker};
+        use objc2_app_kit::{NSApplication, NSImage};
+        use objc2_foundation::NSData;
 
-    const ICON_ICNS: &[u8] = include_bytes!("../../icons/icon.icns");
-    // SAFETY: `show` runs on the main thread: Tauri invokes commands and the
-    // setup closure on the main thread, and AppKit outlives this call.
-    let mtm = unsafe { MainThreadMarker::new_unchecked() };
-    let app = NSApplication::sharedApplication(mtm);
-    let data = NSData::with_bytes(ICON_ICNS);
-    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
-        // SAFETY: `app` and `image` are live AppKit objects on the main
-        // thread; passing `Some` only sets the icon, never clears it.
-        unsafe { app.setApplicationIconImage(Some(&image)) };
-    }
+        const ICON_ICNS: &[u8] = include_bytes!("../../icons/icon.icns");
+        // The event loop runs Task closures on the main thread, so `Some`
+        // proves main-thread execution; `None` skips rather than forging one.
+        if let Some(mtm) = MainThreadMarker::new() {
+            let app = NSApplication::sharedApplication(mtm);
+            let data = NSData::with_bytes(ICON_ICNS);
+            if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+                // SAFETY: `app` and `image` are live AppKit objects on the
+                // main thread (proven by the marker above); passing `Some`
+                // only sets the icon, never clears it.
+                unsafe { app.setApplicationIconImage(Some(&image)) };
+            }
+        }
+    });
 }
 
 #[tauri::command]
