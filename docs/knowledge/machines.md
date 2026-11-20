@@ -126,6 +126,71 @@ exit 2 — and is refused where the machine is built.
   outside the LAN is out of scope until a relay exists, for example another
   always-on device.
 
+## Discovery and pairing
+
+Status: design draft for Tom's sign-off, 2026-11-20. Nothing here is built.
+
+Tom, 2026-11-20: for release, the Steam Deck plugin and the desktop app find
+machines on the network themselves, with no manual entry of hosts, MACs or
+keys. Today a client needs the host, port, MAC and broadcast address typed in,
+plus the LAN key that `barged pair` printed, and pairing again unpairs every
+client.
+
+### Discovery
+
+- `barged` advertises `_barged._tcp` over mDNS (DNS-SD) on its LAN address.
+  TXT records carry its machine ID (a stable random ID made at first start),
+  its display name, its mode (`lan` or `tailscale`) and its protocol version.
+  On Bazzite it registers through Avahi, which ships with the OS; no new
+  service is installed.
+- `GET /v1/state` also reports the machine ID, the MAC of the interface it
+  binds, and that interface's broadcast address. A client records them at
+  pairing, so Wake still works when the machine is off and not advertising.
+- Clients browse `_barged._tcp` themselves and list each machine they find
+  that they haven't paired, with an Add button. They can't lean on the
+  system resolver: SteamOS doesn't resolve `.local` names (found setting up
+  the Deck on 2026-11-20), so the plugin carries its own mDNS browser and
+  connects to the address it found. A paired machine is matched by ID, so an
+  address change after a DHCP renewal updates itself.
+
+### Pairing
+
+Each client gets its own key, so adding or removing one never touches the
+others. The shared key becomes the first entry of the list on upgrade, so the
+Mac keeps working.
+
+1. The client sends `POST /v1/pair` with its name and an X25519 public key.
+   The daemon replies with its own public key and holds the request open for
+   two minutes.
+2. Both sides derive the shared key with X25519 and HKDF, and each shows a
+   six-digit code computed from both public keys.
+3. Someone approves the request on a device that's already trusted after
+   checking the codes match. Matching codes prove no one on the LAN swapped
+   the keys in between. The daemon then saves the client's key and name.
+
+Where approval happens:
+
+- **From a paired client.** The Mac app shows "Steam Deck wants to pair" with
+  the code, and Approve or Deny. This is the normal route.
+- **On the PC itself,** for the first client, when nothing is paired yet:
+  `barged pair --approve` in a terminal lists pending requests with their
+  codes. This is the one-time bootstrap and replaces today's printed key.
+
+- `barge machine clients <name>` and the app's details dialog list a machine's
+  paired clients and can revoke one.
+- Requests stay HMAC-signed as today, with each client's own key; the daemon
+  picks the key by a client ID header.
+- Out of scope: discovery across networks (Tailscale has its own names) and
+  pairing over Tailscale, which already identifies callers through `whois`.
+
+### Questions for Tom
+
+- Approval from the Mac app as the normal route, with the PC terminal only for
+  the first client: is that right, or do you want approval on the PC's screen
+  (a notification in Gaming Mode) as well?
+- Per-client keys replacing the single shared key: OK to migrate the current
+  key into the list automatically?
+
 ## UI
 
 The Barge app is specced in [app](app.md): a menu-bar app built with Tauri,
@@ -152,6 +217,8 @@ Poodle and Longhorn, covering Machines and Storage in its first release.
    [install guide](../install-barged.md) for Bazzite.
 3. **Built:** LAN pairing and authenticated requests, with no Tailscale required.
 4. Tailscale on both machines, once Tom is ready for the sign-ins.
+4a. Discovery and per-client pairing, designed in
+   [discovery and pairing](#discovery-and-pairing), once Tom signs it off.
 5. The Barge app: see [app](app.md#build-order).
 6. Retire MoonDeck Buddy on the PC. This changes host software, so it needs
    Tom's go-ahead. The Steam Deck needs a `barged` client first, or loses
