@@ -49,6 +49,12 @@ Create `~/.config/barged/config.json`. For LAN mode use the PC's LAN address:
 }
 ```
 
+`barged` binds exactly this address, so it stops starting if the PC's LAN
+address changes. Give the PC a DHCP reservation on the router. Bazzite's default
+firewall zone (FedoraWorkstation) already allows high ports such as 9777; on
+other distributions, open the port, for example with
+`sudo firewall-cmd --add-port=9777/tcp --permanent && sudo firewall-cmd --reload`.
+
 Run `~/.local/bin/barged pair --config ~/.config/barged/config.json` on the PC.
 Copy the printed key securely; it is shown only then. Running pair again replaces
 it and unpairs all clients. On the Mac, after registering the machine below,
