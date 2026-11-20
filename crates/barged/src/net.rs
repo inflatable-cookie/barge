@@ -121,10 +121,24 @@ fn lookup_via_getifaddrs(target: IpAddr) -> InterfaceInfo {
     }
 }
 
+/// The broadcast address field: `ifa_ifu` on Linux (a union with the
+/// destination address), `ifa_dstaddr` on the BSDs and macOS.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn broadcast_sockaddr(ifa: &libc::ifaddrs) -> *mut libc::sockaddr {
+    ifa.ifa_ifu
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn broadcast_sockaddr(ifa: &libc::ifaddrs) -> *mut libc::sockaddr {
+    ifa.ifa_dstaddr
+}
+
 fn extract_broadcast(ifa: &libc::ifaddrs, addr: Ipv4Addr) -> Option<Ipv4Addr> {
-    if (ifa.ifa_flags & libc::IFF_BROADCAST as u32) != 0 && !ifa.ifa_dstaddr.is_null() {
-        // SAFETY: `ifa_dstaddr` is valid for a broadcast interface in `getifaddrs`.
-        let bcast = unsafe { &*(ifa.ifa_dstaddr as *const libc::sockaddr_in) };
+    let broadcast_addr = broadcast_sockaddr(ifa);
+    if (ifa.ifa_flags & libc::IFF_BROADCAST as u32) != 0 && !broadcast_addr.is_null() {
+        // SAFETY: for a broadcast interface `getifaddrs` stores its broadcast
+        // address in this field, which is null-checked above.
+        let bcast = unsafe { &*(broadcast_addr as *const libc::sockaddr_in) };
         if i32::from(bcast.sin_family) == libc::AF_INET {
             return Some(Ipv4Addr::from(u32::from_be(bcast.sin_addr.s_addr)));
         }

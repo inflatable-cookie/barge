@@ -106,6 +106,11 @@ systemctl --user daemon-reload
 systemctl --user enable --now barged
 ```
 
+The unit keeps the home folder read-only except `~/.config/barged`, where
+`barged` keeps its paired clients and machine ID. After upgrading from a
+version without that line, copy the unit again and run
+`systemctl --user daemon-reload` before restarting.
+
 The PC should be controllable whether or not someone is logged in at the
 desktop, so let the user's services run without a session:
 
