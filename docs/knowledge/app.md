@@ -68,6 +68,10 @@ After using the cards once more (PR #106) Tom asked for:
     `RunEvent::Reopen`);
 - **Window on demand:** also opened from the menu. The app shows a Dock icon
   only while the window is open (`ActivationPolicy::Accessory` otherwise).
+  An unbundled dev build has no bundle icon, so the app sets the Dock icon
+  itself on every switch to Regular, again shortly after (the Dock creates the
+  tile asynchronously), and once more when AppKit has finished launching,
+  which otherwise resets it to the generic executable icon.
 - **Launch at login** is a setting, off by default.
 
 ### Window
