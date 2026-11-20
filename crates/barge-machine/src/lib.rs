@@ -1,18 +1,27 @@
-//! Machine registry, Wake-on-LAN, daemon protocol and client.
+//! Machine registry, Wake-on-LAN, mDNS discovery, pairing and daemon client.
 #![deny(missing_docs)]
 
 pub mod auth;
 pub mod daemon;
+pub mod discover;
+pub mod pair;
 mod protocol;
 mod registry;
 mod state;
 mod wol;
 pub use daemon::{request_power, AssumeYes, Confirmation, DaemonClient};
-pub use protocol::{
-    Cancel, CancelResult, DaemonError, Pending, PowerActionKind, PowerRequest, PowerResult,
-    PowerState, State,
+pub use discover::{
+    browse_at, match_registered, DiscoveredMachine, MdnsBrowser, UdpMdnsBrowser,
+    DEFAULT_DISCOVER_TIMEOUT, MDNS_SERVICE_TYPE,
 };
-pub use registry::{Machine, Registry};
+pub use pair::{parse_public_key, verification_code, DerivedPairing, KeyPair, PairRole};
+pub use protocol::{
+    Cancel, CancelResult, ClientList, ClientRevoked, DaemonError, PairApproved, PairDecision,
+    PairDenied, PairRequest, PairResponse, PairStatus, PairStatusResponse, PairedClient, Pending,
+    PendingPairList, PendingPairRequest, PowerActionKind, PowerRequest, PowerResult, PowerState,
+    State,
+};
+pub use registry::{sanitize_machine_name, ClientCredentials, Machine, Registry};
 #[cfg(not(unix))]
 compile_error!("barge-machine requires Unix");
 
@@ -22,7 +31,7 @@ pub use wol::{magic_packet, parse_mac, wake, DatagramSender, UdpSender};
 /// The schema of `machines.json`.
 pub const REGISTRY_SCHEMA: &str = "barge.machines/1";
 /// The schema of the state `barged` reports.
-pub const STATE_SCHEMA: &str = "barge.machine-state/1";
+pub const STATE_SCHEMA: &str = "barge.machine-state/2";
 /// The schema of a power request sent to `barged`.
 pub const POWER_REQUEST_SCHEMA: &str = "barge.power-request/1";
 /// The schema of `barged`'s acceptance of a power request.
@@ -31,6 +40,24 @@ pub const POWER_RESULT_SCHEMA: &str = "barge.power-result/1";
 pub const CANCEL_SCHEMA: &str = "barge.power-cancel/1";
 /// The schema of `barged`'s answer to a cancel.
 pub const CANCEL_RESULT_SCHEMA: &str = "barge.power-cancel-result/1";
+/// The schema of a pairing initiation request sent to `barged`.
+pub const PAIR_REQUEST_SCHEMA: &str = "barge.pair-request/1";
+/// The schema of `barged`'s response to `POST /v1/pair`.
+pub const PAIR_RESPONSE_SCHEMA: &str = "barge.pair-response/1";
+/// The schema of `barged`'s response to `GET /v1/pair/<id>`.
+pub const PAIR_STATUS_SCHEMA: &str = "barge.pair-status/1";
+/// The schema of `barged`'s response to `GET /v1/pair/pending`.
+pub const PAIR_PENDING_SCHEMA: &str = "barge.pair-pending/1";
+/// The schema of an approve/deny decision sent to `barged`.
+pub const PAIR_DECISION_SCHEMA: &str = "barge.pair-decision/1";
+/// The schema of `barged`'s response to `POST /v1/pair/<id>/approve`.
+pub const PAIR_APPROVED_SCHEMA: &str = "barge.pair-approved/1";
+/// The schema of `barged`'s response to `POST /v1/pair/<id>/deny`.
+pub const PAIR_DENIED_SCHEMA: &str = "barge.pair-denied/1";
+/// The schema of `barged`'s response to `GET /v1/clients`.
+pub const CLIENTS_SCHEMA: &str = "barge.clients/1";
+/// The schema of `barged`'s response to `DELETE /v1/clients/<id>`.
+pub const CLIENT_REVOKED_SCHEMA: &str = "barge.client-revoked/1";
 /// The schema of the error document every `barged` refusal carries.
 pub const DAEMON_ERROR_SCHEMA: &str = "barge.daemon-error/1";
 pub(crate) const DEFAULT_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
@@ -208,6 +235,14 @@ mod tests {
     }
 
     #[test]
+    fn wake_refuses_discovered_machine_without_mac() {
+        let machine = Machine::discovered("mid-1", "pc", "192.168.1.20", 9777).unwrap();
+        let sender = FakeSender::default();
+        let error = wake(&machine, &sender).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Refused);
+    }
+
+    #[test]
     fn removing_a_machine_removes_its_key_before_the_name_can_be_reused() {
         let (_temp, registry) = registry();
         let machine = Machine::new("pc", "pc.local", "00:11:22:33:44:ff").unwrap();
@@ -343,18 +378,46 @@ mod tests {
     fn protocol_documents_round_trip_with_schema() {
         let docs = [
             serde_json::to_value(
-                State::new(PowerState::Awake, 42).with_pending(Some(Pending {
-                    action: PowerActionKind::Sleep,
-                    deadline_unix_ms: 15_042,
-                })),
+                State::new(PowerState::Awake, 42)
+                    .with_machine_id("mid-1")
+                    .with_mac(Some("00:11:22:33:44:ff".to_string()))
+                    .with_broadcast(Some(Ipv4Addr::new(192, 168, 1, 255)))
+                    .with_pending(Some(Pending {
+                        action: PowerActionKind::Sleep,
+                        deadline_unix_ms: 15_042,
+                    })),
             )
             .unwrap(),
-            serde_json::to_value(State::new(PowerState::Asleep, 42)).unwrap(),
+            serde_json::to_value(State::new(PowerState::Asleep, 42).with_machine_id("mid-1"))
+                .unwrap(),
             serde_json::to_value(PowerRequest::new(PowerActionKind::Shutdown, 15)).unwrap(),
             serde_json::to_value(PowerResult::new(PowerActionKind::Restart, 15_000)).unwrap(),
             serde_json::to_value(Cancel::default()).unwrap(),
             serde_json::to_value(CancelResult::new(true)).unwrap(),
             serde_json::to_value(DaemonError::new("not_authorized", "no")).unwrap(),
+            serde_json::to_value(PairRequest::new("MacBook", "aa".repeat(32))).unwrap(),
+            serde_json::to_value(PairResponse::new("req-1", "bb".repeat(32), 120_042)).unwrap(),
+            serde_json::to_value(PairStatusResponse::new(
+                "req-1",
+                PairStatus::Approved,
+                Some("cid-1".to_string()),
+            ))
+            .unwrap(),
+            serde_json::to_value(PendingPairList::new(vec![PendingPairRequest {
+                request_id: "req-1".to_string(),
+                client_name: "MacBook".to_string(),
+                code: "042719".to_string(),
+                created_at_unix_ms: 42,
+                expires_at_unix_ms: 120_042,
+            }]))
+            .unwrap(),
+            serde_json::to_value(ClientList::new(vec![PairedClient {
+                id: "cid-1".to_string(),
+                name: "MacBook".to_string(),
+                paired_at_unix_ms: 100,
+            }]))
+            .unwrap(),
+            serde_json::to_value(ClientRevoked::new("cid-1")).unwrap(),
         ];
         for document in &docs {
             assert!(document.get("schema").is_some());
@@ -368,6 +431,9 @@ mod tests {
         let error: DaemonError = serde_json::from_value(docs[6].clone()).unwrap();
         assert_eq!(state.schema, STATE_SCHEMA);
         assert_eq!(state.observed_at_unix_ms, 42);
+        assert_eq!(state.machine_id, "mid-1");
+        assert_eq!(state.mac.as_deref(), Some("00:11:22:33:44:ff"));
+        assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 168, 1, 255)));
         assert_eq!(
             state.pending,
             Some(Pending {

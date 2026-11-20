@@ -136,7 +136,7 @@ pub fn stub_daemon_routes(routes: Routes) -> (u16, Arc<Mutex<Vec<String>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&requests);
     thread::spawn(move || {
-        for stream in listener.incoming().take(4) {
+        for stream in listener.incoming().take(32) {
             let Ok(mut stream) = stream else { break };
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))

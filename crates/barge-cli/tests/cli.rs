@@ -328,7 +328,7 @@ fn machine_sleep_sends_at_once_and_status_reports_what_the_daemon_said() {
         (
             "/v1/state",
             200,
-            r#"{"schema":"barge.machine-state/1","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042}}"#,
+            r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042},"machine_id":"mid-1"}"#,
         ),
     ]);
     register_machine(&fixture, port);
@@ -716,6 +716,7 @@ fn usage_and_passive_commands_do_not_create_state() {
     }
     for args in [
         vec!["status"],
+        vec!["machine", "discover", "--timeout", "0"],
         vec!["machine", "status", "missing"],
         vec!["volume", "list"],
         vec!["volume", "status", "missing"],
@@ -752,12 +753,28 @@ fn usage_and_passive_commands_do_not_create_state() {
 
 #[cfg(unix)]
 #[test]
-fn machine_pair_reads_stdin_and_unpair_removes_owner_only_key() {
-    use std::io::Write;
+fn machine_pair_writes_owner_only_credentials_and_unpair_removes_them() {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     let temp = barge::testing::TempDir::new("cli-pair").unwrap();
     let state = temp.path();
+    let (port, _requests) = stub_daemon_routes(vec![
+        (
+            "/v1/pair/req-1",
+            200,
+            r#"{"schema":"barge.pair-status/1","request_id":"req-1","status":"approved","client_id":"cid-1"}"#,
+        ),
+        (
+            "/v1/pair",
+            202,
+            r#"{"schema":"barge.pair-response/1","request_id":"req-1","public_key":"de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f","expires_at_unix_ms":9999999999999}"#,
+        ),
+        (
+            "/v1/state",
+            200,
+            r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-1","mac":"00:11:22:33:44:ff","broadcast":"127.0.0.1"}"#,
+        ),
+    ]);
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_barge"))
             .env("BARGE_STATE_DIR", state)
@@ -771,26 +788,20 @@ fn machine_pair_reads_stdin_and_unpair_removes_owner_only_key() {
         "--name",
         "pc",
         "--hostname",
-        "pc.local",
+        "127.0.0.1",
         "--mac",
-        "00:11:22:33:44:ff"
+        "00:11:22:33:44:ff",
+        "--daemon-port",
+        &port.to_string(),
+        "--broadcast",
+        "127.0.0.1",
     ])
     .status
     .success());
     assert!(!run(&["machine", "pair", "pc", "1234"]).status.success());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_barge"))
-        .env("BARGE_STATE_DIR", state)
-        .args(["machine", "pair", "pc"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("{}\n", "ab".repeat(32)).as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
+    let paired = run(&["machine", "pair", "pc", "--client-name", "MacBook"]);
+    assert!(paired.status.success(), "{}", stderr(&paired));
+    assert!(stdout(&paired).contains("pairing code for pc:"));
     let path = state.join("machine-keys/pc.key");
     assert_eq!(
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,

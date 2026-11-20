@@ -51,10 +51,13 @@ usage: barge [--json] <command>
   worktree status [--repo R]              pools, roots and the leases on them
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
+  machine discover [--timeout SECONDS]
+  machine add <id-or-name> [--name N] [--timeout SECONDS]
   machine add --name N --hostname H --mac MAC [--tailscale-name N]
     [--broadcast IPv4] [--port PORT] [--daemon-port PORT]
   machine list | remove <name> | wake <name>
-  machine pair <name> | unpair <name>
+  machine pair <name> [--client-name N] | unpair <name>
+  machine clients <name> | revoke <name> <client-id>
   machine status <name>                   what barged on that machine reports
   machine sleep <name> [--delay SECONDS]  start the countdown at once
   machine restart <name> [--delay S] [--yes]

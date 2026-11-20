@@ -85,7 +85,7 @@ impl Entry {
         MachineView {
             name: machine.name().to_owned(),
             hostname: machine.hostname().to_owned(),
-            mac: machine.mac().to_owned(),
+            mac: machine.mac().unwrap_or("").to_owned(),
             mode: if self.lan { "lan" } else { "tailscale" },
             address: if self.lan {
                 machine.hostname()
@@ -241,8 +241,12 @@ pub fn client(
     registry: &Registry,
     machine: &Machine,
 ) -> barge_machine::Result<barge_machine::DaemonClient> {
-    match registry.key(machine.name())? {
-        Some(key) => Ok(barge_machine::DaemonClient::for_lan(machine, key)),
+    match registry.credentials(machine.name())? {
+        Some(creds) => Ok(barge_machine::DaemonClient::for_lan_client(
+            machine,
+            creds.client_id,
+            creds.key,
+        )),
         None => Ok(barge_machine::DaemonClient::for_machine(machine)),
     }
 }
@@ -597,7 +601,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 2048];
             let _ = stream.read(&mut request).unwrap();
-            let body = r#"{"schema":"barge.machine-state/1","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042}}"#;
+            let body = r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042},"machine_id":"mid-1"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

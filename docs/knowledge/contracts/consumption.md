@@ -72,12 +72,15 @@ below read `_name`, `_key` and `_state`.
 | `barge.doctor/1` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]` | doctor |
 | `barge.init/1` | `project: string`, `path: string`, `action: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state` | init |
 | `barge.init-check/1` | `project: string`, `path: string`, `block_state: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state`, `diff: [string]` | init --check |
+| `barge.machine-discover/1` | `discovered: [discovered-machine]` | machine discover |
 | `barge.machine/1` | `machine: machine` | machine add |
 | `barge.machine-list/1` | `machines: [machine]` | machine list |
 | `barge.machine-removed/1` | `removed: machine` | machine remove |
 | `barge.machine-wake/1` | `machine_name: string`, `destination: string`, `bytes_sent: int` | machine wake |
-| `barge.machine-paired/1` | `machine_name: string` | machine pair |
+| `barge.machine-paired/1` | `machine_name: string`, `client_id: string` | machine pair |
 | `barge.machine-unpaired/1` | `machine_name: string` | machine unpair |
+| `barge.machine-clients/1` | `machine_name: string`, `clients: [paired-client]` | machine clients |
+| `barge.machine-client-revoked/1` | `machine_name: string`, `client_id: string` | machine revoke |
 | `barge.machine-status/1` | `machine_name: string`, `mode: string`, `machine_state: machine-state` | machine status |
 | `barge.machine-power/1` | `machine_name: string`, `action: string`, `deadline_unix_ms: int` | machine sleep, restart, shutdown |
 | `barge.machine-cancel/1` | `machine_name: string`, `cancelled: bool` | machine cancel |
@@ -93,8 +96,7 @@ is one of `refused`, `not_found`, `usage`, `io`, `unknown_state`,
 `unsupported`. [Architecture](../architecture.md#cli) owns the exit codes each
 kind maps to. `--json` precedes the command and selects the document form. `env` emits
 shell assignments and refuses `--json`. A move or bind plan is read from a file
-or from standard input (`-`). The key for `machine pair` is read from standard
-input only. Input that cannot be read is `usage`.
+or from standard input (`-`). Input that cannot be read is `usage`.
 
 ## Shapes
 
@@ -138,8 +140,10 @@ input only. Input that cannot be read is `usage`.
 | `move-layout` | `class: string`, `before: placement`, `after: placement` |
 | `move-area` | `before: area-record`, `after: area-record` |
 | `area-record` | `schema: string`, `namespace: string`, `name: string`, `volume: string`, `folder?: string`, `absent: absent`, `soft_cap_bytes?: int`, `counts_toward_reserve: bool` |
-| `machine` | `name: string`, `hostname: string`, `tailscale_name: string?`, `mac: string`, `broadcast: string`, `port: int`, `daemon_port: int` |
-| `machine-state` | `schema: string`, `power: string`, `observed_at_unix_ms: int`, `pending?: pending` |
+| `machine` | `id?: string`, `name: string`, `hostname: string`, `tailscale_name: string?`, `mac: string?`, `broadcast: string`, `port: int`, `daemon_port: int` |
+| `discovered-machine` | `id: string`, `name: string`, `mode: string`, `protocol_version: string`, `address: string`, `port: int`, `registered_as: string?` |
+| `paired-client` | `id: string`, `name: string`, `paired_at_unix_ms: int` |
+| `machine-state` | `schema: string`, `power: string`, `observed_at_unix_ms: int`, `pending?: pending`, `machine_id: string`, `mac?: string`, `broadcast?: string` |
 | `pending` | `action: string`, `deadline_unix_ms: int` |
 | `worktree-lease` | `schema: string`, `lease_id: string`, `request: string`, `repo: string`, `base: string`, `base_name?: string`, `branch: string`, `label?: string`, `pool: string`, `root_id: string`, `path: string`, `head: string`, `state: string`, `disposable: bool`, `created_unix_ms: int`, `updated_unix_ms: int` |
 | `worktree-pool` | `repo: string`, `pool: string`, `warm: int`, `max: int`, `location?: string`, `unavailable?: string`, `roots: [worktree-root]` |

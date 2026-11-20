@@ -82,9 +82,15 @@ impl DatagramSender for UdpSender {
 
 /// Send the magic packet for `machine` and report the address it went to.
 pub fn wake(machine: &Machine, sender: &impl DatagramSender) -> Result<(SocketAddr, usize)> {
+    let mac = machine.mac().ok_or_else(|| {
+        Error::refused(format!(
+            "machine {:?} has no MAC address recorded yet; pair it first",
+            machine.name()
+        ))
+    })?;
     let destination = SocketAddr::from((machine.broadcast(), machine.port()));
     let sent = sender
-        .send_to(&magic_packet(parse_mac(machine.mac())?), destination)
+        .send_to(&magic_packet(parse_mac(mac)?), destination)
         .map_err(|e| {
             Error::new(
                 ErrorKind::Io,

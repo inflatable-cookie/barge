@@ -1,0 +1,1 @@
+Added mDNS (`_barged._tcp`) advertisement, per-client X25519 + HKDF pairing with six-digit verification codes, desktop notification and localhost/paired-client approval routes, legacy shared-key migration, `machine-state/2` (ID, MAC, broadcast), and CLI `discover`/`add`/`pair`/`clients`/`revoke` commands.

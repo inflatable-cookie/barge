@@ -1,4 +1,4 @@
-//! The client for `barged`: three calls over plain HTTP and the confirmation
+//! The client for `barged`: HTTP calls over plain HTTP and the confirmation
 //! rule the CLI's human path applies.
 //!
 //! Transport failures are [`ErrorKind::Unreachable`] and never collapse into a
@@ -12,21 +12,35 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::{
-    Cancel, CancelResult, DaemonError, Error, ErrorKind, Machine, PowerActionKind, PowerRequest,
-    PowerResult, Result, State, CANCEL_RESULT_SCHEMA, MAX_POWER_DELAY_S, POWER_RESULT_SCHEMA,
-    STATE_SCHEMA,
+    Cancel, CancelResult, ClientList, ClientRevoked, DaemonError, Error, ErrorKind, Machine,
+    PairApproved, PairDecision, PairDenied, PairRequest, PairResponse, PairStatusResponse,
+    PendingPairList, PowerActionKind, PowerRequest, PowerResult, Result, State,
+    CANCEL_RESULT_SCHEMA, CLIENTS_SCHEMA, CLIENT_REVOKED_SCHEMA, MAX_POWER_DELAY_S,
+    PAIR_APPROVED_SCHEMA, PAIR_DENIED_SCHEMA, PAIR_PENDING_SCHEMA, PAIR_RESPONSE_SCHEMA,
+    PAIR_STATUS_SCHEMA, POWER_RESULT_SCHEMA, STATE_SCHEMA,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_PATH: &str = "/v1/state";
 const POWER_PATH: &str = "/v1/power";
 const CANCEL_PATH: &str = "/v1/power/cancel";
+const PAIR_PATH: &str = "/v1/pair";
+const PAIR_PENDING_PATH: &str = "/v1/pair/pending";
+const CLIENTS_PATH: &str = "/v1/clients";
+
+struct AuthHeaders<'a> {
+    client_id: Option<&'a str>,
+    timestamp: String,
+    nonce: String,
+    signature: String,
+}
 
 /// A client for one machine's `barged`.
 #[derive(Clone)]
 pub struct DaemonClient {
     agent: ureq::Agent,
     base: String,
+    client_id: Option<String>,
     key: Option<Vec<u8>>,
 }
 
@@ -34,6 +48,7 @@ impl std::fmt::Debug for DaemonClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DaemonClient")
             .field("base", &self.base)
+            .field("client_id", &self.client_id)
             .field("lan", &self.key.is_some())
             .finish_non_exhaustive()
     }
@@ -52,6 +67,7 @@ impl DaemonClient {
         Self {
             agent,
             base: base.into(),
+            client_id: None,
             key: None,
         }
     }
@@ -63,17 +79,44 @@ impl DaemonClient {
         Self::at(format!("http://{host}:{}", machine.daemon_port()))
     }
 
-    /// Authenticate requests using a LAN key.
+    /// Authenticate requests using a legacy shared LAN key (no client ID header).
     pub fn with_key(mut self, key: Vec<u8>) -> Self {
+        self.client_id = None;
         self.key = Some(key);
         self
     }
 
-    /// Connect to the machine's LAN hostname using its key.
+    /// Authenticate requests using a per-client ID and LAN key.
+    pub fn with_client_key(mut self, client_id: impl Into<String>, key: Vec<u8>) -> Self {
+        self.client_id = Some(client_id.into());
+        self.key = Some(key);
+        self
+    }
+
+    /// Connect to the machine's LAN hostname using a legacy shared key.
     pub fn for_lan(machine: &Machine, key: Vec<u8>) -> Self {
         let host = machine.hostname();
         let host = bracket_host(host);
         Self::at(format!("http://{host}:{}", machine.daemon_port())).with_key(key)
+    }
+
+    /// Connect to the machine's LAN hostname using a per-client ID and key.
+    pub fn for_lan_client(machine: &Machine, client_id: Option<String>, key: Vec<u8>) -> Self {
+        let base = Self::for_lan(machine, key);
+        match client_id {
+            Some(id) => {
+                let mut client = base;
+                client.client_id = Some(id);
+                client
+            }
+            None => base,
+        }
+    }
+
+    /// Connect to the machine's LAN hostname without authentication (for pairing).
+    pub fn for_lan_unauthenticated(machine: &Machine) -> Self {
+        let host = bracket_host(machine.hostname());
+        Self::at(format!("http://{host}:{}", machine.daemon_port()))
     }
 
     fn auth_headers(
@@ -81,7 +124,7 @@ impl DaemonClient {
         method: &str,
         path: &str,
         body: &[u8],
-    ) -> Result<Option<(String, String, String)>> {
+    ) -> Result<Option<AuthHeaders<'_>>> {
         let Some(key) = &self.key else {
             return Ok(None);
         };
@@ -95,7 +138,12 @@ impl DaemonClient {
         );
         let signature = crate::auth::sign(key, method, path, &timestamp, &nonce, body)
             .ok_or_else(|| Error::new(ErrorKind::Io, "cannot sign request"))?;
-        Ok(Some((timestamp, nonce, signature)))
+        Ok(Some(AuthHeaders {
+            client_id: self.client_id.as_deref(),
+            timestamp,
+            nonce,
+            signature,
+        }))
     }
 
     /// The base URL this client dials; also the name an error reports.
@@ -105,7 +153,7 @@ impl DaemonClient {
 
     /// `GET /v1/state`.
     pub fn state(&self) -> Result<State> {
-        let (status, body) = self.get(STATE_PATH)?;
+        let (status, body) = self.get(STATE_PATH, true)?;
         self.decode(status, &body, STATE_SCHEMA)
     }
 
@@ -116,23 +164,97 @@ impl DaemonClient {
                 "delay must be 0-{MAX_POWER_DELAY_S} seconds, not {delay_s}"
             )));
         }
-        let (status, body) = self.post(POWER_PATH, &PowerRequest::new(action, delay_s))?;
+        let (status, body) = self.post(POWER_PATH, &PowerRequest::new(action, delay_s), true)?;
         self.decode(status, &body, POWER_RESULT_SCHEMA)
     }
 
     /// `POST /v1/power/cancel`.
     pub fn cancel(&self) -> Result<CancelResult> {
-        let (status, body) = self.post(CANCEL_PATH, &Cancel::default())?;
+        let (status, body) = self.post(CANCEL_PATH, &Cancel::default(), true)?;
         self.decode(status, &body, CANCEL_RESULT_SCHEMA)
     }
 
-    fn get(&self, path: &str) -> Result<(u16, String)> {
-        let mut request = self.agent.get(&self.url(path));
-        if let Some((timestamp, nonce, signature)) = self.auth_headers("GET", path, b"")? {
+    /// `POST /v1/pair` (unauthenticated).
+    pub fn start_pair(&self, client_name: &str, public_key_hex: &str) -> Result<PairResponse> {
+        let (status, body) = self.post(
+            PAIR_PATH,
+            &PairRequest::new(client_name, public_key_hex),
+            false,
+        )?;
+        self.decode(status, &body, PAIR_RESPONSE_SCHEMA)
+    }
+
+    /// `GET /v1/pair/<request_id>` (unauthenticated).
+    pub fn pair_status(&self, request_id: &str) -> Result<PairStatusResponse> {
+        validate_path_segment(request_id, "request_id")?;
+        let (status, body) = self.get(&format!("{PAIR_PATH}/{request_id}"), false)?;
+        self.decode(status, &body, PAIR_STATUS_SCHEMA)
+    }
+
+    /// `GET /v1/pair/pending` (signed or localhost).
+    pub fn pending_pairs(&self) -> Result<PendingPairList> {
+        let (status, body) = self.get(PAIR_PENDING_PATH, true)?;
+        self.decode(status, &body, PAIR_PENDING_SCHEMA)
+    }
+
+    /// `POST /v1/pair/<request_id>/approve` (signed or localhost).
+    pub fn approve_pair(&self, request_id: &str) -> Result<PairApproved> {
+        validate_path_segment(request_id, "request_id")?;
+        let (status, body) = self.post(
+            &format!("{PAIR_PATH}/{request_id}/approve"),
+            &PairDecision::default(),
+            true,
+        )?;
+        self.decode(status, &body, PAIR_APPROVED_SCHEMA)
+    }
+
+    /// `POST /v1/pair/<request_id>/deny` (signed or localhost).
+    pub fn deny_pair(&self, request_id: &str) -> Result<PairDenied> {
+        validate_path_segment(request_id, "request_id")?;
+        let (status, body) = self.post(
+            &format!("{PAIR_PATH}/{request_id}/deny"),
+            &PairDecision::default(),
+            true,
+        )?;
+        self.decode(status, &body, PAIR_DENIED_SCHEMA)
+    }
+
+    /// `GET /v1/clients` (signed).
+    pub fn clients(&self) -> Result<ClientList> {
+        let (status, body) = self.get(CLIENTS_PATH, true)?;
+        self.decode(status, &body, CLIENTS_SCHEMA)
+    }
+
+    /// `DELETE /v1/clients/<client_id>` (signed).
+    pub fn revoke_client(&self, client_id: &str) -> Result<ClientRevoked> {
+        validate_path_segment(client_id, "client_id")?;
+        let (status, body) = self.delete(&format!("{CLIENTS_PATH}/{client_id}"))?;
+        self.decode(status, &body, CLIENT_REVOKED_SCHEMA)
+    }
+
+    fn apply_auth<B>(
+        &self,
+        mut request: ureq::RequestBuilder<B>,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<ureq::RequestBuilder<B>> {
+        if let Some(auth) = self.auth_headers(method, path, body)? {
+            if let Some(client_id) = auth.client_id {
+                request = request.header(crate::auth::CLIENT_ID, client_id);
+            }
             request = request
-                .header(crate::auth::TIMESTAMP, &timestamp)
-                .header(crate::auth::NONCE, &nonce)
-                .header(crate::auth::SIGNATURE, &signature);
+                .header(crate::auth::TIMESTAMP, &auth.timestamp)
+                .header(crate::auth::NONCE, &auth.nonce)
+                .header(crate::auth::SIGNATURE, &auth.signature);
+        }
+        Ok(request)
+    }
+
+    fn get(&self, path: &str, sign: bool) -> Result<(u16, String)> {
+        let mut request = self.agent.get(&self.url(path));
+        if sign {
+            request = self.apply_auth(request, "GET", path, b"")?;
         }
         let mut response = request.call().map_err(|error| self.unreachable(error))?;
         let status = response.status().as_u16();
@@ -143,7 +265,7 @@ impl DaemonClient {
         Ok((status, body))
     }
 
-    fn post(&self, path: &str, document: &impl Serialize) -> Result<(u16, String)> {
+    fn post(&self, path: &str, document: &impl Serialize, sign: bool) -> Result<(u16, String)> {
         let encoded = serde_json::to_string(document).map_err(|error| {
             Error::new(
                 ErrorKind::UnknownState,
@@ -154,17 +276,23 @@ impl DaemonClient {
             .agent
             .post(&self.url(path))
             .header("content-type", "application/json");
-        if let Some((timestamp, nonce, signature)) =
-            self.auth_headers("POST", path, encoded.as_bytes())?
-        {
-            request = request
-                .header(crate::auth::TIMESTAMP, &timestamp)
-                .header(crate::auth::NONCE, &nonce)
-                .header(crate::auth::SIGNATURE, &signature);
+        if sign {
+            request = self.apply_auth(request, "POST", path, encoded.as_bytes())?;
         }
         let mut response = request
             .send(encoded.as_str())
             .map_err(|error| self.unreachable(error))?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| self.unreachable(error))?;
+        Ok((status, body))
+    }
+
+    fn delete(&self, path: &str) -> Result<(u16, String)> {
+        let request = self.apply_auth(self.agent.delete(&self.url(path)), "DELETE", path, b"")?;
+        let mut response = request.call().map_err(|error| self.unreachable(error))?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
@@ -179,7 +307,7 @@ impl DaemonClient {
 
     /// A successful answer is decoded into its document only when the
     /// document's `schema` is the one this client knows: a later version with
-    /// the same fields must be refused, not acted on as version 1
+    /// the same fields must be refused, not acted on as the known version
     /// (docs/knowledge/contracts/consumption.md).
     fn decode<T: DeserializeOwned>(&self, status: u16, body: &str, expected: &str) -> Result<T> {
         if !(200..300).contains(&status) {
@@ -245,6 +373,19 @@ impl DaemonClient {
             format!("barged at {} is unreachable: {error}", self.base),
         )
     }
+}
+
+fn validate_path_segment(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(Error::usage(format!(
+            "{label} must be a non-empty alphanumeric, '-' or '_' identifier"
+        )));
+    }
+    Ok(())
 }
 
 fn bracket_host(host: &str) -> String {
@@ -369,7 +510,7 @@ mod tests {
     }
 
     fn state_document() -> &'static str {
-        r#"{"schema":"barge.machine-state/1","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042}}"#
+        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042},"machine_id":"mid-1","mac":"00:11:22:33:44:ff","broadcast":"192.168.1.255"}"#
     }
 
     #[test]
@@ -378,6 +519,12 @@ mod tests {
         let state = DaemonClient::at(base).state().unwrap();
         assert_eq!(state.schema, STATE_SCHEMA);
         assert_eq!(state.observed_at_unix_ms, 42);
+        assert_eq!(state.machine_id, "mid-1");
+        assert_eq!(state.mac.as_deref(), Some("00:11:22:33:44:ff"));
+        assert_eq!(
+            state.broadcast,
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 255))
+        );
         assert_eq!(
             state.pending,
             Some(crate::Pending {
@@ -390,20 +537,22 @@ mod tests {
     }
 
     #[test]
-    fn lan_client_sends_authentication_headers() {
+    fn lan_client_sends_authentication_headers_with_client_id() {
         let (base, seen) = stub(200, state_document());
         DaemonClient::at(base)
-            .with_key(vec![7; 32])
+            .with_client_key("cid-1", vec![7; 32])
             .state()
             .unwrap();
         let request = seen.lock().unwrap()[0].to_lowercase();
         for header in [
+            crate::auth::CLIENT_ID,
             crate::auth::TIMESTAMP,
             crate::auth::NONCE,
             crate::auth::SIGNATURE,
         ] {
             assert!(request.contains(&format!("{header}: ")), "{request}");
         }
+        assert!(request.contains("x-barge-client-id: cid-1"), "{request}");
     }
 
     #[test]
@@ -510,11 +659,11 @@ mod tests {
         // Same fields, later version: the contract says refuse, not assume.
         let (base, _) = stub(
             200,
-            r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42}"#,
+            r#"{"schema":"barge.machine-state/3","power":"awake","observed_at_unix_ms":42,"machine_id":"m"}"#,
         );
         let error = DaemonClient::at(base).state().unwrap_err();
         assert_eq!(error.kind(), ErrorKind::UnknownState);
-        assert!(error.message().contains("barge.machine-state/2"), "{error}");
+        assert!(error.message().contains("barge.machine-state/3"), "{error}");
         assert!(error.message().contains(STATE_SCHEMA), "{error}");
 
         let (base, _) = stub(

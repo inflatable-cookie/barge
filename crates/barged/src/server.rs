@@ -1,4 +1,4 @@
-//! The HTTP surface: three endpoints, one caller at a time.
+//! The HTTP surface: power endpoints, pairing, approval and client revocation.
 //!
 //! Every response is JSON with a `schema` field, errors included. The daemon
 //! handles one request at a time on purpose: there is one operator and one
@@ -8,16 +8,22 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use barge_machine::{
-    Cancel, CancelResult, DaemonError, PowerRequest, PowerResult, PowerState, State, CANCEL_SCHEMA,
-    POWER_REQUEST_SCHEMA,
+    auth, Cancel, CancelResult, ClientList, ClientRevoked, DaemonError, PairApproved, PairDecision,
+    PairDenied, PairRequest, PairStatus, PowerRequest, PowerResult, PowerState, State,
+    CANCEL_SCHEMA, PAIR_DECISION_SCHEMA, PAIR_REQUEST_SCHEMA, POWER_REQUEST_SCHEMA,
 };
 
+use crate::mdns::{MdnsAdvertiser, MdnsRegistration, ServiceAdvertisement};
+use crate::net::{NetworkLookup, SystemNetworkLookup};
+use crate::notify::{PairAction, PairNotification, PairingNotifier};
+use crate::pairing::{PairDecisionError, PairStartError, PairingStore};
+use crate::state::{DaemonState, LEGACY_CLIENT_ID};
 use crate::{Allowlist, Clock, Config, Error, PeerLookup, PeerNode, PowerController, RequestError};
 
 /// The largest request body the daemon reads; the documents are a few lines.
@@ -27,14 +33,19 @@ const ACCEPT_POLL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HEADERS: usize = 16 * 1024;
 
-/// One daemon: state, power and the allowlist that gates both.
+/// One daemon: state, power, mDNS advertisement, pairing and client auth.
 pub struct Daemon {
     listen: SocketAddr,
+    display_name: String,
     controller: PowerController,
     peers: Arc<dyn PeerLookup>,
     allowlist: Allowlist,
     clock: Arc<dyn Clock>,
-    key_path: Option<std::path::PathBuf>,
+    state: Arc<DaemonState>,
+    pairing: Arc<PairingStore>,
+    network: Arc<dyn NetworkLookup>,
+    notifier: Arc<dyn PairingNotifier>,
+    advertiser: Arc<dyn MdnsAdvertiser>,
     lan: bool,
     nonces: Mutex<HashMap<String, u64>>,
 }
@@ -43,6 +54,7 @@ impl fmt::Debug for Daemon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Daemon")
             .field("listen", &self.listen)
+            .field("machine_id", &self.state.machine_id())
             .field("allowlist", &self.allowlist)
             .field("pending", &self.controller.pending())
             .finish_non_exhaustive()
@@ -59,21 +71,50 @@ impl Daemon {
         controller: PowerController,
         peers: Arc<dyn PeerLookup>,
         clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        let state = DaemonState::open(
+            config.resolved_state_dir(),
+            config.key_path().as_deref(),
+            clock.now_unix_ms(),
+        )?;
+        Ok(Self {
             listen: config.listen,
+            display_name: config.display_name(),
             controller,
             peers,
             allowlist: config.allowlist(),
             clock,
-            key_path: config.key_path(),
+            state: Arc::new(state),
+            pairing: Arc::new(PairingStore::default()),
+            network: Arc::new(SystemNetworkLookup),
+            notifier: default_notifier(),
+            advertiser: default_advertiser(),
             lan: config.mode == crate::AuthMode::Lan,
             nonces: Mutex::new(HashMap::new()),
-        }
+        })
+    }
+
+    pub fn with_network(mut self, network: Arc<dyn NetworkLookup>) -> Self {
+        self.network = network;
+        self
+    }
+
+    pub fn with_notifier(mut self, notifier: Arc<dyn PairingNotifier>) -> Self {
+        self.notifier = notifier;
+        self
+    }
+
+    pub fn with_advertiser(mut self, advertiser: Arc<dyn MdnsAdvertiser>) -> Self {
+        self.advertiser = advertiser;
+        self
     }
 
     pub fn listen(&self) -> SocketAddr {
         self.listen
+    }
+
+    pub fn state_store(&self) -> &DaemonState {
+        &self.state
     }
 
     /// Bind the configured address. A wildcard bind is refused by the config,
@@ -87,18 +128,98 @@ impl Daemon {
         Ok(listener)
     }
 
-    /// Serve until `running` clears.
-    pub fn serve(&self, listener: TcpListener, running: &AtomicBool) -> crate::Result<()> {
-        while running.load(Ordering::SeqCst) {
-            match listener.accept() {
-                Ok((stream, peer)) => self.handle(stream, peer),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(ACCEPT_POLL)
+    /// Bind the configured address and, when serving a specific LAN address,
+    /// also bind loopback on the same port so local callers (Decky plugin,
+    /// `barged pair --approve`) can reach `127.0.0.1:<port>`.
+    pub fn bind_all(&self) -> crate::Result<Vec<TcpListener>> {
+        let primary = self.bind()?;
+        let mut listeners = Vec::new();
+        if self.lan && !self.listen.ip().is_loopback() && !self.listen.ip().is_unspecified() {
+            if let Ok(local_addr) = primary.local_addr() {
+                let loopback = match local_addr.ip() {
+                    IpAddr::V4(_) => {
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_addr.port())
+                    }
+                    IpAddr::V6(_) => {
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), local_addr.port())
+                    }
+                };
+                match TcpListener::bind(loopback)
+                    .and_then(|sock| sock.set_nonblocking(true).map(|()| sock))
+                {
+                    Ok(sock) => listeners.push(sock),
+                    Err(error) => eprintln!(
+                        "barged: warning: cannot bind localhost listener {loopback}: {error}"
+                    ),
                 }
-                Err(error) => return Err(Error::new(format!("cannot accept a request: {error}"))),
+            }
+        }
+        listeners.insert(0, primary);
+        Ok(listeners)
+    }
+
+    /// Serve one listener until `running` clears.
+    pub fn serve(&self, listener: TcpListener, running: &AtomicBool) -> crate::Result<()> {
+        self.serve_all(vec![listener], running)
+    }
+
+    /// Serve all listeners until `running` clears, advertising via mDNS in LAN mode.
+    pub fn serve_all(
+        &self,
+        listeners: Vec<TcpListener>,
+        running: &AtomicBool,
+    ) -> crate::Result<()> {
+        let _mdns = self.start_mdns(listeners.first());
+        while running.load(Ordering::SeqCst) {
+            let mut accepted_any = false;
+            for listener in &listeners {
+                match listener.accept() {
+                    Ok((stream, peer)) => {
+                        accepted_any = true;
+                        self.handle(stream, peer);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => {
+                        return Err(Error::new(format!("cannot accept a request: {error}")))
+                    }
+                }
+            }
+            if !accepted_any {
+                std::thread::sleep(ACCEPT_POLL);
             }
         }
         Ok(())
+    }
+
+    fn start_mdns(&self, primary: Option<&TcpListener>) -> Option<Box<dyn MdnsRegistration>> {
+        if !self.lan {
+            return None;
+        }
+        let port = primary
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or_else(|| self.listen.port());
+        let info = self.network.interface_for(self.listen.ip());
+        let service = ServiceAdvertisement {
+            service_type: "_barged._tcp".to_string(),
+            instance_name: self.display_name.clone(),
+            port,
+            address: self.listen.ip(),
+            interface_index: info.interface_index,
+            txt: vec![
+                ("id".to_string(), self.state.machine_id().to_string()),
+                ("name".to_string(), self.display_name.clone()),
+                ("mode".to_string(), "lan".to_string()),
+                ("version".to_string(), "1".to_string()),
+            ],
+        };
+        match self.advertiser.advertise(&service) {
+            Ok(registration) => Some(registration),
+            Err(error) => {
+                eprintln!("barged: mDNS advertisement unavailable: {error}");
+                None
+            }
+        }
     }
 
     fn handle(&self, mut stream: TcpStream, peer: SocketAddr) {
@@ -118,40 +239,132 @@ impl Daemon {
 
     fn route(&self, request: &Request, peer: Option<SocketAddr>) -> Answer {
         let body = &request.body;
-        let caller = if self.lan {
-            let key = self
-                .key_path
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|s| barge_machine::auth::decode(s.trim(), 32))
-                .ok_or_else(|| {
-                    eprintln!("barged: cannot read or decode LAN key");
-                    (500, failure("internal", "cannot read or decode LAN key"))
-                })?;
-            self.authorize_lan(request, &key, body.as_bytes())?;
-            PeerNode::new("lan", "LAN client")
-        } else {
-            self.authorize(peer)?
-        };
         let url = request.url.to_string();
         let path = url.split(['?', '#']).next().unwrap_or("").to_string();
         let method = request.method.as_str();
+
+        if path == "/v1/pair" {
+            self.require_lan()?;
+            return match method {
+                "POST" => self.pair_start(body),
+                _ => Err(method_not_allowed(path, method)),
+            };
+        }
+
+        if path == "/v1/pair/pending" {
+            self.require_lan()?;
+            self.authorize_lan_or_localhost(request, peer)?;
+            return match method {
+                "GET" => self.pair_pending(),
+                _ => Err(method_not_allowed(path, method)),
+            };
+        }
+
+        if let Some(rest) = path.strip_prefix("/v1/pair/") {
+            self.require_lan()?;
+            if let Some(id) = rest.strip_suffix("/approve") {
+                if !valid_segment(id) {
+                    return Err((
+                        404,
+                        failure("not_found", format!("{path} is not an endpoint")),
+                    ));
+                }
+                self.authorize_lan_or_localhost(request, peer)?;
+                return match method {
+                    "POST" => self.pair_approve(id, body),
+                    _ => Err(method_not_allowed(path, method)),
+                };
+            }
+            if let Some(id) = rest.strip_suffix("/deny") {
+                if !valid_segment(id) {
+                    return Err((
+                        404,
+                        failure("not_found", format!("{path} is not an endpoint")),
+                    ));
+                }
+                self.authorize_lan_or_localhost(request, peer)?;
+                return match method {
+                    "POST" => self.pair_deny(id, body),
+                    _ => Err(method_not_allowed(path, method)),
+                };
+            }
+            if valid_segment(rest) {
+                return match method {
+                    "GET" => self.pair_status(rest),
+                    _ => Err(method_not_allowed(path, method)),
+                };
+            }
+        }
+
+        let caller = self.authorize_caller(request, peer)?;
+
+        if path == "/v1/clients" {
+            self.require_lan()?;
+            return match method {
+                "GET" => self.list_clients(),
+                _ => Err(method_not_allowed(path, method)),
+            };
+        }
+
+        if let Some(client_id) = path.strip_prefix("/v1/clients/") {
+            if valid_segment(client_id) {
+                self.require_lan()?;
+                return match method {
+                    "DELETE" => self.revoke_client(client_id),
+                    _ => Err(method_not_allowed(path, method)),
+                };
+            }
+        }
+
         match (method, path.as_str()) {
             ("GET", "/v1/state") => self.state_answer(),
             ("POST", "/v1/power") => self.power(body, &caller),
             ("POST", "/v1/power/cancel") => self.cancel(body),
-            (_, known @ ("/v1/state" | "/v1/power" | "/v1/power/cancel")) => Err((
-                405,
-                failure(
-                    "method_not_allowed",
-                    format!("{known} does not accept {method}"),
-                ),
-            )),
+            (_, known @ ("/v1/state" | "/v1/power" | "/v1/power/cancel")) => {
+                Err(method_not_allowed(known.to_string(), method))
+            }
             (_, other) => Err((
                 404,
                 failure("not_found", format!("{other} is not an endpoint")),
             )),
         }
+    }
+
+    fn require_lan(&self) -> std::result::Result<(), Refusal> {
+        if self.lan {
+            Ok(())
+        } else {
+            Err((
+                400,
+                failure(
+                    "bad_request",
+                    "pairing and client management require LAN mode",
+                ),
+            ))
+        }
+    }
+
+    fn authorize_caller(
+        &self,
+        request: &Request,
+        peer: Option<SocketAddr>,
+    ) -> std::result::Result<PeerNode, Refusal> {
+        if self.lan {
+            self.authorize_lan(request, request.body.as_bytes())
+        } else {
+            self.authorize(peer)
+        }
+    }
+
+    fn authorize_lan_or_localhost(
+        &self,
+        request: &Request,
+        peer: Option<SocketAddr>,
+    ) -> std::result::Result<PeerNode, Refusal> {
+        if peer.is_some_and(|addr| addr.ip().is_loopback()) && !has_auth_headers(request) {
+            return Ok(PeerNode::new("localhost", "localhost"));
+        }
+        self.authorize_lan(request, request.body.as_bytes())
     }
 
     /// Tailscale identifies the caller; the config decides whether it may call.
@@ -189,26 +402,32 @@ impl Daemon {
     fn authorize_lan(
         &self,
         request: &Request,
-        key: &[u8],
         body: &[u8],
-    ) -> std::result::Result<(), Refusal> {
+    ) -> std::result::Result<PeerNode, Refusal> {
         let refused = || (401, failure("not_authorized", "authentication failed"));
-        let header = |name: &'static str| {
-            request
-                .headers
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.as_str())
-        };
-        let timestamp = header(barge_machine::auth::TIMESTAMP).ok_or_else(refused)?;
-        let nonce = header(barge_machine::auth::NONCE).ok_or_else(refused)?;
-        let signature = header(barge_machine::auth::SIGNATURE).ok_or_else(refused)?;
+        let client_id = header_value(request, auth::CLIENT_ID).unwrap_or(LEGACY_CLIENT_ID);
+        let client = self
+            .state
+            .find_client(client_id)
+            .map_err(|error| {
+                eprintln!("barged: cannot read paired clients: {error}");
+                (500, failure("internal", "cannot read paired clients"))
+            })?
+            .ok_or_else(refused)?;
+        let key = client.key_bytes().ok_or_else(|| {
+            eprintln!("barged: stored key for client {:?} is invalid", client.id);
+            (500, failure("internal", "invalid stored client key"))
+        })?;
+
+        let timestamp = header_value(request, auth::TIMESTAMP).ok_or_else(refused)?;
+        let nonce = header_value(request, auth::NONCE).ok_or_else(refused)?;
+        let signature = header_value(request, auth::SIGNATURE).ok_or_else(refused)?;
         let seconds: u64 = timestamp.parse().map_err(|_| refused())?;
         let now = self.clock.now_unix_ms() / 1000;
         if seconds.abs_diff(now) > 60
-            || barge_machine::auth::decode(nonce, 16).is_none()
-            || !barge_machine::auth::verify(
-                key,
+            || auth::decode(nonce, 16).is_none()
+            || !auth::verify(
+                &key,
                 request.method.as_str(),
                 &request.url,
                 timestamp,
@@ -219,18 +438,23 @@ impl Daemon {
         {
             return Err(refused());
         }
+        let replay_key = format!("{}:{nonce}", client.id);
         let mut nonces = self.nonces.lock().map_err(|_| refused())?;
         nonces.retain(|_, expiry| *expiry >= now);
-        if nonces.contains_key(nonce) || nonces.len() >= 10000 {
+        if nonces.contains_key(&replay_key) || nonces.len() >= 10000 {
             return Err(refused());
         }
-        nonces.insert(nonce.to_string(), seconds.saturating_add(60));
-        Ok(())
+        nonces.insert(replay_key, seconds.saturating_add(60));
+        Ok(PeerNode::new(client.id, client.name))
     }
 
     fn state_answer(&self) -> Answer {
+        let info = self.network.interface_for(self.listen.ip());
         let state = State::new(PowerState::Awake, self.clock.now_unix_ms())
-            .with_pending(self.controller.pending());
+            .with_pending(self.controller.pending())
+            .with_machine_id(self.state.machine_id().to_string())
+            .with_mac(info.mac)
+            .with_broadcast(info.broadcast);
         Ok((200, encode(&state)?))
     }
 
@@ -271,6 +495,122 @@ impl Daemon {
         Ok((200, encode(&CancelResult::new(cancelled))?))
     }
 
+    fn pair_start(&self, body: &str) -> Answer {
+        let document: PairRequest = self.document(body)?;
+        if document.schema != PAIR_REQUEST_SCHEMA {
+            return Err(schema_mismatch(PAIR_REQUEST_SCHEMA, &document.schema));
+        }
+        let now_ms = self.clock.now_unix_ms();
+        let (response, code) = self
+            .pairing
+            .start(&document.client_name, &document.public_key, now_ms)
+            .map_err(|error| match error {
+                PairStartError::InvalidInput(msg) => (400, failure("bad_request", msg)),
+                PairStartError::TooManyPending => (
+                    409,
+                    failure("too_many_pending", "too many pending pairing requests"),
+                ),
+                PairStartError::Internal(msg) => (500, failure("internal", msg)),
+            })?;
+
+        let notice = PairNotification {
+            request_id: response.request_id.clone(),
+            client_name: document.client_name.trim().to_string(),
+            code,
+        };
+        let pairing = Arc::clone(&self.pairing);
+        let state = Arc::clone(&self.state);
+        let clock = Arc::clone(&self.clock);
+        let callback = Arc::new(move |request_id: &str, action: PairAction| {
+            let now = clock.now_unix_ms();
+            match action {
+                PairAction::Approve => {
+                    if let Err(err) = pairing.approve(request_id, &state, now) {
+                        eprintln!("barged: notification approve failed: {err:?}");
+                    }
+                }
+                PairAction::Deny => {
+                    if let Err(err) = pairing.deny(request_id, now) {
+                        eprintln!("barged: notification deny failed: {err:?}");
+                    }
+                }
+            }
+        });
+        self.notifier.notify(notice, callback);
+
+        Ok((202, encode(&response)?))
+    }
+
+    fn pair_status(&self, request_id: &str) -> Answer {
+        let now_ms = self.clock.now_unix_ms();
+        let status = self
+            .pairing
+            .status(request_id, now_ms)
+            .ok_or_else(|| (404, failure("not_found", "unknown pairing request")))?;
+        Ok((200, encode(&status)?))
+    }
+
+    fn pair_pending(&self) -> Answer {
+        let now_ms = self.clock.now_unix_ms();
+        let requests = self.pairing.pending(now_ms);
+        Ok((200, encode(&barge_machine::PendingPairList::new(requests))?))
+    }
+
+    fn pair_approve(&self, request_id: &str, body: &str) -> Answer {
+        self.check_optional_decision_body(body)?;
+        let now_ms = self.clock.now_unix_ms();
+        let client = self
+            .pairing
+            .approve(request_id, &self.state, now_ms)
+            .map_err(decision_refusal)?;
+        Ok((200, encode(&PairApproved::new(request_id, client))?))
+    }
+
+    fn pair_deny(&self, request_id: &str, body: &str) -> Answer {
+        self.check_optional_decision_body(body)?;
+        let now_ms = self.clock.now_unix_ms();
+        self.pairing
+            .deny(request_id, now_ms)
+            .map_err(decision_refusal)?;
+        Ok((200, encode(&PairDenied::new(request_id))?))
+    }
+
+    fn check_optional_decision_body(&self, body: &str) -> std::result::Result<(), Refusal> {
+        if body.trim().is_empty() {
+            return Ok(());
+        }
+        let document: PairDecision = self.document(body)?;
+        if document.schema != PAIR_DECISION_SCHEMA {
+            return Err(schema_mismatch(PAIR_DECISION_SCHEMA, &document.schema));
+        }
+        Ok(())
+    }
+
+    fn list_clients(&self) -> Answer {
+        let clients = self
+            .state
+            .list_clients()
+            .map_err(|e| (500, failure("internal", e.to_string())))?
+            .into_iter()
+            .map(|c| c.summary())
+            .collect();
+        Ok((200, encode(&ClientList::new(clients))?))
+    }
+
+    fn revoke_client(&self, client_id: &str) -> Answer {
+        let removed = self
+            .state
+            .remove_client(client_id)
+            .map_err(|e| (500, failure("internal", e.to_string())))?;
+        if !removed {
+            return Err((
+                404,
+                failure("not_found", format!("client {client_id:?} is not paired")),
+            ));
+        }
+        Ok((200, encode(&ClientRevoked::new(client_id))?))
+    }
+
     fn document<T: serde::de::DeserializeOwned>(
         &self,
         body: &str,
@@ -291,6 +631,74 @@ impl Daemon {
             )
         })
     }
+}
+
+fn decision_refusal(error: PairDecisionError) -> Refusal {
+    match error {
+        PairDecisionError::NotFound => (404, failure("not_found", "unknown pairing request")),
+        PairDecisionError::AlreadyDecided(PairStatus::Approved) => (
+            409,
+            failure("already_decided", "pairing request was already approved"),
+        ),
+        PairDecisionError::AlreadyDecided(_) => (
+            409,
+            failure("already_decided", "pairing request was already denied"),
+        ),
+        PairDecisionError::Expired => (409, failure("expired", "pairing request has expired")),
+        PairDecisionError::Internal(msg) => (500, failure("internal", msg)),
+    }
+}
+
+fn method_not_allowed(path: String, method: &str) -> Refusal {
+    (
+        405,
+        failure(
+            "method_not_allowed",
+            format!("{path} does not accept {method}"),
+        ),
+    )
+}
+
+fn valid_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn has_auth_headers(request: &Request) -> bool {
+    header_value(request, auth::SIGNATURE).is_some()
+        || header_value(request, auth::TIMESTAMP).is_some()
+        || header_value(request, auth::NONCE).is_some()
+        || header_value(request, auth::CLIENT_ID).is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn default_notifier() -> Arc<dyn PairingNotifier> {
+    Arc::new(crate::notify::DesktopNotifier)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_notifier() -> Arc<dyn PairingNotifier> {
+    Arc::new(crate::notify::NoopNotifier)
+}
+
+#[cfg(target_os = "linux")]
+fn default_advertiser() -> Arc<dyn MdnsAdvertiser> {
+    Arc::new(crate::mdns::AvahiAdvertiser)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn default_advertiser() -> Arc<dyn MdnsAdvertiser> {
+    Arc::new(crate::mdns::UnavailableMdns)
 }
 
 struct Request {
@@ -475,19 +883,45 @@ mod tests {
         }
     }
 
+    fn tailscale_config(temp: &barge::testing::TempDir) -> Config {
+        Config::parse(
+            format!(
+                r#"{{"listen":"127.0.0.1:0","allowed_nodes":["mac"],"state_dir":{}}}"#,
+                serde_json::to_string(temp.path()).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn lan_config(temp: &barge::testing::TempDir) -> Config {
+        Config::parse(
+            format!(
+                r#"{{"listen":"127.0.0.1:0","mode":"lan","state_dir":{}}}"#,
+                serde_json::to_string(temp.path()).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn slow_drip_cannot_prevent_cancel() {
-        let config = Config::parse(br#"{"listen":"127.0.0.1:0","allowed_nodes":["mac"]}"#).unwrap();
+        let temp = barge::testing::TempDir::new("barged-drip").unwrap();
+        let config = tailscale_config(&temp);
         let controller = PowerController::new(Arc::new(NoPower), Arc::new(crate::SystemClock));
         controller
             .request(barge_machine::PowerActionKind::Shutdown, 60)
             .unwrap();
-        let daemon = Arc::new(Daemon::new(
-            &config,
-            controller,
-            Arc::new(FixedLookup(Some(PeerNode::new("id", "mac")))),
-            Arc::new(crate::SystemClock),
-        ));
+        let daemon = Arc::new(
+            Daemon::new(
+                &config,
+                controller,
+                Arc::new(FixedLookup(Some(PeerNode::new("id", "mac")))),
+                Arc::new(crate::SystemClock),
+            )
+            .unwrap(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (accepted, ready) = std::sync::mpsc::channel();
@@ -521,14 +955,16 @@ mod tests {
 
     #[test]
     fn an_unidentifiable_caller_is_refused_before_any_endpoint_runs() {
-        let config = Config::parse(br#"{"listen":"127.0.0.1:0","allowed_nodes":["mac"]}"#).unwrap();
+        let temp = barge::testing::TempDir::new("barged-unid").unwrap();
+        let config = tailscale_config(&temp);
         let controller = PowerController::new(Arc::new(NoPower), Arc::new(crate::SystemClock));
         let daemon = Daemon::new(
             &config,
             controller,
             Arc::new(FixedLookup(None)),
             Arc::new(crate::SystemClock),
-        );
+        )
+        .unwrap();
         let refusal = daemon
             .authorize(Some("127.0.0.1:5000".parse().unwrap()))
             .unwrap_err();
@@ -543,9 +979,15 @@ mod tests {
 
     #[test]
     fn an_identified_node_off_the_allowlist_is_refused() {
-        let config =
-            Config::parse(br#"{"listen":"127.0.0.1:0","allowed_nodes":["mac.tailnet.ts.net"]}"#)
-                .unwrap();
+        let temp = barge::testing::TempDir::new("barged-allow").unwrap();
+        let config = Config::parse(
+            format!(
+                r#"{{"listen":"127.0.0.1:0","allowed_nodes":["mac.tailnet.ts.net"],"state_dir":{}}}"#,
+                serde_json::to_string(temp.path()).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         let controller = PowerController::new(Arc::new(NoPower), Arc::new(crate::SystemClock));
         let daemon = Daemon::new(
             &config,
@@ -555,7 +997,8 @@ mod tests {
                 "intruder.tailnet.ts.net",
             )))),
             Arc::new(crate::SystemClock),
-        );
+        )
+        .unwrap();
         let refusal = daemon
             .authorize(Some("127.0.0.1:5000".parse().unwrap()))
             .unwrap_err();
@@ -564,6 +1007,72 @@ mod tests {
             refusal.1.contains("is not on the allowlist"),
             "{}",
             refusal.1
+        );
+    }
+
+    #[test]
+    fn approval_routes_refuse_unsigned_non_localhost_caller_and_allow_localhost() {
+        let temp = barge::testing::TempDir::new("barged-approval-auth").unwrap();
+        let config = lan_config(&temp);
+        let controller = PowerController::new(Arc::new(NoPower), Arc::new(crate::SystemClock));
+        let daemon = Daemon::new(
+            &config,
+            controller,
+            Arc::new(FixedLookup(None)),
+            Arc::new(crate::SystemClock),
+        )
+        .unwrap();
+
+        let non_localhost: SocketAddr = "192.168.1.50:40000".parse().unwrap();
+        let localhost: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+        for (method, url) in [
+            ("GET", "/v1/pair/pending"),
+            ("POST", "/v1/pair/req1/approve"),
+            ("POST", "/v1/pair/req1/deny"),
+        ] {
+            let req = Request {
+                method: method.to_string(),
+                url: url.to_string(),
+                headers: Vec::new(),
+                body: String::new(),
+            };
+            let refused = daemon.route(&req, Some(non_localhost)).unwrap_err();
+            assert_eq!(refused.0, 401, "{method} {url}");
+            let no_peer = daemon.route(&req, None).unwrap_err();
+            assert_eq!(no_peer.0, 401, "{method} {url} with None peer");
+        }
+
+        // Localhost succeeds on pending list (empty) and reaches 404 on unknown req1.
+        let pending_req = Request {
+            method: "GET".to_string(),
+            url: "/v1/pair/pending".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        assert_eq!(daemon.route(&pending_req, Some(localhost)).unwrap().0, 200);
+
+        let approve_req = Request {
+            method: "POST".to_string(),
+            url: "/v1/pair/req1/approve".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        assert_eq!(
+            daemon.route(&approve_req, Some(localhost)).unwrap_err().0,
+            404
+        );
+
+        // Unsigned localhost is STILL refused on protected non-approval routes.
+        let state_req = Request {
+            method: "GET".to_string(),
+            url: "/v1/state".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        assert_eq!(
+            daemon.route(&state_req, Some(localhost)).unwrap_err().0,
+            401
         );
     }
 }

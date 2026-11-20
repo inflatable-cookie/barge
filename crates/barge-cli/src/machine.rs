@@ -1,41 +1,31 @@
+use std::ffi::CStr;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use barge::{Error, ErrorKind, Result};
 use barge_machine::{
-    request_power, AssumeYes, Confirmation, DaemonClient, DatagramSender, Machine, PowerActionKind,
-    PowerState, Registry, UdpSender, DEFAULT_POWER_DELAY_S,
+    match_registered, parse_public_key, request_power, sanitize_machine_name, AssumeYes,
+    Confirmation, DaemonClient, DatagramSender, DiscoveredMachine, KeyPair, Machine, MdnsBrowser,
+    PairRole, PairStatus, PowerActionKind, PowerState, Registry, UdpMdnsBrowser, UdpSender,
+    DEFAULT_DISCOVER_TIMEOUT, DEFAULT_POWER_DELAY_S,
 };
 use serde_json::json;
 
 use crate::args::{expect_no_positionals, Options};
-use crate::console::{read_secret, StdinConsole};
 use crate::human;
 use crate::output::document;
 
-const VERBS: &str =
-    "add, list, remove, wake, pair, unpair, status, sleep, restart, shutdown or cancel";
+const VERBS: &str = "discover, add, list, remove, wake, pair, unpair, clients, revoke, status, sleep, restart, shutdown or cancel";
+const PAIR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const DEFAULT_PAIR_TIMEOUT: Duration = Duration::from_secs(125);
 
-/// Where a machine verb reaches the outside world: the registry, the Wake-on-LAN
-/// sender and the key read by `machine pair`. Tests replace each one.
-pub(crate) struct Env<'a, S> {
+/// Where a machine verb reaches the outside world: the registry, Wake-on-LAN
+/// sender, and mDNS browser. Tests replace each one.
+pub(crate) struct Env<'a, S, B> {
     pub(crate) discover: &'a dyn Fn() -> Result<Registry>,
     pub(crate) sender: &'a S,
-    pub(crate) keys: &'a dyn KeyInput,
-}
-
-/// The LAN key a `machine pair` call stores: one line, with echo off on a terminal.
-pub(crate) trait KeyInput {
-    fn read_key(&self) -> Result<String>;
-}
-
-/// Standard input, read through the console seam.
-struct StdinKey;
-
-impl KeyInput for StdinKey {
-    fn read_key(&self) -> Result<String> {
-        read_secret(&mut std::io::stdin().lock(), &StdinConsole)
-            .map_err(|e| Error::usage(format!("cannot read key from stdin: {e}")))
-    }
+    pub(crate) browser: &'a B,
+    pub(crate) pair_poll_interval: Duration,
 }
 
 pub(crate) fn machine(arguments: &[String], json: bool) -> Result<()> {
@@ -46,18 +36,19 @@ pub(crate) fn machine(arguments: &[String], json: bool) -> Result<()> {
         &Env {
             discover: &discover,
             sender: &UdpSender,
-            keys: &StdinKey,
+            browser: &UdpMdnsBrowser,
+            pair_poll_interval: PAIR_POLL_INTERVAL,
         },
     )
 }
 
 #[cfg(test)]
-pub(crate) fn machine_with<S: DatagramSender>(
+pub(crate) fn machine_with<S: DatagramSender, B: MdnsBrowser>(
     arguments: &[String],
     json: bool,
     registry: &Registry,
     sender: &S,
-    keys: &dyn KeyInput,
+    browser: &B,
 ) -> Result<()> {
     let discover = || Ok(registry.clone());
     machine_dispatch(
@@ -66,27 +57,31 @@ pub(crate) fn machine_with<S: DatagramSender>(
         &Env {
             discover: &discover,
             sender,
-            keys,
+            browser,
+            pair_poll_interval: Duration::from_millis(10),
         },
     )
 }
 
-fn machine_dispatch<S: DatagramSender>(
+fn machine_dispatch<S: DatagramSender, B: MdnsBrowser>(
     arguments: &[String],
     json: bool,
-    env: &Env<'_, S>,
+    env: &Env<'_, S, B>,
 ) -> Result<()> {
     let Some(command) = arguments.first().map(String::as_str) else {
         return Err(Error::usage(format!("machine needs {VERBS}")));
     };
     let rest = &arguments[1..];
     match command {
+        "discover" => discover_machines(rest, json, env),
         "add" => add(rest, json, env),
         "list" => list(rest, json, env),
         "remove" => remove(rest, json, env),
         "wake" => wake(rest, json, env),
         "pair" => pair(rest, json, env),
         "unpair" => unpair(rest, json, env),
+        "clients" => clients(rest, json, env),
+        "revoke" => revoke(rest, json, env),
         "status" => status(rest, json, env),
         "sleep" => machine_power(PowerActionKind::Sleep, rest, json, env),
         "restart" => machine_power(PowerActionKind::Restart, rest, json, env),
@@ -98,7 +93,84 @@ fn machine_dispatch<S: DatagramSender>(
     }
 }
 
-fn add<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Result<()> {
+fn discover_machines<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
+    let options = Options::parse(rest, &["timeout"], &[])?;
+    expect_no_positionals(&options)?;
+    let timeout = parse_timeout(&options, DEFAULT_DISCOVER_TIMEOUT)?;
+    let registry = (env.discover)()?;
+    let mut registered = registry.list().map_err(machine_error)?;
+    let found = env.browser.browse(timeout).map_err(machine_error)?;
+
+    // Keep registered IP/port current when a paired machine's DHCP lease moves.
+    if registry.exists() {
+        for item in &found {
+            if let Some(existing) = registered
+                .iter()
+                .find(|m| m.id() == Some(item.id.as_str()))
+                .cloned()
+            {
+                if existing.hostname() != item.address || existing.daemon_port() != item.port {
+                    let _ = registry.update(existing.name(), |machine| {
+                        let updated = machine
+                            .clone()
+                            .with_hostname(item.address.clone())?
+                            .with_daemon_port(item.port)?;
+                        *machine = updated;
+                        Ok(())
+                    });
+                }
+            }
+        }
+        registered = registry.list().map_err(machine_error)?;
+    }
+
+    let entries: Vec<serde_json::Value> = found
+        .iter()
+        .map(|item| {
+            let reg_name = match_registered(item, &registered).map(|m| m.name().to_string());
+            json!({
+                "id": item.id,
+                "name": item.name,
+                "mode": item.mode,
+                "protocol_version": item.protocol_version,
+                "address": item.address,
+                "port": item.port,
+                "registered_as": reg_name,
+            })
+        })
+        .collect();
+
+    if json {
+        document(
+            "barge.machine-discover/1",
+            vec![("discovered", serde_json::Value::Array(entries))],
+        )?;
+    } else if found.is_empty() {
+        println!("no machines found");
+    } else {
+        for item in &found {
+            let status = match match_registered(item, &registered) {
+                Some(m) => format!("registered as {}", m.name()),
+                None => "not registered".to_string(),
+            };
+            println!(
+                "{} ({}) at {}:{} [{}] — {}",
+                item.name, item.id, item.address, item.port, item.mode, status
+            );
+        }
+    }
+    Ok(())
+}
+
+fn add<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
     let options = Options::parse(
         rest,
         &[
@@ -109,11 +181,46 @@ fn add<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Resu
             "broadcast",
             "port",
             "daemon-port",
+            "id",
+            "timeout",
         ],
         &[],
     )?;
-    expect_no_positionals(&options)?;
-    let machine = machine_from_options(&options)?;
+    let manual = options.get("hostname").is_some()
+        || options.get("mac").is_some()
+        || options.get("tailscale-name").is_some()
+        || options.get("broadcast").is_some()
+        || options.get("port").is_some()
+        || options.get("daemon-port").is_some();
+
+    let machine = if manual {
+        expect_no_positionals(&options)?;
+        if options.get("id").is_some() || options.get("timeout").is_some() {
+            return Err(Error::usage(
+                "--id and --timeout cannot be combined with manual --hostname/--mac flags",
+            ));
+        }
+        machine_from_options(&options)?
+    } else if let Some(target) = discovery_target(&options)? {
+        let timeout = parse_timeout(&options, DEFAULT_DISCOVER_TIMEOUT)?;
+        let found = env.browser.browse(timeout).map_err(machine_error)?;
+        let chosen = select_discovered(&found, &target)?;
+        let local_name = options
+            .get("name")
+            .unwrap_or_else(|| sanitize_machine_name(&chosen.name));
+        Machine::discovered(
+            chosen.id.clone(),
+            local_name,
+            chosen.address.clone(),
+            chosen.port,
+        )
+        .map_err(machine_error)?
+    } else {
+        // Preserves the existing required-flag usage error when `machine add`
+        // is invoked with no arguments.
+        machine_from_options(&options)?
+    };
+
     let registry = (env.discover)()?;
     registry.add(machine.clone()).map_err(machine_error)?;
     if json {
@@ -126,6 +233,42 @@ fn add<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Resu
         );
     }
     Ok(())
+}
+
+fn discovery_target(options: &Options) -> Result<Option<String>> {
+    match (options.get("id"), options.positionals.as_slice()) {
+        (Some(_), [_, ..]) => Err(Error::usage(
+            "machine add takes either <id-or-name> or --id, not both",
+        )),
+        (Some(id), []) => Ok(Some(id)),
+        (None, [target]) => Ok(Some(target.clone())),
+        (None, []) => Ok(None),
+        (None, _) => Err(Error::usage(
+            "machine add takes at most one <id-or-name> positional argument",
+        )),
+    }
+}
+
+fn select_discovered<'a>(
+    found: &'a [DiscoveredMachine],
+    target: &str,
+) -> Result<&'a DiscoveredMachine> {
+    if let Some(exact_id) = found.iter().find(|item| item.id == target) {
+        return Ok(exact_id);
+    }
+    let matches: Vec<&DiscoveredMachine> = found
+        .iter()
+        .filter(|item| item.name.eq_ignore_ascii_case(target))
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(Error::not_found(format!(
+            "no discovered machine matches {target:?}"
+        ))),
+        _ => Err(Error::refused(format!(
+            "multiple discovered machines match {target:?}; pass the machine ID"
+        ))),
+    }
 }
 
 fn machine_from_options(options: &Options) -> Result<Machine> {
@@ -158,7 +301,11 @@ fn machine_from_options(options: &Options) -> Result<Machine> {
     Ok(machine)
 }
 
-fn list<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Result<()> {
+fn list<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
     let options = Options::parse(rest, &[], &[])?;
     expect_no_positionals(&options)?;
     let registry = (env.discover)()?;
@@ -173,14 +320,18 @@ fn list<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Res
                 "{}: {} ({})",
                 machine.name(),
                 machine.hostname(),
-                machine.mac()
+                machine.mac().unwrap_or("unpaired")
             );
         }
     }
     Ok(())
 }
 
-fn remove<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Result<()> {
+fn remove<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
     let options = Options::parse(rest, &[], &[])?;
     let name = options.single("machine remove", "name")?;
     let registry = (env.discover)()?;
@@ -193,7 +344,11 @@ fn remove<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> R
     Ok(())
 }
 
-fn wake<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Result<()> {
+fn wake<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
     let options = Options::parse(rest, &[], &[])?;
     let name = options.single("machine wake", "name")?;
     let registry = (env.discover)()?;
@@ -219,24 +374,119 @@ fn wake<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Res
     Ok(())
 }
 
-fn pair<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Result<()> {
-    let options = Options::parse(rest, &[], &[])?;
+fn pair<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
+    let options = Options::parse(rest, &["client-name", "timeout"], &[])?;
     let name = options.single("machine pair", "name")?;
-    let key = env.keys.read_key()?;
+    let timeout = parse_timeout(&options, DEFAULT_PAIR_TIMEOUT)?;
     let registry = (env.discover)()?;
-    registry.pair(&name, &key).map_err(machine_error)?;
+    let machine = registry.get(&name).map_err(machine_error)?;
+
+    let client_name = options
+        .get("client-name")
+        .or_else(local_hostname)
+        .unwrap_or_else(|| "barge-cli".to_string());
+    let keys = KeyPair::generate().map_err(machine_error)?;
+    let unauth = DaemonClient::for_lan_unauthenticated(&machine);
+    let started = unauth
+        .start_pair(&client_name, &keys.public_key_hex())
+        .map_err(machine_error)?;
+    let daemon_pub = parse_public_key(&started.public_key).map_err(machine_error)?;
+    let derived = keys
+        .derive(&daemon_pub, PairRole::Client)
+        .map_err(machine_error)?;
+
+    if json {
+        eprintln!("pairing code for {}: {}", machine.name(), derived.code());
+    } else {
+        println!("pairing code for {}: {}", machine.name(), derived.code());
+        let _ = std::io::stdout().flush();
+    }
+
+    let deadline = Instant::now() + timeout;
+    let client_id = loop {
+        let status = unauth
+            .pair_status(&started.request_id)
+            .map_err(machine_error)?;
+        match status.status {
+            PairStatus::Pending => {
+                if Instant::now() >= deadline {
+                    return Err(Error::refused(format!(
+                        "pairing request for {} timed out",
+                        machine.name()
+                    )));
+                }
+                std::thread::sleep(env.pair_poll_interval);
+            }
+            PairStatus::Approved => {
+                let id = status.client_id.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::UnknownState,
+                        "daemon approved pairing without a client_id",
+                    )
+                })?;
+                break id;
+            }
+            PairStatus::Denied => {
+                return Err(Error::refused(format!(
+                    "pairing request for {} was denied",
+                    machine.name()
+                )));
+            }
+            PairStatus::Expired => {
+                return Err(Error::refused(format!(
+                    "pairing request for {} expired",
+                    machine.name()
+                )));
+            }
+        }
+    };
+
+    registry
+        .pair_client(&name, &client_id, derived.key())
+        .map_err(machine_error)?;
+
+    let authed =
+        DaemonClient::for_lan_client(&machine, Some(client_id.clone()), derived.key().to_vec());
+    if let Ok(state) = authed.state() {
+        let _ = registry.update(&name, |record| {
+            let mut next = record.clone();
+            if !state.machine_id.trim().is_empty() {
+                next = next.with_id(Some(state.machine_id.clone()));
+            }
+            if let Some(mac) = &state.mac {
+                next = next.with_mac(mac)?;
+            }
+            if let Some(broadcast) = state.broadcast {
+                next = next.with_broadcast(broadcast);
+            }
+            *record = next;
+            Ok(())
+        });
+    }
+
     if json {
         document(
             "barge.machine-paired/1",
-            vec![("machine_name", json!(name))],
+            vec![
+                ("machine_name", json!(name)),
+                ("client_id", json!(client_id)),
+            ],
         )?;
     } else {
-        println!("paired {name}");
+        println!("paired {name} (client {client_id})");
     }
     Ok(())
 }
 
-fn unpair<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Result<()> {
+fn unpair<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
     let options = Options::parse(rest, &[], &[])?;
     let name = options.single("machine unpair", "name")?;
     let registry = (env.discover)()?;
@@ -252,7 +502,85 @@ fn unpair<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> R
     Ok(())
 }
 
-fn status<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Result<()> {
+fn clients<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
+    let options = Options::parse(rest, &[], &[])?;
+    let name = options.single("machine clients", "name")?;
+    let registry = (env.discover)()?;
+    let machine = registry.get(&name).map_err(machine_error)?;
+    let (client, _) = machine_client(&registry, &machine)?;
+    let list = client.clients().map_err(machine_error)?;
+    if json {
+        document(
+            "barge.machine-clients/1",
+            vec![
+                ("machine_name", json!(machine.name())),
+                ("clients", json!(list.clients)),
+            ],
+        )?;
+    } else if list.clients.is_empty() {
+        println!("no paired clients on {}", machine.name());
+    } else {
+        for item in list.clients {
+            println!(
+                "{}: {} (paired {} local)",
+                item.id,
+                item.name,
+                human::local_clock(item.paired_at_unix_ms)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn revoke<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
+    let options = Options::parse(rest, &[], &[])?;
+    let (machine_name, client_id) = match options.positionals.as_slice() {
+        [machine, client] => (machine.clone(), client.clone()),
+        _ => return Err(Error::usage("machine revoke needs <name> <client-id>")),
+    };
+    let registry = (env.discover)()?;
+    let machine = registry.get(&machine_name).map_err(machine_error)?;
+    let local_creds = registry
+        .credentials(machine.name())
+        .map_err(machine_error)?;
+    let (client, _) = machine_client(&registry, &machine)?;
+    let revoked = client.revoke_client(&client_id).map_err(machine_error)?;
+
+    let revoked_self = local_creds.as_ref().is_some_and(|creds| {
+        creds.client_id.as_deref() == Some(revoked.client_id.as_str())
+            || (creds.client_id.is_none() && revoked.client_id == "legacy")
+    });
+    if revoked_self {
+        let _ = registry.unpair(machine.name());
+    }
+
+    if json {
+        document(
+            "barge.machine-client-revoked/1",
+            vec![
+                ("machine_name", json!(machine.name())),
+                ("client_id", json!(revoked.client_id)),
+            ],
+        )?;
+    } else {
+        println!("revoked client {} on {}", revoked.client_id, machine.name());
+    }
+    Ok(())
+}
+
+fn status<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
     let options = Options::parse(rest, &[], &[])?;
     let name = options.single("machine status", "name")?;
     let registry = (env.discover)()?;
@@ -289,7 +617,11 @@ fn status<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> R
     Ok(())
 }
 
-fn cancel<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> Result<()> {
+fn cancel<S: DatagramSender, B: MdnsBrowser>(
+    rest: &[String],
+    json: bool,
+    env: &Env<'_, S, B>,
+) -> Result<()> {
     let options = Options::parse(rest, &[], &[])?;
     let name = options.single("machine cancel", "name")?;
     let registry = (env.discover)()?;
@@ -313,8 +645,14 @@ fn cancel<S: DatagramSender>(rest: &[String], json: bool, env: &Env<'_, S>) -> R
 }
 
 fn machine_client(registry: &Registry, machine: &Machine) -> Result<(DaemonClient, &'static str)> {
-    if let Some(key) = registry.key(machine.name()).map_err(machine_error)? {
-        Ok((DaemonClient::for_lan(machine, key), "lan"))
+    if let Some(creds) = registry
+        .credentials(machine.name())
+        .map_err(machine_error)?
+    {
+        Ok((
+            DaemonClient::for_lan_client(machine, creds.client_id, creds.key),
+            "lan",
+        ))
     } else {
         Ok((DaemonClient::for_machine(machine), "tailscale"))
     }
@@ -324,11 +662,11 @@ fn machine_client(registry: &Registry, machine: &Machine) -> Result<(DaemonClien
 ///
 /// Sleep starts its countdown at once; restart and shutdown ask first unless
 /// `--yes` was given (docs/knowledge/machines.md, "Behaviour").
-fn machine_power<S: DatagramSender>(
+fn machine_power<S: DatagramSender, B: MdnsBrowser>(
     action: PowerActionKind,
     arguments: &[String],
     json: bool,
-    env: &Env<'_, S>,
+    env: &Env<'_, S, B>,
 ) -> Result<()> {
     let options = Options::parse(arguments, &["delay"], &["yes"])?;
     let name = options.single(&format!("machine {}", action.as_str()), "name")?;
@@ -377,6 +715,39 @@ fn machine_power<S: DatagramSender>(
     Ok(())
 }
 
+fn parse_timeout(options: &Options, default: Duration) -> Result<Duration> {
+    let Some(raw) = options.get("timeout") else {
+        return Ok(default);
+    };
+    let seconds: f64 = raw
+        .parse()
+        .map_err(|_| Error::usage("--timeout must be non-negative seconds"))?;
+    if !seconds.is_finite() || !(0.0..=3600.0).contains(&seconds) {
+        return Err(Error::usage("--timeout must be 0-3600 seconds"));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn local_hostname() -> Option<String> {
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: `buf` is a live, writable buffer of `buf.len()` bytes.
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    buf[buf.len() - 1] = 0;
+    // SAFETY: `buf` is NUL-terminated above.
+    let name = unsafe { CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    let short = name.split('.').next().unwrap_or("").trim().to_string();
+    if short.is_empty() {
+        None
+    } else {
+        Some(short)
+    }
+}
+
 /// The interactive confirmation: one line from stdin, anything but yes is no.
 struct Prompt;
 
@@ -416,12 +787,16 @@ pub(crate) fn machine_error(error: barge_machine::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{machine_with, KeyInput};
+    use super::machine_with;
     use barge::testing::TempDir;
-    use barge_machine::{DatagramSender, Registry};
-    use std::io;
-    use std::net::SocketAddr;
+    use barge_machine::{
+        parse_public_key, DatagramSender, DiscoveredMachine, KeyPair, MdnsBrowser, PairResponse,
+        PairRole, PairStatus, PairStatusResponse, Registry,
+    };
+    use std::io::{self, Read, Write};
+    use std::net::{SocketAddr, TcpListener};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct FakeSender(Mutex<Vec<(Vec<u8>, SocketAddr)>>);
@@ -433,16 +808,13 @@ mod tests {
         }
     }
 
-    /// Stands in for the key on standard input.
-    struct FixedKey(&'static str);
+    struct FakeBrowser(Vec<DiscoveredMachine>);
 
-    impl KeyInput for FixedKey {
-        fn read_key(&self) -> barge::Result<String> {
-            Ok(self.0.to_string())
+    impl MdnsBrowser for FakeBrowser {
+        fn browse(&self, _timeout: Duration) -> barge_machine::Result<Vec<DiscoveredMachine>> {
+            Ok(self.0.clone())
         }
     }
-
-    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn arguments(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_string()).collect()
@@ -454,6 +826,7 @@ mod tests {
         let temp = TempDir::new("cli-machine").unwrap();
         let registry = Registry::open(temp.path()).unwrap();
         let sender = FakeSender::default();
+        let browser = FakeBrowser(Vec::new());
         for words in [
             &[
                 "add",
@@ -469,7 +842,7 @@ mod tests {
             &["list"][..],
             &["wake", "pc"][..],
         ] {
-            machine_with(&arguments(words), true, &registry, &sender, &FixedKey(KEY)).unwrap();
+            machine_with(&arguments(words), true, &registry, &sender, &browser).unwrap();
         }
         let sent = sender.0.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -479,28 +852,161 @@ mod tests {
     }
 
     #[test]
-    fn machine_pair_stores_the_key_read_from_the_seam() {
-        let temp = TempDir::new("cli-machine-pair").unwrap();
+    fn machine_discover_and_add_from_discovery_need_no_host_or_mac() {
+        let temp = TempDir::new("cli-machine-discover").unwrap();
         let registry = Registry::open(temp.path()).unwrap();
         let sender = FakeSender::default();
-        let add = arguments(&[
-            "add",
-            "--name",
-            "pc",
-            "--hostname",
-            "pc.local",
-            "--mac",
-            "00:11:22:33:44:ff",
-        ]);
-        machine_with(&add, false, &registry, &sender, &FixedKey(KEY)).unwrap();
+        let browser = FakeBrowser(vec![DiscoveredMachine {
+            id: "mid-1234".to_string(),
+            name: "Bazzite PC".to_string(),
+            mode: "lan".to_string(),
+            protocol_version: "1".to_string(),
+            address: "192.168.1.42".to_string(),
+            port: 9777,
+        }]);
         machine_with(
-            &arguments(&["pair", "pc"]),
+            &arguments(&["discover"]),
             false,
             &registry,
             &sender,
-            &FixedKey(KEY),
+            &browser,
         )
         .unwrap();
-        assert!(registry.key("pc").unwrap().is_some());
+        machine_with(
+            &arguments(&["add", "Bazzite PC"]),
+            false,
+            &registry,
+            &sender,
+            &browser,
+        )
+        .unwrap();
+        let saved = registry.get("bazzite-pc").unwrap();
+        assert_eq!(saved.id(), Some("mid-1234"));
+        assert_eq!(saved.hostname(), "192.168.1.42");
+        assert_eq!(saved.daemon_port(), 9777);
+        assert_eq!(saved.mac(), None);
+
+        // DHCP renewal updates registered IP when discover sees the same machine ID.
+        let moved = FakeBrowser(vec![DiscoveredMachine {
+            id: "mid-1234".to_string(),
+            name: "Bazzite PC".to_string(),
+            mode: "lan".to_string(),
+            protocol_version: "1".to_string(),
+            address: "192.168.1.99".to_string(),
+            port: 9777,
+        }]);
+        machine_with(&arguments(&["discover"]), true, &registry, &sender, &moved).unwrap();
+        assert_eq!(
+            registry.get("bazzite-pc").unwrap().hostname(),
+            "192.168.1.99"
+        );
+    }
+
+    #[test]
+    fn machine_pair_runs_x25519_flow_and_records_state_mac_and_broadcast() {
+        let temp = TempDir::new("cli-machine-pair-flow").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+        let sender = FakeSender::default();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = FakeBrowser(vec![DiscoveredMachine {
+            id: "mid-9".to_string(),
+            name: "pc".to_string(),
+            mode: "lan".to_string(),
+            protocol_version: "1".to_string(),
+            address: "127.0.0.1".to_string(),
+            port,
+        }]);
+
+        let daemon_keys = KeyPair::generate().unwrap();
+        let daemon_pub = daemon_keys.public_key_hex();
+        let server = std::thread::spawn(move || {
+            let mut derived_key = None;
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let text = String::from_utf8_lossy(&buf[..n]);
+                let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+                let (status, reply) = if text.starts_with("POST /v1/pair ") {
+                    let req: barge_machine::PairRequest = serde_json::from_str(body).unwrap();
+                    let client_pub = parse_public_key(&req.public_key).unwrap();
+                    derived_key = Some(
+                        daemon_keys
+                            .derive(&client_pub, PairRole::Daemon)
+                            .unwrap()
+                            .key()
+                            .to_vec(),
+                    );
+                    (
+                        202,
+                        serde_json::to_string(&PairResponse::new("req-1", &daemon_pub, 9_999_999))
+                            .unwrap(),
+                    )
+                } else if step == 1 && text.starts_with("GET /v1/pair/req-1 ") {
+                    (
+                        200,
+                        serde_json::to_string(&PairStatusResponse::new(
+                            "req-1",
+                            PairStatus::Pending,
+                            None,
+                        ))
+                        .unwrap(),
+                    )
+                } else if text.starts_with("GET /v1/pair/req-1 ") {
+                    (
+                        200,
+                        serde_json::to_string(&PairStatusResponse::new(
+                            "req-1",
+                            PairStatus::Approved,
+                            Some("cid-42".to_string()),
+                        ))
+                        .unwrap(),
+                    )
+                } else {
+                    assert!(text.contains("x-barge-client-id: cid-42"), "{text}");
+                    (
+                        200,
+                        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-9","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1.255"}"#.to_string(),
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+            derived_key.unwrap()
+        });
+
+        machine_with(
+            &arguments(&["add", "pc"]),
+            false,
+            &registry,
+            &sender,
+            &browser,
+        )
+        .unwrap();
+        machine_with(
+            &arguments(&["pair", "pc", "--client-name", "MacBook"]),
+            false,
+            &registry,
+            &sender,
+            &browser,
+        )
+        .unwrap();
+
+        let expected_key = server.join().unwrap();
+        let creds = registry.credentials("pc").unwrap().unwrap();
+        assert_eq!(creds.client_id.as_deref(), Some("cid-42"));
+        assert_eq!(creds.key, expected_key);
+
+        let updated = registry.get("pc").unwrap();
+        assert_eq!(updated.mac(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(
+            updated.broadcast(),
+            std::net::Ipv4Addr::new(192, 168, 1, 255)
+        );
     }
 }
