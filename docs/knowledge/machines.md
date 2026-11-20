@@ -128,7 +128,7 @@ exit 2 — and is refused where the machine is built.
 
 ## Discovery and pairing
 
-Status: design draft for Tom's sign-off, 2026-11-20. Nothing here is built.
+Status: design approved by Tom, 2026-11-20. Nothing here is built yet.
 
 Tom, 2026-11-20: for release, the Steam Deck plugin and the desktop app find
 machines on the network themselves, with no manual entry of hosts, MACs or
@@ -191,12 +191,14 @@ the PC, not a terminal):
 - Out of scope: discovery across networks (Tailscale has its own names) and
   pairing over Tailscale, which already identifies callers through `whois`.
 
-### Questions for Tom
+### Rulings
 
-- Approval on the PC through the Decky plugin in Gaming Mode and a
-  notification in Desktop Mode, plus any paired client: is that the right set?
-- Per-client keys replacing the single shared key: OK to migrate the current
-  key into the list automatically?
+Tom, 2026-11-20, approving this design:
+
+- Approval happens on the PC through the Decky plugin in Gaming Mode and a
+  desktop notification in Desktop Mode, and from any paired client.
+- The current shared key migrates into the per-client list automatically, so
+  the Mac and the Deck keep working without pairing again.
 
 ## UI
 
@@ -225,7 +227,8 @@ Poodle and Longhorn, covering Machines and Storage in its first release.
 3. **Built:** LAN pairing and authenticated requests, with no Tailscale required.
 4. Tailscale on both machines, once Tom is ready for the sign-ins.
 4a. Discovery and per-client pairing, designed in
-   [discovery and pairing](#discovery-and-pairing), once Tom signs it off.
+   [discovery and pairing](#discovery-and-pairing): `barged` and the CLI
+   first, then the Mac app and the Decky plugin.
 5. The Barge app: see [app](app.md#build-order).
 6. Retire MoonDeck Buddy on the PC. This changes host software, so it needs
    Tom's go-ahead. The Steam Deck needs a `barged` client first, or loses
