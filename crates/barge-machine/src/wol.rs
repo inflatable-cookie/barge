@@ -55,7 +55,7 @@ pub(crate) fn format_mac(mac: [u8; 6]) -> String {
 /// Build the 102-byte Wake-on-LAN magic packet.
 pub fn magic_packet(mac: [u8; 6]) -> [u8; 102] {
     let mut packet = [0xff; 102];
-    for chunk in packet[6..].chunks_exact_mut(6) {
+    for chunk in packet[6..].as_chunks_mut::<6>().0 {
         chunk.copy_from_slice(&mac);
     }
     packet

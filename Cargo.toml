@@ -9,9 +9,8 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# The declared toolchain is the first consumer's (`rust-version = "1.97.1"`,
-# same channel), so Barge's MSRV follows that consumer rather than inventing its
-# own.
+# The MSRV remains 1.97.1 for consumers even though this repository builds with
+# the newer toolchain pinned in rust-toolchain.toml.
 rust-version = "1.97.1"
 # Barge is consumed by path or Git revision; it is never published to a registry.
 publish = false

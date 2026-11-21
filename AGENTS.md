@@ -26,9 +26,9 @@ Wake-on-LAN, daemon protocol types and the `barged` client, separate from
 storage. `crates/barged` is the machine daemon: state and power over HTTP, with
 Tailscale `whois` and logind behind seams; `packaging/barged/` holds its unit,
 polkit rule and example config. Its platform limits are
-[architecture](docs/knowledge/architecture.md#platforms). Toolchain `1.97.1` is
-pinned in `rust-toolchain.toml`; edition 2021 is set in `Cargo.toml` and
-`Cargo.lock` is committed.
+[architecture](docs/knowledge/architecture.md#platforms). Toolchain `1.100.0` is
+pinned in `rust-toolchain.toml`; the library MSRV remains `1.97.1`; edition
+2021 is set in `Cargo.toml` and `Cargo.lock` is committed.
 Oxide depends on the library at an exact Git commit. `apps/barge-app` contains
 the Tauri menu-bar app and Svelte renderer. UI work on it uses the Impeccable skill
 vendored in `.agents/skills/impeccable` (Claude reads it through `.claude/skills`).

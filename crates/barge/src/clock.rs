@@ -46,11 +46,19 @@ impl ManualClock {
     }
 
     pub fn advance(&self, by_ms: u64) {
-        let _ = self
-            .millis
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                Some(current.saturating_add(by_ms))
-            });
+        let mut current = self.millis.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_add(by_ms);
+            match self.millis.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
