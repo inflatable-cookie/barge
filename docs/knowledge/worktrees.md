@@ -6,7 +6,7 @@ the CLI), and so is the consumer hold seam, `barge worktree run`
 it is in [step 1 as built](#step-1-as-built). Warm-path key checks and `prune`
 are step 2.
 
-Barge keeps a warm pool of git worktrees per repository on Stash and leases
+Barge keeps a warm pool of git worktrees per repository on External and leases
 them to agents. An agent starts in a checkout that already has its dependencies
 installed, instead of cloning and installing from cold. Worktrees are Barge's
 domain ([vision](vision.md#direction)); the reference design is
@@ -173,7 +173,7 @@ state directory:
 ## Nucleus and Paseo
 
 Nucleus creates and owns task worktrees today, under its `workRoot`
-(`/Volumes/Stash/queue/workspaces/<hash>/ns-<task>`); Paseo and T3 only
+(`<workRoot>/<hash>/ns-<task>`); Paseo and T3 only
 register the directory Nucleus made. The Nucleus planner confirmed
 (2026-11-20) there is no seam for an outside provider: a Paseo plugin runs too
 late. Taking workspaces from Barge needs a host-independent change to Nucleus's

@@ -178,7 +178,7 @@ mod tests {
 
     fn volume() -> VolumeSummary {
         VolumeSummary {
-            name: "Stash".into(),
+            name: "External".into(),
             presence: Presence::Present,
             free_bytes: Some(2_284 * 1024 * 1024 * 1024),
         }
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(
             ids(&entries),
             vec![
-                "storage:Stash",
+                "storage:External",
                 "-",
                 "header:linux-pc",
                 "sleep:linux-pc",
@@ -347,9 +347,9 @@ mod tests {
     #[test]
     fn the_storage_line_opens_storage_and_names_issues_only_when_there_are_findings() {
         let clean = plan_for(&[], Some(0), "");
-        assert_eq!(labels(&clean)[0], "Stash · 2284.0 GiB free");
+        assert_eq!(labels(&clean)[0], "External · 2284.0 GiB free");
         let dirty = plan_for(&[], Some(1), "");
-        assert_eq!(labels(&dirty)[0], "Stash · 2284.0 GiB free · 1 issue");
+        assert_eq!(labels(&dirty)[0], "External · 2284.0 GiB free · 1 issue");
         let many = plan_for(&[], Some(3), "");
         assert!(labels(&many)[0].ends_with("· 3 issues"));
         let unknown = plan_for(&[], None, "");
@@ -451,7 +451,7 @@ mod tests {
         let entries = plan_for(&[], None, "");
         assert_eq!(
             ids(&entries),
-            vec!["storage:Stash", "-", "open", "settings", "quit"]
+            vec!["storage:External", "-", "open", "settings", "quit"]
         );
     }
 }

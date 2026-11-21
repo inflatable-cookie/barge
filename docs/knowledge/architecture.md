@@ -119,7 +119,7 @@ one `lock` file there and publish by atomic rename. The account layout is the
 authority for class placement; each volume also carries `<mount>/.barge/layout.json`,
 which lists the classes that volume holds ([resources](resources.md#layout)).
 
-Today's Stash layout (`scratch/`, `caches/`, `oxide-pool/`, `oxide-outputs/`
+Today's External layout (`scratch/`, `caches/`, `oxide-pool/`, `oxide-outputs/`
 at the drive root) is expressed as `root_dir = ""` with Oxide's two areas
 overridden to their existing folder names, so adoption moves nothing.
 
@@ -341,7 +341,7 @@ identity. Required cases:
 
 There are no native proof ladders or capture harnesses. Before Oxide adopts a
 new Barge revision, run `barge volume status` and a `prune --dry-run` against
-the real Stash drive by hand.
+the real External drive by hand.
 
 Two test affordances exist and no others. `barge::testing` is behind the
 `testing` feature, which only dev-dependencies enable, so it is not in the
