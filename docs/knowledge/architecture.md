@@ -146,8 +146,8 @@ let layout = barge.layout()?;                     // account resource placements
 let scratch = barge.resource_path(Class::Scratch, Some("project"))?;
 let survey = barge.survey("Builds", true)?;       // read-only inventory
 let report = barge.doctor()?;                     // read-only drift report
-let block = barge.workflow("project")?;           // the managed AGENTS.md block
-let init = barge.init(repo, None)?;               // insert or replace it, and record it
+let file = barge.workflow("project")?;           // the scratch file text, as init writes it
+let init = barge.init(repo, None)?;               // write AGENTS.local.md, exclude it, and record it
 let vol = barge.volume("Builds")?;
 vol.state()?;                                     // Present | Absent | Mismatch
 
@@ -281,7 +281,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 - `survey <volume> [--no-bytes]`;
 - `bind list | plan | apply | adopt | undo`;
 - `init [--project p] [--path dir] [--check]`, which writes or reports the
-  managed `AGENTS.md` workflow block from the layout
+  uncommitted `AGENTS.local.md` scratch file from the layout
   ([resources](resources.md#reaching-tools-and-agents-without-coupling));
 - `move --plan | --apply [--retarget-unrecorded]`;
 - `doctor`;
@@ -335,9 +335,10 @@ identity. Required cases:
   follows a symlink;
 - doctor reports ok, drifted, stale, missing and unavailable, and writes nothing
   on a read-only account;
-- `init` inserts, replaces and leaves a workflow block alone, keeps the bytes
-  around it, refuses unbalanced markers, and renders while the volume is away;
-  `--check` and doctor write nothing.
+- `init` writes, replaces and leaves alone `AGENTS.local.md`, adds its exclude
+  entry once (also in a linked worktree's common Git directory), never edits
+  the committed `AGENTS.md`, renders while the volume is away, and reports a
+  leftover block or a missing pointer; `--check` and doctor write nothing.
 
 There are no native proof ladders or capture harnesses. Before Oxide adopts a
 new Barge revision, run `barge volume status` and a `prune --dry-run` against

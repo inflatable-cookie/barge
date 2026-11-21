@@ -8,7 +8,7 @@
 //! for as long as the lease lives. Nothing here scans or kills processes.
 
 mod cleanup;
-mod git;
+pub(crate) mod git;
 mod lease;
 mod leases;
 mod pools;

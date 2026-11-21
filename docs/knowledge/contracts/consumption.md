@@ -70,8 +70,8 @@ below read `_name`, `_key` and `_state`.
 | `barge.binding/1` | `action: string`, `binding: binding-record` | bind apply, bind adopt, bind undo |
 | `barge.move/1` | `report: move-report` | move apply |
 | `barge.doctor/1` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]` | doctor |
-| `barge.init/1` | `project: string`, `path: string`, `action: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state` | init |
-| `barge.init-check/1` | `project: string`, `path: string`, `block_state: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state`, `diff: [string]` | init --check |
+| `barge.init/1` | `project: string`, `path: string`, `action: string`, `exclude: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state`, `warnings: [string]` | init |
+| `barge.init-check/1` | `project: string`, `path: string`, `block_state: string`, `exclude: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state`, `diff: [string]`, `warnings: [string]` | init --check |
 | `barge.machine-discover/1` | `discovered: [discovered-machine]` | machine discover |
 | `barge.machine/1` | `machine: machine` | machine add |
 | `barge.machine-list/1` | `machines: [machine]` | machine list |

@@ -204,9 +204,9 @@ pub(crate) fn describe_binding(state: &BindingState) -> String {
 
 pub(crate) fn print_init(report: &InitReport) {
     println!(
-        "{} the barge workflow block in {}",
+        "{} the scratch file {}",
         match report.action {
-            InitAction::Inserted => "inserted",
+            InitAction::Inserted => "wrote",
             InitAction::Replaced => "replaced",
             InitAction::Unchanged => "left unchanged",
         },
@@ -220,24 +220,28 @@ pub(crate) fn print_init(report: &InitReport) {
             describe_state(&report.volume_state)
         );
     }
+    for warning in &report.warnings {
+        eprintln!("barge: {warning}");
+    }
 }
 
 pub(crate) fn print_init_check(check: &InitCheck) {
-    match check.state {
-        BlockState::Current => println!(
-            "the barge workflow block in {} is current",
-            check.path.display()
-        ),
-        BlockState::Stale | BlockState::Missing => {
-            for line in &check.diff {
-                println!("{line}");
-            }
+    if check.is_current() {
+        println!("the scratch file {} is current", check.path.display());
+    } else {
+        for line in &check.diff {
+            println!("{line}");
+        }
+        if check.state != BlockState::Current {
             eprintln!(
-                "barge: the barge workflow block in {} is {}; run `barge init`",
+                "barge: the scratch file {} is {}; run `barge init`",
                 check.path.display(),
                 check.state.name()
             );
         }
+    }
+    for warning in &check.warnings {
+        eprintln!("barge: {warning}");
     }
     if !check.volume_present() {
         eprintln!(

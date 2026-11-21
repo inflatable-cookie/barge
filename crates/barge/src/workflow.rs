@@ -1,17 +1,19 @@
-//! `barge init`: the managed workflow block in a repository's `AGENTS.md`.
+//! `barge init`: the scratch file an interactive agent reads on this machine.
 //!
-//! An interactive agent learns where its scratch lives from a block Barge
-//! renders from the account layout, the way `oxide init` writes its own: the
-//! scratch folder for that project, how to get a fresh scratch root, and the
-//! rule never to write scratch to a home folder or a drive root. Markers delimit
-//! the block, so `init` replaces only the content between them and keeps every
-//! other byte of the file. `init --check` reports whether the block is current
-//! and writes nothing, and the `workflow` binding `init` records lets
-//! `barge doctor` report a stale block.
+//! The scratch folder names paths on one machine, so it cannot live in a file
+//! that is committed. `init` writes `AGENTS.local.md` at the repository root and
+//! owns the whole file. It keeps the file out of Git through the repository's
+//! `info/exclude` (never `.gitignore`, and never a commit), and it records a
+//! `workflow` binding so `barge doctor` can report the file as current, stale or
+//! missing.
 //!
-//! The block names a location, not a mounted path: it renders from the layout
-//! even while the class's volume is away, so an agent can still be told where its
-//! scratch belongs. Worktrees are not mentioned until that class has a binding.
+//! The committed `AGENTS.md` only needs a line that names the local file. `init`
+//! and `--check` print that line when it is missing, and they report a block left
+//! over from the earlier design. Neither edits the committed file.
+//!
+//! The file names a location, not a mounted path, so it renders from the layout
+//! even while the class's volume is away. Worktrees are not mentioned until that
+//! class has a binding.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,36 +25,41 @@ use crate::error::{Error, Result};
 use crate::layout::{Class, Layout};
 use crate::state::{publish, validate_name};
 use crate::volume::VolumeState;
+use crate::worktree::git;
 use crate::Barge;
 
-/// The file inside a repository that carries the block.
-pub const AGENTS_FILE: &str = "AGENTS.md";
+/// The file `init` owns in a repository. It is never committed.
+pub const LOCAL_FILE: &str = "AGENTS.local.md";
 
-/// The line that opens the managed block.
+/// The committed file that names [`LOCAL_FILE`]. A block from the earlier design
+/// may still be in it, and so may the old `workflow` binding's record.
+pub const COMMITTED_FILE: &str = "AGENTS.md";
+
+/// The line the committed file should carry so agents find the local file.
+pub const POINTER_LINE: &str = "Machine-specific scratch locations are in AGENTS.local.md, written by barge init and never committed; read it if it exists.";
+
+/// The markers of the block the earlier design wrote into `AGENTS.md`. `init`
+/// never writes them; it only looks for them to report a leftover block.
 pub const START_MARKER: &str = "<!-- barge:workflow:start -->";
 
-/// The line that closes it.
+/// The line that closes that block.
 pub const END_MARKER: &str = "<!-- barge:workflow:end -->";
 
-/// The rendered block for one project and the folder it names.
+/// The entry `init` adds to `info/exclude`, anchored at the repository root.
+const EXCLUDE_ENTRY: &str = "/AGENTS.local.md";
+
+/// The file the rendered content is for one project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rendered {
-    /// The text between the markers, markers excluded.
-    pub(crate) interior: String,
-    /// The scratch folder the block names for this project.
+    /// The whole file `init` writes.
+    pub(crate) content: String,
+    /// The scratch folder the file names for this project.
     pub(crate) scratch: PathBuf,
 }
 
-impl Rendered {
-    /// The whole block, markers included, ending with a newline.
-    fn text(&self) -> String {
-        format!("{START_MARKER}\n{}{END_MARKER}\n", self.interior)
-    }
-}
-
-/// Render the block for one project from the layout, under `base`.
+/// Render the file for one project from the layout, under `base`.
 ///
-/// It only needs the layout, so it renders while the volume is away: the block
+/// It only needs the layout, so it renders while the volume is away: the file
 /// names where the scratch belongs, not whether it is mounted right now.
 pub(crate) fn render(layout: &Layout, base: &Path, project: &str) -> Result<Rendered> {
     let placement = layout.classes.get(&Class::Scratch).ok_or_else(|| {
@@ -62,15 +69,15 @@ pub(crate) fn render(layout: &Layout, base: &Path, project: &str) -> Result<Rend
     })?;
     let scratch = base.join(&placement.path).join(project);
     Ok(Rendered {
-        interior: interior(project, &placement.volume, &scratch),
+        content: contents(project, &placement.volume, &scratch),
         scratch,
     })
 }
 
-fn interior(project: &str, volume: &str, scratch: &Path) -> String {
+fn contents(project: &str, volume: &str, scratch: &Path) -> String {
     let mut text = String::new();
     text.push_str(
-        "<!-- Generated by `barge init` from the resource layout. Edits between these markers are replaced. -->\n",
+        "<!-- Generated by `barge init` from the resource layout. Edits to this file are replaced. -->\n",
     );
     text.push('\n');
     text.push_str("## Scratch for this project\n\n");
@@ -85,74 +92,20 @@ fn interior(project: &str, volume: &str, scratch: &Path) -> String {
     text
 }
 
-/// What a file holds where the managed block belongs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Block {
-    /// No markers at all: the block is inserted at the end.
-    Absent,
-    /// One pair of markers, ordered, with the byte range between them.
-    Present { start: usize, end: usize },
-    /// Markers that cannot be trusted, with the reason.
-    Broken(String),
+/// Whether a committed file still carries a block from the earlier design: a
+/// line that is one of its markers.
+fn has_legacy_block(content: &str) -> bool {
+    content
+        .lines()
+        .map(str::trim)
+        .any(|line| line == START_MARKER || line == END_MARKER)
 }
 
-/// Locate the managed block in `content`. A marker is a line of its own, and
-/// markers must appear exactly once each, start before end.
-pub(crate) fn locate(content: &str) -> Block {
-    let mut start: Option<(usize, usize)> = None;
-    let mut end: Option<usize> = None;
-    let mut duplicate_start = false;
-    let mut duplicate_end = false;
-    let mut offset = 0;
-    for line in content.split_inclusive('\n') {
-        let line_start = offset;
-        offset += line.len();
-        let text = line.trim_end_matches(['\n', '\r']).trim();
-        if text == START_MARKER {
-            if start.replace((line_start, offset)).is_some() {
-                duplicate_start = true;
-            }
-        } else if text == END_MARKER && end.replace(line_start).is_some() {
-            duplicate_end = true;
-        }
-    }
-    if duplicate_start {
-        return Block::Broken(format!("{START_MARKER} appears more than once"));
-    }
-    if duplicate_end {
-        return Block::Broken(format!("{END_MARKER} appears more than once"));
-    }
-    match (start, end) {
-        (None, None) => Block::Absent,
-        (Some(_), None) => Block::Broken(format!("{START_MARKER} has no {END_MARKER}")),
-        (None, Some(_)) => Block::Broken(format!("{END_MARKER} has no {START_MARKER}")),
-        (Some((_, start_end)), Some(end_start)) => {
-            if end_start < start_end {
-                Block::Broken(format!("{END_MARKER} comes before {START_MARKER}"))
-            } else {
-                Block::Present {
-                    start: start_end,
-                    end: end_start,
-                }
-            }
-        }
-    }
-}
-
-/// Append the block after the file's own text, separated by one blank line.
-fn insert(content: &str, block: &str) -> String {
-    if content.is_empty() {
-        return block.to_string();
-    }
-    let mut text = content.to_string();
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    if !text.ends_with("\n\n") {
-        text.push('\n');
-    }
-    text.push_str(block);
-    text
+/// Whether an exclude file keeps the local file out of Git.
+fn excludes(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .any(|line| line == EXCLUDE_ENTRY || line == LOCAL_FILE)
 }
 
 /// What a file holds, once it is read.
@@ -175,47 +128,73 @@ pub(crate) fn read_file(path: &Path) -> Result<FileContents> {
     }
 }
 
-/// What `barge init` did to the file.
+/// What `barge init` did to the local file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InitAction {
-    /// The block was added to a file without one, or to a new file.
+    /// The file did not exist and was written.
     Inserted,
-    /// A stale block between existing markers was replaced.
+    /// A stale file was rewritten.
     Replaced,
-    /// The block was already current; nothing was written.
+    /// The file was already current; nothing was written.
     Unchanged,
+}
+
+/// Whether the repository's Git exclude file keeps the local file out of Git.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExcludeState {
+    /// The exclude file names the local file.
+    Excluded,
+    /// The repository exists but its exclude file does not name the local file.
+    NotExcluded,
+    /// The folder has no `.git`, so there is no exclude file to write.
+    NotARepository,
+}
+
+impl ExcludeState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Excluded => "excluded",
+            Self::NotExcluded => "not_excluded",
+            Self::NotARepository => "not_a_repository",
+        }
+    }
 }
 
 /// One `barge init` run.
 #[derive(Debug, Clone, Serialize)]
 pub struct InitReport {
     pub project: String,
-    /// The `AGENTS.md` that holds the block.
+    /// The local file `init` owns: `AGENTS.local.md` in the repository.
     pub path: PathBuf,
     pub action: InitAction,
+    pub exclude: ExcludeState,
+    /// What the operator must act on by hand, such as a line to add to the
+    /// committed file or a block to delete from it.
+    pub warnings: Vec<String>,
     pub volume_name: String,
     pub volume_state: VolumeState,
-    /// The scratch folder the block names.
+    /// The scratch folder the file names.
     pub scratch: PathBuf,
 }
 
 impl InitReport {
-    /// Whether the class's volume was there when the block was rendered.
+    /// Whether the class's volume was there when the file was rendered.
     pub fn volume_present(&self) -> bool {
         matches!(self.volume_state, VolumeState::Present)
     }
 }
 
-/// What a repository's managed block is right now.
+/// What the repository's local file is right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockState {
-    /// The block matches what the layout renders.
+    /// The file matches what the layout renders.
     Current,
-    /// A block is there but differs from the rendered one.
+    /// A file is there but differs from the rendered one.
     Stale,
-    /// There is no file, or no block in it.
+    /// There is no file.
     Missing,
 }
 
@@ -233,30 +212,34 @@ impl BlockState {
 #[derive(Debug, Clone, Serialize)]
 pub struct InitCheck {
     pub project: String,
-    /// The `AGENTS.md` that should hold the block.
+    /// The local file that should hold the scratch content.
     pub path: PathBuf,
     pub state: BlockState,
+    pub exclude: ExcludeState,
+    pub warnings: Vec<String>,
     pub volume_name: String,
     pub volume_state: VolumeState,
-    /// The scratch folder the block should name.
+    /// The scratch folder the file should name.
     pub scratch: PathBuf,
-    /// A diff of the block the file holds against the rendered one, `-` for what
-    /// is there and `+` for what should be.
+    /// A diff of the file against the rendered one, `-` for what is there and
+    /// `+` for what should be.
     pub diff: Vec<String>,
 }
 
 impl InitCheck {
+    /// Current means the file matches and Git does not see it. A folder that is
+    /// not a repository has nothing to exclude from, so it is only a warning.
     pub fn is_current(&self) -> bool {
-        self.state == BlockState::Current
+        self.state == BlockState::Current && self.exclude != ExcludeState::NotExcluded
     }
 
-    /// Whether the class's volume was there when the block was rendered.
+    /// Whether the class's volume was there when the file was rendered.
     pub fn volume_present(&self) -> bool {
         matches!(self.volume_state, VolumeState::Present)
     }
 }
 
-/// A rendered block for one repository, resolved once for `init` and `--check`.
+/// A rendered file for one repository, resolved once for `init` and `--check`.
 struct Resolved {
     repository: PathBuf,
     project: String,
@@ -264,111 +247,88 @@ struct Resolved {
     rendered: Rendered,
     volume_name: String,
     volume_state: VolumeState,
+    /// The Git directory holding `info/exclude`, when the folder is a repository.
+    common_dir: Option<PathBuf>,
 }
 
 impl Barge {
-    /// Render the managed workflow block for one project from the account
-    /// layout. Writes nothing and works while the volume is away.
+    /// Render the scratch file for one project from the account layout. Writes
+    /// nothing and works while the volume is away.
     pub fn workflow(&self, project: &str) -> Result<WorkflowBlock> {
         validate_name("project", project)?;
         let (rendered, volume, volume_state) = self.render_scratch_block(project)?;
-        let text = rendered.text();
         Ok(WorkflowBlock {
             project: project.to_string(),
             volume_name: volume,
             volume_state,
             scratch: rendered.scratch,
-            text,
+            text: rendered.content,
         })
     }
 
-    /// Insert or replace the managed block in a repository's `AGENTS.md`, and
-    /// record the block as a `workflow` binding so doctor can report it.
+    /// Write `AGENTS.local.md` in a repository, keep it out of Git, and record it
+    /// as a `workflow` binding so doctor can report it.
     ///
-    /// The project defaults to the repository folder's name. A file without
-    /// markers gets the block at the end; existing markers have only the content
-    /// between them replaced. Unbalanced or duplicate markers are refused.
+    /// The project defaults to the repository folder's name. `init` owns the
+    /// whole local file, so a stale copy is replaced. It never edits the
+    /// committed `AGENTS.md`; it reports what the operator must change there.
     pub fn init(&self, repository: &Path, project: Option<&str>) -> Result<InitReport> {
         self.core.ensure_writable()?;
         let resolved = self.resolve_workflow(repository, project)?;
         let _lock = self.core.state.lock()?;
-        let block = resolved.rendered.text();
-        let (action, contents) = match read_file(&resolved.file)? {
-            FileContents::Missing => (InitAction::Inserted, insert("", &block)),
-            FileContents::NotText => {
-                return Err(Error::refused(format!(
-                    "{} is not valid UTF-8; refusing to edit it",
-                    resolved.file.display()
-                )))
+        let action = match read_file(&resolved.file)? {
+            FileContents::Missing => InitAction::Inserted,
+            FileContents::Text(current) if current == resolved.rendered.content => {
+                InitAction::Unchanged
             }
-            FileContents::Text(content) => match locate(&content) {
-                Block::Absent => (InitAction::Inserted, insert(&content, &block)),
-                Block::Broken(reason) => return Err(broken(&resolved.file, &reason)),
-                Block::Present { start, end } => {
-                    if content[start..end] == resolved.rendered.interior {
-                        (InitAction::Unchanged, content)
-                    } else {
-                        let mut updated = String::with_capacity(content.len());
-                        updated.push_str(&content[..start]);
-                        updated.push_str(&resolved.rendered.interior);
-                        updated.push_str(&content[end..]);
-                        (InitAction::Replaced, updated)
-                    }
-                }
-            },
+            FileContents::Text(_) | FileContents::NotText => InitAction::Replaced,
         };
         if action != InitAction::Unchanged {
-            publish(&resolved.file, contents.as_bytes())?;
+            publish(&resolved.file, resolved.rendered.content.as_bytes())?;
         }
+        let exclude = match &resolved.common_dir {
+            Some(common) => ensure_excluded(common)?,
+            None => ExcludeState::NotARepository,
+        };
         self.record_workflow(&resolved)?;
+        let warnings = warnings(&resolved.repository, exclude)?;
         Ok(InitReport {
             project: resolved.project,
             path: resolved.file,
             action,
+            exclude,
+            warnings,
             volume_name: resolved.volume_name,
             volume_state: resolved.volume_state,
             scratch: resolved.rendered.scratch,
         })
     }
 
-    /// Report whether a repository's block is current, stale or missing, with a
-    /// diff. Writes nothing and works on a read-only account.
+    /// Report whether a repository's local file is current, with a diff and the
+    /// exclude state. Writes nothing and works on a read-only account.
     pub fn init_check(&self, repository: &Path, project: Option<&str>) -> Result<InitCheck> {
         let resolved = self.resolve_workflow(repository, project)?;
+        let content = &resolved.rendered.content;
         let (state, diff) = match read_file(&resolved.file)? {
-            FileContents::Missing => (
-                BlockState::Missing,
-                diff_missing(&resolved.file, &resolved.rendered.interior),
+            FileContents::Missing => (BlockState::Missing, diff_missing(&resolved.file, content)),
+            FileContents::NotText => (BlockState::Stale, diff_file(&resolved.file, "", content)),
+            FileContents::Text(current) if current == *content => (BlockState::Current, Vec::new()),
+            FileContents::Text(current) => (
+                BlockState::Stale,
+                diff_file(&resolved.file, &current, content),
             ),
-            FileContents::NotText => {
-                return Err(Error::refused(format!(
-                    "{} is not valid UTF-8; refusing to read it",
-                    resolved.file.display()
-                )))
-            }
-            FileContents::Text(content) => match locate(&content) {
-                Block::Absent => (
-                    BlockState::Missing,
-                    diff_missing(&resolved.file, &resolved.rendered.interior),
-                ),
-                Block::Broken(reason) => return Err(broken(&resolved.file, &reason)),
-                Block::Present { start, end } => {
-                    let current = &content[start..end];
-                    if current == resolved.rendered.interior {
-                        (BlockState::Current, Vec::new())
-                    } else {
-                        (
-                            BlockState::Stale,
-                            diff_block(&resolved.file, current, &resolved.rendered.interior),
-                        )
-                    }
-                }
-            },
         };
+        let exclude = match &resolved.common_dir {
+            Some(common) => exclude_state(common)?,
+            None => ExcludeState::NotARepository,
+        };
+        let warnings = warnings(&resolved.repository, exclude)?;
         Ok(InitCheck {
             project: resolved.project,
             path: resolved.file,
             state,
+            exclude,
+            warnings,
             volume_name: resolved.volume_name,
             volume_state: resolved.volume_state,
             scratch: resolved.rendered.scratch,
@@ -376,7 +336,7 @@ impl Barge {
         })
     }
 
-    /// Resolve the repository, project and block for `init` and `--check`.
+    /// Resolve the repository, project and rendered file for `init` and `--check`.
     fn resolve_workflow(&self, repository: &Path, project: Option<&str>) -> Result<Resolved> {
         let repository = fs::canonicalize(repository)
             .map_err(|source| Error::io("cannot resolve the repository", repository, &source))?;
@@ -401,8 +361,9 @@ impl Barge {
         };
         validate_name("project", &project)
             .map_err(|error| Error::usage(format!("{}; pass --project", error.message())))?;
-        let file = repository.join(AGENTS_FILE);
+        let file = repository.join(LOCAL_FILE);
         check_editable(&file)?;
+        let common_dir = git_common_dir(&repository)?;
         let (rendered, volume, volume_state) = self.render_scratch_block(&project)?;
         Ok(Resolved {
             file,
@@ -411,11 +372,12 @@ impl Barge {
             rendered,
             volume_name: volume,
             volume_state,
+            common_dir,
         })
     }
 
-    /// Render the scratch workflow block for one project, with the class's
-    /// volume and its current state.
+    /// Render the scratch file for one project, with the class's volume and its
+    /// current state.
     fn render_scratch_block(&self, project: &str) -> Result<(Rendered, String, VolumeState)> {
         let layout = self.layout()?;
         let placement = layout.classes.get(&Class::Scratch).ok_or_else(|| {
@@ -429,8 +391,9 @@ impl Barge {
         Ok((rendered, placement.volume.clone(), volume_state))
     }
 
-    /// Record the block as a `workflow` binding, leaving an identical record
-    /// untouched so a second `init` changes nothing.
+    /// Record the local file as a `workflow` binding, leaving an identical record
+    /// untouched so a second `init` changes nothing. A record that still names
+    /// the committed `AGENTS.md` is replaced by this one.
     fn record_workflow(&self, resolved: &Resolved) -> Result<()> {
         let consumer = resolved.repository.to_string_lossy().into_owned();
         let fresh = BindingRecord {
@@ -440,6 +403,7 @@ impl Barge {
             target: BindingTarget::Workflow {
                 repository: resolved.repository.clone(),
                 project: resolved.project.clone(),
+                file: LOCAL_FILE.to_string(),
             },
             applied: Applied {
                 value: resolved.rendered.scratch.clone(),
@@ -468,20 +432,103 @@ impl Barge {
     }
 }
 
-/// The block rendered for one project.
+/// The rendered scratch file for one project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkflowBlock {
     pub project: String,
     pub volume_name: String,
     pub volume_state: VolumeState,
-    /// The scratch folder the block names.
+    /// The scratch folder the file names.
     pub scratch: PathBuf,
-    /// The whole block, markers included.
+    /// The whole file, as `init` writes it.
     pub text: String,
 }
 
-/// Refuse a file `init` would have to replace rather than merge into. Barge
-/// never follows a symlink to write through it, and a folder is not a file.
+/// The Git directory of a repository, or `None` when the folder has no `.git`.
+/// Only a folder with its own `.git` is handed to git: `git -C` would otherwise
+/// find whatever repository encloses it.
+fn git_common_dir(repository: &Path) -> Result<Option<PathBuf>> {
+    if !repository.join(".git").exists() {
+        return Ok(None);
+    }
+    git::common_dir(repository).map(Some)
+}
+
+/// The exclude state of a Git directory, without writing anything.
+fn exclude_state(common: &Path) -> Result<ExcludeState> {
+    let bytes = match fs::read(common.join("info").join("exclude")) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(source) => return Err(Error::io("cannot read", common, &source)),
+    };
+    Ok(if excludes(&String::from_utf8_lossy(&bytes)) {
+        ExcludeState::Excluded
+    } else {
+        ExcludeState::NotExcluded
+    })
+}
+
+/// Add the local file to a Git directory's `info/exclude` if it is not there.
+/// The file is rewritten by atomic rename and every other line is kept.
+fn ensure_excluded(common: &Path) -> Result<ExcludeState> {
+    let file = common.join("info").join("exclude");
+    let mut bytes = match fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(source) => return Err(Error::io("cannot read", &file, &source)),
+    };
+    if excludes(&String::from_utf8_lossy(&bytes)) {
+        return Ok(ExcludeState::Excluded);
+    }
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(EXCLUDE_ENTRY.as_bytes());
+    bytes.push(b'\n');
+    publish(&file, &bytes)?;
+    Ok(ExcludeState::Excluded)
+}
+
+/// What the operator must change by hand. `init` never edits committed files, so
+/// a missing pointer or a leftover block is reported here rather than fixed.
+fn warnings(repository: &Path, exclude: ExcludeState) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    match exclude {
+        ExcludeState::Excluded => {}
+        ExcludeState::NotExcluded => warnings.push(format!(
+            "{LOCAL_FILE} is not excluded from Git; run `barge init` to add {EXCLUDE_ENTRY} to the exclude file"
+        )),
+        ExcludeState::NotARepository => warnings.push(format!(
+            "{} is not a Git repository, so {LOCAL_FILE} is not excluded from Git; keep it out of commits by hand",
+            repository.display()
+        )),
+    }
+    let committed = committed_text(repository)?;
+    if !committed.lines().any(|line| line.contains(LOCAL_FILE)) {
+        warnings.push(format!(
+            "{COMMITTED_FILE} does not name {LOCAL_FILE}; add this line to it, since barge never edits committed files: {POINTER_LINE}"
+        ));
+    }
+    if has_legacy_block(&committed) {
+        warnings.push(format!(
+            "{COMMITTED_FILE} still has the old barge:workflow block; delete the lines from {START_MARKER} to {END_MARKER}, since barge never edits committed files"
+        ));
+    }
+    Ok(warnings)
+}
+
+/// The committed file's text, lossily decoded; empty when there is no file.
+fn committed_text(repository: &Path) -> Result<String> {
+    let file = repository.join(COMMITTED_FILE);
+    match fs::read(&file) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(source) => Err(Error::io("cannot read", &file, &source)),
+    }
+}
+
+/// Refuse a file `init` would have to replace. Barge never follows a symlink to
+/// write through it, and a folder is not a file.
 fn check_editable(file: &Path) -> Result<()> {
     match fs::symlink_metadata(file) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::refused(format!(
@@ -496,17 +543,10 @@ fn check_editable(file: &Path) -> Result<()> {
     }
 }
 
-fn broken(file: &Path, reason: &str) -> Error {
-    Error::refused(format!(
-        "{}: {reason}; refusing to edit a file with unbalanced or duplicate barge workflow markers",
-        file.display()
-    ))
-}
-
 fn diff_missing(file: &Path, rendered: &str) -> Vec<String> {
     let mut lines = vec![
-        format!("--- {} (no block)", file.display()),
-        format!("+++ {} (rendered block)", file.display()),
+        format!("--- {} (no file)", file.display()),
+        format!("+++ {} (rendered file)", file.display()),
     ];
     for line in rendered.lines() {
         lines.push(format!("+{line}"));
@@ -514,10 +554,10 @@ fn diff_missing(file: &Path, rendered: &str) -> Vec<String> {
     lines
 }
 
-fn diff_block(file: &Path, current: &str, rendered: &str) -> Vec<String> {
+fn diff_file(file: &Path, current: &str, rendered: &str) -> Vec<String> {
     let mut lines = vec![
-        format!("--- {} (current block)", file.display()),
-        format!("+++ {} (rendered block)", file.display()),
+        format!("--- {} (current file)", file.display()),
+        format!("+++ {} (rendered file)", file.display()),
     ];
     lines.extend(diff_lines(current, rendered));
     lines
@@ -569,39 +609,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn markers_are_located_or_refused() {
-        assert_eq!(locate("no block here\n"), Block::Absent);
-        assert_eq!(locate(""), Block::Absent);
-        let text = format!("head\n{START_MARKER}\nold\n{END_MARKER}\ntail\n");
-        let start = text.find(START_MARKER).unwrap() + START_MARKER.len() + 1;
-        let end = text.find(END_MARKER).unwrap();
-        assert_eq!(locate(&text), Block::Present { start, end });
-        assert_eq!(&text[start..end], "old\n");
-
-        match locate(&format!("{START_MARKER}\nonly\n")) {
-            Block::Broken(reason) => assert!(reason.contains("has no"), "{reason}"),
-            other => panic!("expected broken, got {other:?}"),
-        }
-        match locate(&format!("{START_MARKER}\n{START_MARKER}\n{END_MARKER}\n")) {
-            Block::Broken(reason) => assert!(reason.contains("more than once"), "{reason}"),
-            other => panic!("expected broken, got {other:?}"),
-        }
-        match locate(&format!("{END_MARKER}\n{START_MARKER}\n")) {
-            Block::Broken(reason) => assert!(reason.contains("before"), "{reason}"),
-            other => panic!("expected broken, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn insertion_separates_the_block_with_one_blank_line() {
-        let block = format!("{START_MARKER}\nbody\n{END_MARKER}\n");
-        assert_eq!(insert("", &block), block);
-        assert_eq!(insert("# Title\n", &block), format!("# Title\n\n{block}"));
-        assert_eq!(
-            insert("# Title\n\n", &block),
-            format!("# Title\n\n{block}"),
-            "an existing blank line is not doubled"
-        );
+    fn legacy_markers_are_found_and_the_pointer_is_matched() {
+        assert!(!has_legacy_block("# Notes\n"));
+        assert!(has_legacy_block(&format!(
+            "{START_MARKER}\nold\n{END_MARKER}\n"
+        )));
+        assert!(has_legacy_block(&format!("  {END_MARKER}  \n")));
+        assert!(excludes("# git\n/AGENTS.local.md\n"));
+        assert!(excludes("AGENTS.local.md\n"));
+        assert!(!excludes("/AGENTS.local.md.bak\n"));
     }
 
     #[test]

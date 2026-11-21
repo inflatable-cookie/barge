@@ -37,8 +37,8 @@ usage: barge [--json] <command>
   move --apply --plan FILE|- [--confirm-stopped] [--retarget-unrecorded]
   doctor                                  volumes, layout and binding drift
   init [--project P] [--path DIR] [--check]
-                                          write the AGENTS.md scratch block;
-                                          --check reports it and writes nothing
+                                          write AGENTS.local.md, the uncommitted scratch
+                                          file; --check reports it and writes nothing
   prune --volume V [--dry-run]            evict idle roots to meet policy
   worktree lease --repo R --base SHA --branch B --request ID
     [--base-name N] [--label L] [--wait SECONDS]

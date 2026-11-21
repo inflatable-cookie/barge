@@ -112,7 +112,7 @@ kinds:
 | `queried` | runs `barge path <class>` or `eval "$(barge env)"` | none: always current |
 | `setting` | its own configuration file | an adapter writes, reads back and undoes the value |
 | `link` | a symlink at the tool's own path | Barge owns the link, records it, and can undo it |
-| `workflow` | a managed block in a repository's `AGENTS.md` | `barge init` writes the block from the layout |
+| `workflow` | an uncommitted `AGENTS.local.md` in a repository | `barge init` writes the file from the layout and keeps it out of Git |
 
 `linked` and `queried` are preferred: they can't drift. The other three exist
 because most tools can't be changed to ask Barge.
@@ -154,26 +154,39 @@ The `link` kind's rules:
 One record names one consumer, so a tool with two links records two consumers
 (`cargo-registry`, `cargo-git`).
 
-The `workflow` kind is built too. Its rules:
+The `workflow` kind is built too. Its rules (Tom, 2026-11-21: the scratch
+block names paths on one machine, so it is written locally and never committed,
+since it would not work for anyone else checking out the code):
 
-- a repository renders the block from the account layout: the project's scratch
-  folder under the scratch class, how to get a fresh scratch root with
-  `barge scratch new`, and the rule never to write scratch to a home folder or
-  a drive root. Worktrees are not mentioned until that class has a binding;
-- the block sits between `<!-- barge:workflow:start -->` and
-  `<!-- barge:workflow:end -->`, with a line saying edits between them are
-  replaced. `init` inserts the block at the end of a file without one and
-  replaces only the content between existing markers, keeping every other byte.
-  A file with unbalanced or duplicate markers is refused;
+- a repository's scratch file is `AGENTS.local.md`, rendered from the account
+  layout: the project's scratch folder under the scratch class, how to get a
+  fresh scratch root with `barge scratch new`, and the rule never to write
+  scratch to a home folder or a drive root. Worktrees are not mentioned until
+  that class has a binding. `init` owns the whole file, with no markers, so a
+  stale copy is replaced by atomic rename;
+- `init` adds `/AGENTS.local.md` to the repository's `info/exclude` once. The
+  Git directory comes from `git rev-parse --git-common-dir`, so a linked
+  worktree's entry lands in the main repository. Barge never touches
+  `.gitignore` and never commits. A folder without `.git` is written and
+  reported as not excluded;
+- the committed `AGENTS.md` is never written. It needs one line that names
+  `AGENTS.local.md`; when it is missing, `init` and `--check` print that line.
+  A `barge:workflow` block left there by the earlier design is reported, and the
+  operator deletes it by hand. Neither removes it;
 - the project defaults to the repository folder's name and can be overridden
-  with `--project`. `init` publishes the file by atomic rename and records the
-  block as a `workflow` binding whose consumer is the repository path;
-- `barge init --check` exits 0 when the block is current and 1 when it is stale
-  or missing, prints a diff, writes nothing and works on a read-only account;
-- the block names a location, not a mounted path: it renders from the layout
+  with `--project`. `init` records a `workflow` binding whose consumer is the
+  repository path and whose file is `AGENTS.local.md`. A record that names
+  `AGENTS.md` predates this and doctor reports it stale, with the fix (rerun
+  `barge init`); doctor never rewrites it;
+- `barge init --check` exits 0 when the file is current and excluded, and 1
+  when it is stale or missing, or not excluded from a repository. A folder that
+  is not a repository is a warning, not a failure. The missing pointer and a
+  leftover block are warnings in both commands. Check prints a diff, writes
+  nothing and works on a read-only account;
+- the file names a location, not a mounted path: it renders from the layout
   while the scratch class's volume is away, and the output says the volume is
-  absent. `init` merges into the file, so the record keeps no earlier copy and
-  `bind undo` refuses a workflow binding.
+  absent. `bind undo` refuses a workflow binding, since the file has no earlier
+  copy to restore.
 
 **Cache and kept placements** are `link` or `setting` bindings for tool-owned
 data:
@@ -232,10 +245,11 @@ never back.** No tool needs Barge installed, linked or running.
   selector its own scratch. Those values already come from the settings above,
   so Barge's layout reaches every run with no injection and no code change in
   either tool. `TMPDIR` is the standard contract every program already honours.
-- **Interactive agents get a generated workflow block.** `barge init` writes a
-  managed block into a repository's `AGENTS.md`, the way `oxide init` does: the
-  scratch folder for that project, and never to write to a home folder or a
-  drive root. `barge init --check` reports a stale block. Today these rules are
+- **Interactive agents get a generated scratch file.** `barge init` writes
+  `AGENTS.local.md` into a repository, uncommitted and excluded from Git, and
+  the committed `AGENTS.md` names it. The file gives the scratch folder for
+  that project and the rule never to write to a home folder or a drive root.
+  `barge init --check` reports a stale file. Today these rules are
   hand-written, and Effigy's already carries notes about a path that moved. A
   repository may run the check in its docs check, but nothing requires it.
 - **Voluntary use stays possible.** A tool that wants a fresh scratch root can
@@ -256,7 +270,7 @@ Rejected:
 - the layout: every class folder exists, and unknown top-level items are listed;
 - each binding: `ok`, `drifted` (with the observed and expected values),
   `missing`, or `unavailable` (volume absent);
-- each workflow block: current or stale.
+- each scratch file (`workflow` binding): current or stale.
 
 `--json` uses the usual schema contract. Exit codes: 0 when everything is ok,
 1 when anything drifted. Doctor changes nothing.
@@ -265,9 +279,9 @@ As built, `0` requires every volume to be present with an agreeing layout, every
 class folder to exist and every binding to be `ok`; an absent or mismatched
 volume, a disagreeing copy, a missing class folder, and a `drifted`, `stale`,
 `missing` or `unavailable` binding all exit 1. A workflow binding is `ok` when
-its block matches what the layout renders, `stale` when the block or its markers
-no longer do, and `missing` when the file or the block is gone. A stale block is
-reported even while the volume is away, because the block names a location
+its file matches what the layout renders, `stale` when it no longer does (or it
+records the committed `AGENTS.md`), and `missing` when the file is gone. A stale file is
+reported even while the volume is away, because the file names a location
 rather than a mounted path. Doctor writes nothing and works on a read-only
 account.
 
@@ -287,7 +301,7 @@ The reviewed JSON plan records volume and filesystem identities and lists:
 - the data to move. A move within one APFS volume is a rename: instant,
   atomic, and with no copy.
 - every binding that points at the old path, with its exact change;
-- the workflow blocks to regenerate;
+- the scratch files to regenerate;
 - the consumers that must be stopped first;
 - area declarations carried by a moved folder, whose consumers must update their declarations.
 
@@ -367,7 +381,7 @@ Each step is its own brief, reviewed as usual.
 1. **Built:** classes and the layout manifest; `path` and `env`; `survey`.
 2. **Built:** binding records, the `link` kind and `doctor`. Adopting the real
    Cargo links is the operator's step after merge.
-3. **Built:** `init` with workflow blocks. Adopting this repository, then
+3. **Built:** `init` with the local scratch file. Adopting this repository, then
    Effigy's, is the operator's step after merge.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
 5. **Built:** `move --plan|--apply`; the External layout lane then uses it item by item.

@@ -16,10 +16,10 @@
 //! inode Barge linked, so doctor reports a destination that was replaced, not
 //! just one the link no longer reaches.
 //!
-//! The `workflow` kind records the managed block `barge init` writes into a
-//! repository's `AGENTS.md`, so `barge doctor` can report the block as current
-//! or stale. Its consumer is the repository path. `init` merges into the file
-//! instead of replacing an entry, so the record keeps no earlier copy and undo
+//! The `workflow` kind records the scratch file `barge init` writes into a
+//! repository (`AGENTS.local.md`), so `barge doctor` can report it as current,
+//! stale or missing. Its consumer is the repository path. `init` owns the file
+//! but never replaces an entry, so the record keeps no earlier copy and undo
 //! refuses it.
 
 use std::collections::BTreeSet;
@@ -51,7 +51,7 @@ const PRESERVED_SUFFIX: &str = ".barge-prior";
 pub enum BindingKind {
     /// Barge owns a symlink at the consumer's own path.
     Link,
-    /// A managed block in a repository's `AGENTS.md`.
+    /// A scratch file `barge init` owns in a repository.
     Workflow,
 }
 
@@ -64,8 +64,8 @@ impl BindingKind {
     }
 }
 
-/// Where a binding points: the link Barge owns, or the repository whose
-/// `AGENTS.md` carries a managed workflow block.
+/// Where a binding points: the link Barge owns, or the repository whose scratch
+/// file `init` owns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BindingTarget {
@@ -75,7 +75,16 @@ pub enum BindingTarget {
     Workflow {
         repository: PathBuf,
         project: String,
+        /// The file in the repository that carries the scratch content. A record
+        /// written before this field existed named the committed `AGENTS.md`.
+        #[serde(default = "legacy_workflow_file")]
+        file: String,
     },
+}
+
+/// The file a workflow record names when it predates the `file` field.
+fn legacy_workflow_file() -> String {
+    crate::workflow::COMMITTED_FILE.to_string()
 }
 
 /// The kind of entry a preserved target held.
@@ -163,9 +172,9 @@ impl BindingRecord {
     pub fn owned_path(&self) -> PathBuf {
         match &self.target {
             BindingTarget::Link { path } => path.clone(),
-            BindingTarget::Workflow { repository, .. } => {
-                repository.join(crate::workflow::AGENTS_FILE)
-            }
+            BindingTarget::Workflow {
+                repository, file, ..
+            } => repository.join(file),
         }
     }
 }
@@ -1003,8 +1012,15 @@ pub(crate) fn validate_record(record: &BindingRecord) -> Result<()> {
             BindingTarget::Workflow {
                 repository,
                 project,
+                file,
             },
         ) => {
+            if file != crate::workflow::LOCAL_FILE && file != crate::workflow::COMMITTED_FILE {
+                return Err(Error::unknown_state(format!(
+                    "workflow binding {} names an unknown file {file}",
+                    record.consumer
+                )));
+            }
             if !Path::new(&record.consumer).is_absolute() {
                 return Err(Error::unknown_state(format!(
                     "workflow binding consumer {} is not a repository path",
