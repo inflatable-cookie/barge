@@ -19,8 +19,8 @@
 //! The `workflow` kind records the scratch file `barge init` writes into a
 //! repository (`AGENTS.local.md`), so `barge doctor` can report it as current,
 //! stale or missing. Its consumer is the repository path. `init` owns the file
-//! but never replaces an entry, so the record keeps no earlier copy and undo
-//! refuses it.
+//! but never replaces an entry, so the record keeps no earlier copy. Undo
+//! forgets that record without changing the workflow file.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -509,7 +509,7 @@ impl Bindings {
 
     /// Undo one consumer's binding, restoring exactly what was there before and
     /// removing the record. A `workflow` binding has no earlier copy to restore,
-    /// so undo refuses it rather than guessing at the file's previous text.
+    /// so undo only forgets the record and leaves its file untouched.
     pub fn undo(&self, consumer: &str) -> Result<BindingRecord> {
         self.core.ensure_writable()?;
         let _lock = self.core.state.lock()?;
@@ -528,10 +528,9 @@ impl Bindings {
         };
         let record = records[index].clone();
         if record.kind == BindingKind::Workflow {
-            return Err(Error::refused(format!(
-                "{} is a workflow binding; `barge init` manages the block and there is no earlier copy to restore",
-                record.consumer
-            )));
+            records.remove(index);
+            write(&self.core, &records)?;
+            return Ok(record);
         }
         let link = record.owned_path();
         match observe(&link)? {
@@ -1125,6 +1124,53 @@ fn push_before_link_hook(hook: impl FnOnce() + 'static) {
 #[cfg(test)]
 mod rollback_kind_tests {
     use super::*;
+
+    #[test]
+    fn undo_forgets_a_workflow_binding_without_changing_its_file() {
+        use crate::{Absent, FakeOs, ManualClock, VolumeRegistration};
+        use std::sync::Arc;
+
+        let temp = crate::testing::TempDir::new("binding-workflow-undo").unwrap();
+        let mount = temp.folder("volume").unwrap();
+        let state = temp.folder("state").unwrap();
+        let repository = temp.folder("repository").unwrap();
+        let barge = Barge::open_with(
+            state,
+            Arc::new(FakeOs::with_volume(
+                &mount,
+                "11111111-2222-3333-4444-555555555555",
+                1000,
+            )),
+            Arc::new(ManualClock::new(1)),
+        )
+        .unwrap();
+        barge
+            .register_volume(VolumeRegistration::new("volume", &mount).floor_bytes(0))
+            .unwrap();
+        barge
+            .set_layout(
+                Class::Scratch,
+                crate::Placement {
+                    volume: "volume".into(),
+                    path: "scratch".into(),
+                    absent: Absent::Fail,
+                },
+            )
+            .unwrap();
+        barge.init(&repository, None).unwrap();
+
+        let file = repository.join(crate::workflow::LOCAL_FILE);
+        let before = fs::read(&file).unwrap();
+        let record = barge
+            .bindings()
+            .undo(&repository.to_string_lossy())
+            .unwrap();
+
+        assert_eq!(record.kind, BindingKind::Workflow);
+        assert_eq!(fs::read(&file).unwrap(), before);
+        assert!(barge.bindings().list().unwrap().is_empty());
+    }
+
     #[test]
     fn preservation_refuses_a_new_destination() {
         let temp = crate::testing::TempDir::new("binding-race").unwrap();

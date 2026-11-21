@@ -304,7 +304,31 @@ fn split_at_crlf(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr};
+
+    fn read_http_request(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte)?;
+            request.push(byte[0]);
+        }
+        let headers = String::from_utf8_lossy(&request);
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = request.len();
+        request.resize(body_start + length, 0);
+        stream.read_exact(&mut request[body_start..])?;
+        Ok(request)
+    }
 
     #[test]
     fn the_allowlist_matches_a_stable_id_or_a_magicdns_name() {
@@ -452,7 +476,6 @@ mod tests {
     #[test]
     fn the_lookup_reads_a_real_socket_answer_without_tailscale() {
         use barge::testing::TempDir;
-        use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
 
         // A unix socket path is limited to 103 bytes here, and this fixture used
@@ -470,13 +493,11 @@ mod tests {
         let server = std::thread::spawn(move || {
             for answer in answers {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 1024];
-                let read = stream.read(&mut request).unwrap_or(0);
+                let request = read_http_request(&mut stream).unwrap();
                 assert!(
-                    String::from_utf8_lossy(&request[..read])
-                        .starts_with("GET /localapi/v0/whois?addr="),
+                    String::from_utf8_lossy(&request).starts_with("GET /localapi/v0/whois?addr="),
                     "{}",
-                    String::from_utf8_lossy(&request[..read])
+                    String::from_utf8_lossy(&request)
                 );
                 stream.write_all(&answer).unwrap();
                 stream.flush().unwrap();

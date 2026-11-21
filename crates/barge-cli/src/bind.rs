@@ -113,11 +113,22 @@ pub(crate) fn bind(arguments: &[String], json: bool) -> Result<()> {
             let options = Options::parse(rest, &[], &[])?;
             let consumer = options.single("bind undo", "consumer")?;
             let record = Barge::open()?.bindings().undo(&consumer)?;
+            let action = if record.kind == barge::BindingKind::Workflow {
+                "forgotten"
+            } else {
+                "undone"
+            };
             if json {
                 document(
                     "barge.binding/1",
-                    vec![("action", json!("undone")), ("binding", json!(record))],
+                    vec![("action", json!(action)), ("binding", json!(record))],
                 )?;
+            } else if record.kind == barge::BindingKind::Workflow {
+                println!(
+                    "forgot {} workflow binding; left {} untouched",
+                    record.consumer,
+                    record.owned_path().display()
+                );
             } else {
                 println!(
                     "undid {} {} at {} (restored {})",
