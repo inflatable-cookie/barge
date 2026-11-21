@@ -1,6 +1,6 @@
-# The channel is the first consumer's pin. `rust-version` in Cargo.toml declares
-# the same version, so a newer default toolchain cannot silently raise the MSRV.
+# This is the toolchain the repository builds with. It is deliberately newer
+# than the MSRV declared by `rust-version` in Cargo.toml.
 [toolchain]
-channel = "1.97.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

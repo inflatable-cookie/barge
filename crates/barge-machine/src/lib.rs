@@ -223,7 +223,11 @@ mod tests {
         let mac = [0, 17, 34, 51, 68, 255];
         let packet = magic_packet(mac);
         assert_eq!(&packet[..6], &[255; 6]);
-        assert!(packet[6..].chunks_exact(6).all(|chunk| chunk == mac));
+        assert!(packet[6..]
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .all(|chunk| chunk == &mac));
         let machine = Machine::new("pc", "pc.local", "00:11:22:33:44:ff")
             .unwrap()
             .with_broadcast(Ipv4Addr::new(192, 0, 2, 255));
