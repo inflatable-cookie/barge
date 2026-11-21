@@ -1,12 +1,12 @@
-# Install `barged` on Bazzite
+# Install `barged` on a Linux PC
 
-`barged` is the small daemon that lets the Mac's `barge` CLI see the Bazzite PC's
-state and put it to sleep, restart it or shut it down. This guide is the
-operator step after the daemon's pull request merges; nothing here runs from a
-test. The design it installs is in
+`barged` is the small daemon that lets the Mac's `barge` CLI see a Linux PC's
+state and put it to sleep, restart it or shut it down. This guide sets up the
+daemon on the PC and pairs it with the Mac. The test suite does not run these
+steps. The design it installs is in
 [machines](knowledge/machines.md#protocol-and-trust).
 
-Bazzite is an rpm-ostree image. Do not layer a package for this: a user-installed
+On an rpm-ostree image, do not layer a package for this: a user-installed
 binary plus user unit files is enough and survives image updates.
 
 ## 1. Choose a connection
@@ -43,9 +43,9 @@ Create `~/.config/barged/config.json`. For LAN mode use the PC's LAN address:
 
 ```json
 {
-  "listen": "192.168.1.20:9777",
+  "listen": "192.0.2.20:9777",
   "mode": "lan",
-  "name": "Bazzite PC"
+  "name": "Linux PC"
 }
 ```
 
@@ -53,9 +53,9 @@ Create `~/.config/barged/config.json`. For LAN mode use the PC's LAN address:
 UIs) and advertises `_barged._tcp` over mDNS through Avahi, so clients find it
 automatically on the LAN. `name` is optional and defaults to the host name.
 Give the PC a DHCP reservation on the router, or let discovery update a
-registered machine's address by its stable machine ID. Bazzite's default
-firewall zone (FedoraWorkstation) already allows high ports such as 9777; on
-other distributions, open the port, for example with
+registered machine's address by its stable machine ID. On Fedora-based
+desktops the default firewall zone (FedoraWorkstation) already allows high
+ports such as 9777; on other distributions, open the port, for example with
 `sudo firewall-cmd --add-port=9777/tcp --permanent && sudo firewall-cmd --reload`.
 
 `barged` generates its machine ID and `clients.json` under
@@ -86,7 +86,7 @@ For Tailscale instead, use this config (omitting `mode` also works):
 {
   "listen": "100.101.102.103:9777",
   "mode": "tailscale",
-  "allowed_nodes": ["macbook-pro.tail1234.ts.net"],
+  "allowed_nodes": ["laptop.example.ts.net"],
   "tailscale_socket": "/var/run/tailscale/tailscaled.sock"
 }
 ```
@@ -144,7 +144,7 @@ In LAN mode, discover and add the machine without typing its IP or MAC:
 
 ```sh
 barge machine discover
-barge machine add "Bazzite PC" --name pc
+barge machine add "Linux PC" --name pc
 barge machine pair pc             # prints the 6-digit code and waits for approval
 barge machine clients pc          # list paired clients on pc
 barge machine revoke pc <id>      # revoke a paired client
@@ -154,7 +154,7 @@ Or register manually (and for Tailscale mode):
 
 ```sh
 barge machine add --name pc --hostname pc.local \
-  --mac 00:11:22:33:44:ff # add --tailscale-name pc.tail1234.ts.net for Tailscale
+  --mac 00:11:22:33:44:ff # add --tailscale-name pc.example.ts.net for Tailscale
 barge machine status pc
 barge machine sleep pc            # 15 s countdown; `barge machine cancel pc` stops it
 barge machine restart pc          # asks first; `--yes` skips the question
@@ -169,7 +169,7 @@ it must match `listen` in the PC's config.
 For Tailscale, from the Mac on the tailnet:
 
 ```sh
-curl http://pc.tail1234.ts.net:9777/v1/state
+curl http://pc.example.ts.net:9777/v1/state
 ```
 
 - **`curl` cannot connect.** Check `systemctl --user status barged` and that

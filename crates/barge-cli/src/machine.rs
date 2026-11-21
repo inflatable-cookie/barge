@@ -832,7 +832,7 @@ mod tests {
                 "--mac",
                 "00:11:22:33:44:ff",
                 "--broadcast",
-                "192.168.1.255",
+                "192.0.2.255",
             ][..],
             &["list"][..],
             &["wake", "pc"][..],
@@ -842,7 +842,7 @@ mod tests {
         let sent = sender.0.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0.len(), 102);
-        assert_eq!(sent[0].1, "192.168.1.255:9".parse().unwrap());
+        assert_eq!(sent[0].1, "192.0.2.255:9".parse().unwrap());
         assert_eq!(registry.list().unwrap().len(), 1);
     }
 
@@ -853,12 +853,12 @@ mod tests {
         let sender = FakeSender::default();
         let browser = FakeBrowser(vec![DiscoveredMachine {
             id: "mid-1234".to_string(),
-            name: "Bazzite PC".to_string(),
+            name: "Linux PC".to_string(),
             mode: "lan".to_string(),
             protocol_version: "1".to_string(),
-            address: "192.168.1.42".to_string(),
+            address: "192.0.2.42".to_string(),
             port: 9777,
-            host: "bazzite.local".to_string(),
+            host: "linux-pc.local".to_string(),
         }]);
         machine_with(
             &arguments(&["discover"]),
@@ -869,34 +869,31 @@ mod tests {
         )
         .unwrap();
         machine_with(
-            &arguments(&["add", "Bazzite PC"]),
+            &arguments(&["add", "Linux PC"]),
             false,
             &registry,
             &sender,
             &browser,
         )
         .unwrap();
-        let saved = registry.get("bazzite-pc").unwrap();
+        let saved = registry.get("linux-pc").unwrap();
         assert_eq!(saved.id(), Some("mid-1234"));
-        assert_eq!(saved.hostname(), "192.168.1.42");
+        assert_eq!(saved.hostname(), "192.0.2.42");
         assert_eq!(saved.daemon_port(), 9777);
         assert_eq!(saved.mac(), None);
 
         // DHCP renewal updates registered IP when discover sees the same machine ID.
         let moved = FakeBrowser(vec![DiscoveredMachine {
             id: "mid-1234".to_string(),
-            name: "Bazzite PC".to_string(),
+            name: "Linux PC".to_string(),
             mode: "lan".to_string(),
             protocol_version: "1".to_string(),
-            address: "192.168.1.99".to_string(),
+            address: "192.0.2.99".to_string(),
             port: 9777,
-            host: "bazzite.local".to_string(),
+            host: "linux-pc.local".to_string(),
         }]);
         machine_with(&arguments(&["discover"]), true, &registry, &sender, &moved).unwrap();
-        assert_eq!(
-            registry.get("bazzite-pc").unwrap().hostname(),
-            "192.168.1.99"
-        );
+        assert_eq!(registry.get("linux-pc").unwrap().hostname(), "192.0.2.99");
     }
 
     #[test]
@@ -965,7 +962,7 @@ mod tests {
                     assert!(text.contains("x-barge-client-id: cid-42"), "{text}");
                     (
                         200,
-                        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-9","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1.255"}"#.to_string(),
+                        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-9","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.0.2.255"}"#.to_string(),
                     )
                 };
                 write!(
@@ -1002,9 +999,6 @@ mod tests {
 
         let updated = registry.get("pc").unwrap();
         assert_eq!(updated.mac(), Some("aa:bb:cc:dd:ee:ff"));
-        assert_eq!(
-            updated.broadcast(),
-            std::net::Ipv4Addr::new(192, 168, 1, 255)
-        );
+        assert_eq!(updated.broadcast(), std::net::Ipv4Addr::new(192, 0, 2, 255));
     }
 }

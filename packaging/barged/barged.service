@@ -1,4 +1,4 @@
-# barged as a systemd *user* unit, so Bazzite needs no layered package.
+# barged as a systemd *user* unit, so an rpm-ostree desktop needs no layered package.
 #
 # Install (docs/install-barged.md):
 #   ~/.local/bin/barged and ~/.config/barged/config.json exist

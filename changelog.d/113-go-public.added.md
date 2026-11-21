@@ -1,0 +1,1 @@
+Barge is ready to be public under the MIT licence: a `LICENSE` file, workspace licence and repository metadata, a README written for a stranger, and neutral example hosts, addresses and paths in tests and docs.

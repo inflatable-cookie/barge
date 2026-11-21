@@ -45,7 +45,7 @@ pub struct DiscoveredMachine {
     /// The daemon's TCP port from the SRV record.
     pub port: u16,
     /// The host name the SRV record names, without the trailing dot (for
-    /// example `Bazzite.local`).
+    /// example `Linux-PC.local`).
     pub host: String,
 }
 
@@ -716,13 +716,13 @@ mod tests {
             let mut buf = [0_u8; 512];
             let (_, peer) = responder.recv_from(&mut buf).unwrap();
             let reply = encode_response(
-                "Bazzite._barged._tcp.local.",
-                "bazzite.local.",
-                Ipv4Addr::new(192, 168, 1, 20),
+                "Linux-PC._barged._tcp.local.",
+                "linux-pc.local.",
+                Ipv4Addr::new(192, 0, 2, 20),
                 9777,
                 &[
                     "id=0123456789abcdef",
-                    "name=Bazzite",
+                    "name=Linux PC",
                     "mode=lan",
                     "version=1",
                 ],
@@ -736,12 +736,12 @@ mod tests {
             found,
             vec![DiscoveredMachine {
                 id: "0123456789abcdef".to_string(),
-                name: "Bazzite".to_string(),
+                name: "Linux PC".to_string(),
                 mode: "lan".to_string(),
                 protocol_version: "1".to_string(),
-                address: "192.168.1.20".to_string(),
+                address: "192.0.2.20".to_string(),
                 port: 9777,
-                host: "bazzite.local".to_string(),
+                host: "linux-pc.local".to_string(),
             }]
         );
     }
@@ -783,10 +783,10 @@ mod tests {
         }
     }
 
-    fn found_bazzite(address: &str, port: u16, host: &str) -> DiscoveredMachine {
+    fn found_linux_pc(address: &str, port: u16, host: &str) -> DiscoveredMachine {
         DiscoveredMachine {
             id: "mid-1".to_string(),
-            name: "Bazzite".to_string(),
+            name: "Linux PC".to_string(),
             mode: "lan".to_string(),
             protocol_version: "1".to_string(),
             address: address.to_string(),
@@ -804,9 +804,9 @@ mod tests {
 
     #[test]
     fn match_registered_prefers_machine_id_then_address_and_port() {
-        let found = found_bazzite("192.168.1.50", 9777, "other.local");
-        let by_id = Machine::discovered("mid-1", "pc", "192.168.1.20", 9777).unwrap();
-        let manual = Machine::new("manual", "192.168.1.50", "00:11:22:33:44:ff").unwrap();
+        let found = found_linux_pc("192.0.2.50", 9777, "other.local");
+        let by_id = Machine::discovered("mid-1", "pc", "192.0.2.20", 9777).unwrap();
+        let manual = Machine::new("manual", "192.0.2.50", "00:11:22:33:44:ff").unwrap();
         let probe = FakeProbe::default();
         assert_eq!(
             match_registered_with(&found, &[manual.clone(), by_id.clone()], &probe)
@@ -821,31 +821,31 @@ mod tests {
 
     #[test]
     fn match_registered_matches_by_id_even_when_address_and_port_change() {
-        let found = found_bazzite("192.168.1.99", 9888, "bazzite.local");
-        let registered = Machine::discovered("mid-1", "bazzite", "192.168.1.20", 9777).unwrap();
-        let other = Machine::discovered("mid-2", "other", "192.168.1.99", 9888).unwrap();
+        let found = found_linux_pc("192.0.2.99", 9888, "linux-pc.local");
+        let registered = Machine::discovered("mid-1", "linux-pc", "192.0.2.20", 9777).unwrap();
+        let other = Machine::discovered("mid-2", "other", "192.0.2.99", 9888).unwrap();
         let probe = FakeProbe::default();
         assert_eq!(
             match_registered_with(&found, &[other, registered], &probe).map(Machine::name),
-            Some("bazzite")
+            Some("linux-pc")
         );
         assert!(!probe.mac_asked.get(), "an ID match needs no probe");
     }
 
     #[test]
     fn an_unidentified_record_matches_by_its_resolved_address() {
-        let found = found_bazzite("192.168.1.55", 9777, "Bazzite.local");
-        let record = unidentified("bazzite", "bazzite.lan", 9777);
+        let found = found_linux_pc("192.0.2.55", 9777, "Linux-PC.local");
+        let record = unidentified("linux-pc", "linux-pc.lan", 9777);
         let probe = FakeProbe {
-            resolves: vec![("bazzite.lan", "192.168.1.55".parse().unwrap())],
+            resolves: vec![("linux-pc.lan", "192.0.2.55".parse().unwrap())],
             ..FakeProbe::default()
         };
         assert_eq!(
             match_registered_with(&found, std::slice::from_ref(&record), &probe).map(Machine::name),
-            Some("bazzite")
+            Some("linux-pc")
         );
 
-        let wrong_port = found_bazzite("192.168.1.55", 9888, "elsewhere.local");
+        let wrong_port = found_linux_pc("192.0.2.55", 9888, "elsewhere.local");
         assert_eq!(
             match_registered_with(&wrong_port, &[record], &probe),
             None,
@@ -855,32 +855,32 @@ mod tests {
 
     #[test]
     fn an_unidentified_record_matches_the_mdns_host_ignoring_case() {
-        let found = found_bazzite("192.168.1.55", 9777, "Bazzite.local");
-        let record = unidentified("bazzite", "bazzite.local", 9777);
+        let found = found_linux_pc("192.0.2.55", 9777, "Linux-PC.local");
+        let record = unidentified("linux-pc", "linux-pc.local", 9777);
         assert_eq!(
             match_registered_with(&found, &[record], &FakeProbe::default()).map(Machine::name),
-            Some("bazzite")
+            Some("linux-pc")
         );
     }
 
     #[test]
     fn an_unidentified_record_matches_the_found_mac() {
-        let found = found_bazzite("192.168.1.55", 9777, "elsewhere.local");
-        let record = unidentified("bazzite", "old-name.local", 9777);
+        let found = found_linux_pc("192.0.2.55", 9777, "elsewhere.local");
+        let record = unidentified("linux-pc", "old-name.local", 9777);
         let probe = FakeProbe {
             mac: Some("00:11:22:33:44:55".to_string()),
             ..FakeProbe::default()
         };
         assert_eq!(
             match_registered_with(&found, &[record], &probe).map(Machine::name),
-            Some("bazzite")
+            Some("linux-pc")
         );
     }
 
     #[test]
     fn a_record_with_another_id_is_never_matched_by_name_address_or_mac() {
-        let found = found_bazzite("192.168.1.55", 9777, "Bazzite.local");
-        let other = Machine::discovered("mid-2", "bazzite", "192.168.1.55", 9777).unwrap();
+        let found = found_linux_pc("192.0.2.55", 9777, "Linux-PC.local");
+        let other = Machine::discovered("mid-2", "linux-pc", "192.0.2.55", 9777).unwrap();
         let probe = FakeProbe {
             mac: Some("00:11:22:33:44:55".to_string()),
             ..FakeProbe::default()
@@ -894,11 +894,11 @@ mod tests {
 
     #[test]
     fn the_probe_is_asked_only_when_an_unidentified_record_exists() {
-        let found = found_bazzite("192.168.1.55", 9777, "Bazzite.local");
+        let found = found_linux_pc("192.0.2.55", 9777, "Linux-PC.local");
         let probe = FakeProbe::default();
         assert_eq!(match_registered_with(&found, &[], &probe), None);
         assert!(!probe.mac_asked.get());
-        let identified = Machine::discovered("mid-2", "nas", "192.168.1.30", 9777).unwrap();
+        let identified = Machine::discovered("mid-2", "nas", "192.0.2.30", 9777).unwrap();
         assert_eq!(match_registered_with(&found, &[identified], &probe), None);
         assert!(!probe.mac_asked.get());
     }
@@ -915,24 +915,24 @@ mod tests {
         let temp = barge::testing::TempDir::new("backfill-fill").unwrap();
         let registry = Registry::open(temp.path()).unwrap();
         // A record with neither an ID nor a MAC, as one registered by hand before discovery.
-        let bare = Machine::discovered("unused", "bazzite", "bazzite.local", 9777)
+        let bare = Machine::discovered("unused", "linux-pc", "linux-pc.local", 9777)
             .unwrap()
             .with_id(None);
         registry.add(bare).unwrap();
         let reported = state(
             "mid-1",
             Some("aa:bb:cc:dd:ee:ff"),
-            Some("192.168.1.255".parse().unwrap()),
+            Some("192.0.2.255".parse().unwrap()),
         );
 
-        let first = backfill(&registry, "bazzite", &reported).unwrap();
+        let first = backfill(&registry, "linux-pc", &reported).unwrap();
         assert_eq!(first.id_mismatch, None);
         assert_eq!(first.machine.id(), Some("mid-1"));
         assert_eq!(first.machine.mac(), Some("aa:bb:cc:dd:ee:ff"));
-        assert_eq!(first.machine.broadcast(), Ipv4Addr::new(192, 168, 1, 255));
-        assert_eq!(registry.get("bazzite").unwrap(), first.machine);
+        assert_eq!(first.machine.broadcast(), Ipv4Addr::new(192, 0, 2, 255));
+        assert_eq!(registry.get("linux-pc").unwrap(), first.machine);
 
-        let second = backfill(&registry, "bazzite", &reported).unwrap();
+        let second = backfill(&registry, "linux-pc", &reported).unwrap();
         assert_eq!(second, first);
     }
 
@@ -941,26 +941,26 @@ mod tests {
         let temp = barge::testing::TempDir::new("backfill-mismatch").unwrap();
         let registry = Registry::open(temp.path()).unwrap();
         registry
-            .add(Machine::discovered("mid-1", "bazzite", "bazzite.local", 9777).unwrap())
+            .add(Machine::discovered("mid-1", "linux-pc", "linux-pc.local", 9777).unwrap())
             .unwrap();
         let other_machine = state(
             "mid-2",
             Some("aa:bb:cc:dd:ee:ff"),
-            Some("192.168.1.255".parse().unwrap()),
+            Some("192.0.2.255".parse().unwrap()),
         );
 
-        let outcome = backfill(&registry, "bazzite", &other_machine).unwrap();
+        let outcome = backfill(&registry, "linux-pc", &other_machine).unwrap();
         assert_eq!(outcome.id_mismatch.as_deref(), Some("mid-2"));
         assert_eq!(outcome.machine.id(), Some("mid-1"));
         assert_eq!(outcome.machine.mac(), None);
-        assert_eq!(registry.get("bazzite").unwrap(), outcome.machine);
+        assert_eq!(registry.get("linux-pc").unwrap(), outcome.machine);
     }
 
     #[test]
     fn backfill_keeps_a_mac_and_broadcast_the_record_already_holds() {
         let temp = barge::testing::TempDir::new("backfill-keep").unwrap();
         let registry = Registry::open(temp.path()).unwrap();
-        let record = Machine::discovered("mid-1", "bazzite", "bazzite.local", 9777)
+        let record = Machine::discovered("mid-1", "linux-pc", "linux-pc.local", 9777)
             .unwrap()
             .with_mac("00:11:22:33:44:55")
             .unwrap()
@@ -969,9 +969,9 @@ mod tests {
         let reported = state(
             "mid-1",
             Some("aa:bb:cc:dd:ee:ff"),
-            Some("192.168.1.255".parse().unwrap()),
+            Some("192.0.2.255".parse().unwrap()),
         );
-        let outcome = backfill(&registry, "bazzite", &reported).unwrap();
+        let outcome = backfill(&registry, "linux-pc", &reported).unwrap();
         assert_eq!(outcome.machine, record);
     }
 
@@ -984,19 +984,19 @@ mod tests {
         let found = vec![
             DiscoveredMachine {
                 id: "mid-1".to_string(),
-                name: "Bazzite".to_string(),
+                name: "Linux PC".to_string(),
                 mode: "lan".to_string(),
                 protocol_version: "1".to_string(),
-                address: "192.168.1.99".to_string(),
+                address: "192.0.2.99".to_string(),
                 port: 9888,
-                host: "bazzite.local".to_string(),
+                host: "linux-pc.local".to_string(),
             },
             DiscoveredMachine {
                 id: "mid-unregistered".to_string(),
                 name: "SteamDeck".to_string(),
                 mode: "lan".to_string(),
                 protocol_version: "1".to_string(),
-                address: "192.168.1.77".to_string(),
+                address: "192.0.2.77".to_string(),
                 port: 9777,
                 host: "steamdeck.local".to_string(),
             },
@@ -1006,26 +1006,26 @@ mod tests {
 
         registry
             .add(
-                Machine::discovered("mid-1", "bazzite", "192.168.1.20", 9777)
+                Machine::discovered("mid-1", "linux-pc", "192.0.2.20", 9777)
                     .unwrap()
                     .with_mac("00:11:22:33:44:ff")
                     .unwrap(),
             )
             .unwrap();
         registry
-            .add(Machine::discovered("mid-2", "nas", "192.168.1.30", 9777).unwrap())
+            .add(Machine::discovered("mid-2", "nas", "192.0.2.30", 9777).unwrap())
             .unwrap();
 
         let changed = follow_addresses(&registry, &found).unwrap();
-        assert_eq!(changed, vec!["bazzite".to_string()]);
+        assert_eq!(changed, vec!["linux-pc".to_string()]);
 
-        let updated = registry.get("bazzite").unwrap();
-        assert_eq!(updated.hostname(), "192.168.1.99");
+        let updated = registry.get("linux-pc").unwrap();
+        assert_eq!(updated.hostname(), "192.0.2.99");
         assert_eq!(updated.daemon_port(), 9888);
         assert_eq!(updated.mac(), Some("00:11:22:33:44:ff"));
 
         let untouched = registry.get("nas").unwrap();
-        assert_eq!(untouched.hostname(), "192.168.1.30");
+        assert_eq!(untouched.hostname(), "192.0.2.30");
         assert_eq!(untouched.daemon_port(), 9777);
 
         // Calling again with the same address makes no further updates.

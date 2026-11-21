@@ -1,5 +1,5 @@
 {
   "listen": "100.101.102.103:9777",
-  "allowed_nodes": ["macbook-pro.tail1234.ts.net"],
+  "allowed_nodes": ["laptop.example.ts.net"],
   "tailscale_socket": "/var/run/tailscale/tailscaled.sock"
 }
