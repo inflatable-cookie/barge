@@ -180,6 +180,14 @@ late. Taking workspaces from Barge needs a host-independent change to Nucleus's
 workspace allocator and retirement. That is Nucleus's change, briefed and owned
 by the Nucleus planner, built after Barge's CLI exists.
 
+Barge stays optional for Nucleus (Tom, 2026-11-21). Leasing from a Barge pool
+is a setting the operator turns on; without it, Nucleus makes its own
+worktrees under `workRoot` as it does today, and works with Barge not
+installed. If Nucleus is later written in Rust, it may link the `barge`
+library directly, as Oxide does, instead of calling the CLI. The lease state
+on disk is then the contract both share, so a linked Nucleus and a standalone
+`barge` must agree on its format.
+
 What Nucleus needs from Barge, and this contract gives it:
 
 - a lease keyed by allocation, with the task ID as a label, bound to the
