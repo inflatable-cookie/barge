@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use barge_machine::DaemonClient;
-use barged::{Clock, Config, Daemon, DaemonState, Error, PowerController, Result, SystemClock};
+use barged::{
+    Clock, Config, Daemon, DaemonState, Error, PowerController, Result, Serving, SystemClock,
+};
 
 /// Cleared by the SIGTERM handler; `serve` returns once it reads false.
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -71,18 +73,22 @@ fn run(arguments: &[String]) -> Result<()> {
     let countdown = controller
         .start()
         .map_err(|error| Error::new(format!("cannot start the countdown thread: {error}")))?;
-    if config.mode == barged::AuthMode::Lan {
-        eprintln!(
+    match config.serving() {
+        Serving::Lan => eprintln!(
             "barged: listening on {} in LAN mode (id {})",
             bound_addr,
             daemon.state_store().machine_id()
-        );
-    } else {
-        eprintln!(
+        ),
+        Serving::Both => eprintln!(
+            "barged: listening on {} for LAN clients (id {}); the tailnet listener follows when tailscale is up",
+            bound_addr,
+            daemon.state_store().machine_id()
+        ),
+        Serving::Tailnet => eprintln!(
             "barged: listening on {} for {} allowlisted node(s)",
             bound_addr,
             config.allowed_nodes.len()
-        );
+        ),
     }
     // SAFETY: the handler only stores to a lock-free atomic flag.
     if unsafe {
@@ -176,8 +182,10 @@ fn run_pair(arguments: &[String]) -> Result<()> {
         Some(base) => base,
         None => {
             let config = Config::load(&config_path)?;
-            if config.mode != barged::AuthMode::Lan {
-                return Err(Error::new("pair requires LAN mode"));
+            if config.serving() == Serving::Tailnet {
+                return Err(Error::new(
+                    "pair requires a LAN address: set mode to lan, or add a tailscale block beside a LAN listen",
+                ));
             }
             local_daemon_url(config.listen)?
         }
@@ -396,7 +404,7 @@ fn platform_power() -> barged::Unavailable {
 
 #[cfg(unix)]
 fn platform_lookup(config: &Config) -> barged::TailscaleLookup {
-    barged::TailscaleLookup::new(config.tailscale_socket.clone())
+    barged::TailscaleLookup::new(config.tailnet_socket())
 }
 
 #[cfg(test)]

@@ -9,9 +9,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use barge_machine::{
-    backfill, follow_addresses, match_registered_with, DiscoveredMachine, Machine, MatchProbe,
-    MdnsBrowser, NetworkProbe, PendingPairRequest, Registry, State, UdpMdnsBrowser,
-    DEFAULT_DISCOVER_TIMEOUT,
+    backfill, follow_addresses, match_registered_with, DaemonClient, DiscoveredMachine, Machine,
+    MachineLink, MatchProbe, MdnsBrowser, NetworkProbe, Path, PendingPairRequest, Registry, State,
+    UdpMdnsBrowser, DEFAULT_DISCOVER_TIMEOUT,
 };
 use serde::Serialize;
 
@@ -127,6 +127,8 @@ impl PendingPairs {
 pub struct Poll {
     pub machine: Machine,
     pub lan: bool,
+    /// The route that answered, when a poll reached the machine.
+    pub path: Option<Path>,
     pub started_at_ms: u64,
     pub result: Result<State, String>,
 }
@@ -135,6 +137,8 @@ pub struct Poll {
 struct Entry {
     machine: Machine,
     lan: bool,
+    /// The route the last answer came over.
+    path: Option<Path>,
     reachable: bool,
     error: Option<String>,
     state: Option<State>,
@@ -151,6 +155,7 @@ impl Entry {
         Self {
             machine,
             lan,
+            path: None,
             reachable: false,
             error: None,
             state: None,
@@ -174,12 +179,15 @@ impl Entry {
             name: machine.name().to_owned(),
             hostname: machine.hostname().to_owned(),
             mac: machine.mac().unwrap_or("").to_owned(),
-            mode: if self.lan { "lan" } else { "tailscale" },
+            mode: self
+                .path
+                .map_or(if self.lan { "lan" } else { "tailscale" }, Path::as_str),
             paired: self.lan,
-            address: if self.lan {
-                machine.hostname()
-            } else {
-                machine.daemon_host()
+            address: match self.path {
+                Some(Path::Lan) => machine.hostname(),
+                Some(Path::Tailscale) => machine.daemon_host(),
+                None if self.lan => machine.hostname(),
+                None => machine.daemon_host(),
             }
             .to_owned(),
             daemon_port: machine.daemon_port(),
@@ -232,6 +240,7 @@ impl Observations {
             };
             entry.machine = poll.machine;
             entry.lan = poll.lan;
+            entry.path = poll.path;
             match poll.result {
                 Ok(state) => {
                     entry.reachable = true;
@@ -325,19 +334,22 @@ impl Observations {
     }
 }
 
-/// Use the CLI's LAN key and the same address selection as the CLI.
-pub fn client(
-    registry: &Registry,
-    machine: &Machine,
-) -> barge_machine::Result<barge_machine::DaemonClient> {
-    match registry.credentials(machine.name())? {
-        Some(creds) => Ok(barge_machine::DaemonClient::for_lan_client(
-            machine,
-            creds.client_id,
-            creds.key,
-        )),
-        None => Ok(barge_machine::DaemonClient::for_machine(machine)),
-    }
+/// The routes to a machine's daemon, LAN first and then its tailnet name, signed
+/// with the stored credentials: the same selection as the CLI.
+pub fn link(registry: &Registry, machine: &Machine) -> barge_machine::Result<MachineLink> {
+    Ok(MachineLink::for_machine(
+        machine,
+        registry.credentials(machine.name())?,
+    ))
+}
+
+/// The LAN route, for the verbs the daemon serves only on the LAN: pairing,
+/// listing paired clients and revoking one.
+pub fn lan_client(registry: &Registry, machine: &Machine) -> barge_machine::Result<DaemonClient> {
+    Ok(match registry.credentials(machine.name())? {
+        Some(creds) => DaemonClient::for_lan_client(machine, creds.client_id, creds.key),
+        None => DaemonClient::for_lan_unauthenticated(machine),
+    })
 }
 
 /// List what the registry names without touching the network, so the window
@@ -427,35 +439,34 @@ pub fn refresh_registry_with(
                     let started_at_ms = now_ms();
                     let key = registry.key(machine.name());
                     let lan = matches!(&key, Ok(Some(_)));
-                    let daemon = key.and_then(|_| client(registry, machine));
-                    let (result, machine_pending) = match daemon {
-                        Ok(daemon_client) => {
-                            let state = daemon_client.state().map_err(|error| error.to_string());
-                            let prompts = if state.is_ok() && lan {
-                                daemon_client
-                                    .pending_pairs()
-                                    .map(|list| {
-                                        list.requests
-                                            .into_iter()
-                                            .map(|req| pending_prompt(machine.name(), req))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default()
+                    let (result, path, machine_pending) = match key
+                        .and_then(|_| link(registry, machine))
+                        .map(|routes| routes.run(|daemon| daemon.state()))
+                    {
+                        Ok(Ok(reached)) => {
+                            // Pairing requests are a LAN act, so they are read only over the LAN.
+                            let prompts = if lan && reached.path == Path::Lan {
+                                lan_pending(registry, machine)
                             } else {
                                 Vec::new()
                             };
-                            (state, prompts)
+                            (Ok(reached.value), Some(reached.path), prompts)
                         }
-                        Err(error) => (Err(error.to_string()), Vec::new()),
+                        Ok(Err(error)) => (Err(error.to_string()), None, Vec::new()),
+                        Err(error) => (Err(error.to_string()), None, Vec::new()),
                     };
                     let machine = match &result {
                         Ok(state) => reconciled(registry, machine, state),
                         Err(_) => machine.clone(),
                     };
+                    if let Some(path) = path {
+                        remember_quietly(registry, machine.name(), path);
+                    }
                     (
                         Poll {
                             machine,
                             lan,
+                            path,
                             started_at_ms,
                             result,
                         },
@@ -493,6 +504,28 @@ pub fn refresh_registry_with(
         notifier.notify(&prompt);
     }
     Ok(())
+}
+
+/// The pairing requests a LAN daemon is holding. Empty when none are, or when
+/// the daemon cannot be asked.
+fn lan_pending(registry: &Registry, machine: &Machine) -> Vec<PendingPairPrompt> {
+    lan_client(registry, machine)
+        .and_then(|daemon| daemon.pending_pairs())
+        .map(|list| {
+            list.requests
+                .into_iter()
+                .map(|req| pending_prompt(machine.name(), req))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remember the route that reached a machine. The answer is already in hand,
+/// so a registry that cannot be written is reported and does not fail the poll.
+fn remember_quietly(registry: &Registry, name: &str, path: Path) {
+    if let Err(error) = barge_machine::remember_path(registry, name, path) {
+        eprintln!("barge: cannot remember the route to {name}: {error}");
+    }
 }
 
 /// The registered record after recording what its daemon reported, so
@@ -561,6 +594,7 @@ mod tests {
         Poll {
             machine: pc(),
             lan: true,
+            path: None,
             started_at_ms,
             result,
         }

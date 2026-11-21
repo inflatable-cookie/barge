@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod daemon;
 pub mod discover;
+pub mod link;
 pub mod pair;
 mod protocol;
 mod registry;
@@ -15,6 +16,7 @@ pub use discover::{
     MatchProbe, MdnsBrowser, NetworkProbe, UdpMdnsBrowser, DEFAULT_DISCOVER_TIMEOUT,
     MDNS_SERVICE_TYPE,
 };
+pub use link::{remember_path, MachineLink, Reached, LAN_CONNECT_TIMEOUT};
 pub use pair::{
     local_hostname, parse_public_key, verification_code, DerivedPairing, KeyPair, PairRole,
 };
@@ -24,7 +26,7 @@ pub use protocol::{
     PendingPairList, PendingPairRequest, PowerActionKind, PowerRequest, PowerResult, PowerState,
     State,
 };
-pub use registry::{sanitize_machine_name, ClientCredentials, Machine, Registry};
+pub use registry::{sanitize_machine_name, ClientCredentials, Machine, Path, Registry};
 #[cfg(not(unix))]
 compile_error!("barge-machine requires Unix");
 
@@ -78,6 +80,9 @@ pub const MAX_POWER_DELAY_S: u32 = 3600;
 pub struct Error {
     kind: ErrorKind,
     message: String,
+    /// True when the request never left this machine because the connection
+    /// could not be made, so another route to the same daemon may be tried.
+    not_sent: bool,
 }
 
 impl Error {
@@ -85,7 +90,23 @@ impl Error {
         Self {
             kind,
             message: message.into(),
+            not_sent: false,
         }
+    }
+
+    /// An unreachable daemon whose request was never sent.
+    pub(crate) fn unsent(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Unreachable,
+            message: message.into(),
+            not_sent: true,
+        }
+    }
+
+    /// Whether the request never reached the daemon, so retrying over another
+    /// route cannot repeat an action.
+    pub fn not_sent(&self) -> bool {
+        self.not_sent
     }
 
     /// Bad input from the operator: a name, a hostname, a port or a MAC.

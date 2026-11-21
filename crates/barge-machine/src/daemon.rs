@@ -11,6 +11,8 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use ureq::Timeout;
+
 use crate::{
     Cancel, CancelResult, ClientList, ClientRevoked, DaemonError, Error, ErrorKind, Machine,
     PairApproved, PairDecision, PairDenied, PairRequest, PairResponse, PairStatusResponse,
@@ -39,6 +41,7 @@ struct AuthHeaders<'a> {
 #[derive(Clone)]
 pub struct DaemonClient {
     agent: ureq::Agent,
+    connect_timeout: Option<Duration>,
     base: String,
     client_id: Option<String>,
     key: Option<Vec<u8>>,
@@ -54,22 +57,35 @@ impl std::fmt::Debug for DaemonClient {
     }
 }
 
+fn build_agent(connect_timeout: Option<Duration>) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(TIMEOUT))
+        .timeout_connect(connect_timeout)
+        // Status codes are the protocol's, not the transport's: the daemon's
+        // error document explains a refusal.
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
 impl DaemonClient {
     /// A client for an explicit base URL, for example `http://127.0.0.1:9777`.
     pub fn at(base: impl Into<String>) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
-            // Status codes are the protocol's, not the transport's: the daemon's
-            // error document explains a refusal.
-            .http_status_as_error(false)
-            .build()
-            .into();
         Self {
-            agent,
+            agent: build_agent(None),
+            connect_timeout: None,
             base: base.into(),
             client_id: None,
             key: None,
         }
+    }
+
+    /// Give up on making the connection after `timeout`. A route that cannot
+    /// connect in time is abandoned for the next one, and nothing was sent.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self.agent = build_agent(Some(timeout));
+        self
     }
 
     /// A client for the address a registered machine records.
@@ -107,15 +123,29 @@ impl DaemonClient {
 
     /// Connect to the machine's LAN hostname using a per-client ID and key.
     pub fn for_lan_client(machine: &Machine, client_id: Option<String>, key: Vec<u8>) -> Self {
-        let base = Self::for_lan(machine, key);
-        match client_id {
-            Some(id) => {
-                let mut client = base;
-                client.client_id = Some(id);
-                client
-            }
-            None => base,
-        }
+        let host = bracket_host(machine.hostname());
+        Self::at(format!("http://{host}:{}", machine.daemon_port()))
+            .with_credentials(client_id, key)
+    }
+
+    /// Connect to the machine's tailnet name `name` with a paired client's
+    /// credentials. The same credentials sign requests on either route.
+    pub fn for_tailnet_client(
+        machine: &Machine,
+        name: &str,
+        client_id: Option<String>,
+        key: Vec<u8>,
+    ) -> Self {
+        let host = bracket_host(name);
+        Self::at(format!("http://{host}:{}", machine.daemon_port()))
+            .with_credentials(client_id, key)
+    }
+
+    /// Sign requests as `client_id` (or the legacy shared key when `None`).
+    fn with_credentials(mut self, client_id: Option<String>, key: Vec<u8>) -> Self {
+        self.client_id = client_id;
+        self.key = Some(key);
+        self
     }
 
     /// Connect to the machine's LAN hostname without authentication (for pairing).
@@ -372,11 +402,32 @@ impl DaemonClient {
         )
     }
 
+    /// A transport failure. Only a failure to make the connection is marked as
+    /// not sent: after the request went out, a retry could repeat an action.
     fn unreachable(&self, error: ureq::Error) -> Error {
-        Error::new(
-            ErrorKind::Unreachable,
-            format!("barged at {} is unreachable: {error}", self.base),
-        )
+        let message = format!("barged at {} is unreachable: {error}", self.base);
+        if connection_stage(&error) {
+            Error::unsent(message)
+        } else {
+            Error::new(ErrorKind::Unreachable, message)
+        }
+    }
+}
+
+/// Whether a transport error happened while opening the connection.
+fn connection_stage(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Timeout(Timeout::Connect | Timeout::Resolve)
+        | ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::HostUnreachable
+                | std::io::ErrorKind::AddrNotAvailable
+        ),
+        _ => false,
     }
 }
 
@@ -442,6 +493,18 @@ pub fn request_power(
     delay_s: u32,
     confirmation: &impl Confirmation,
 ) -> Result<PowerResult> {
+    confirm_power(machine, action, delay_s, confirmation)?;
+    client.power(action, delay_s)
+}
+
+/// The checks every power request passes before anything is sent: the delay is
+/// in range, and a restart or shutdown was confirmed.
+pub(crate) fn confirm_power(
+    machine: &str,
+    action: PowerActionKind,
+    delay_s: u32,
+    confirmation: &impl Confirmation,
+) -> Result<()> {
     if delay_s > MAX_POWER_DELAY_S {
         return Err(Error::usage(format!(
             "delay must be 0-{MAX_POWER_DELAY_S} seconds, not {delay_s}"
@@ -453,7 +516,7 @@ pub fn request_power(
             action.as_str()
         )));
     }
-    client.power(action, delay_s)
+    Ok(())
 }
 
 #[cfg(test)]

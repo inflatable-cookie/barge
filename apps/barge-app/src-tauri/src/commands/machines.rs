@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use barge_machine::{
-    local_hostname, parse_public_key, sanitize_machine_name, DaemonClient, KeyPair, Machine,
-    PairRole, PairStatus, PowerActionKind, Registry, UdpSender, DEFAULT_POWER_DELAY_S,
+    local_hostname, parse_public_key, sanitize_machine_name, CancelResult, DaemonClient, KeyPair,
+    Machine, MachineLink, PairRole, PairStatus, Path, PowerActionKind, Registry, UdpSender,
+    DEFAULT_POWER_DELAY_S,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
@@ -478,7 +479,7 @@ pub fn decide_pair_in(
     let machine = registry
         .get(machine_name)
         .map_err(|error| error.to_string())?;
-    let daemon = client(registry, &machine)?;
+    let daemon = lan_client(registry, &machine)?;
     let result = if approve {
         daemon.approve_pair(request_id).map(|_| ())
     } else {
@@ -498,7 +499,7 @@ pub fn clients_in(registry: &Registry, name: &str) -> Result<Vec<PairedClientVie
     let self_id = creds
         .as_ref()
         .map(|item| item.client_id.as_deref().unwrap_or("legacy").to_string());
-    let daemon = client(registry, &machine)?;
+    let daemon = lan_client(registry, &machine)?;
     let list = daemon.clients().map_err(|error| error.to_string())?;
     Ok(list
         .clients
@@ -522,7 +523,7 @@ pub fn revoke_client_in(
     let local_creds = registry
         .credentials(machine.name())
         .map_err(|error| error.to_string())?;
-    let daemon = client(registry, &machine)?;
+    let daemon = lan_client(registry, &machine)?;
     let revoked = daemon
         .revoke_client(client_id)
         .map_err(|error| error.to_string())?;
@@ -603,7 +604,11 @@ fn send(observations: &Mutex<Observations>, name: &str, operation: &str) -> Resu
             record(observations, &machine, LastAction::wake(now_ms()))
         }
         Operation::Cancel => {
-            cancel(&client(&registry, &machine)?)?;
+            let reached = routes(&registry, &machine)?
+                .run(|daemon| daemon.cancel())
+                .map_err(|error| error.to_string())?;
+            remember_quietly(&registry, machine.name(), reached.path);
+            check_cancelled(&reached.value)?;
             observations
                 .lock()
                 .map_err(|error| error.to_string())?
@@ -620,9 +625,10 @@ fn power(
     machine: &Machine,
     kind: PowerActionKind,
 ) -> Result<(), String> {
-    client(registry, machine)?
-        .power(kind, DEFAULT_POWER_DELAY_S)
+    let reached = routes(registry, machine)?
+        .run(|daemon| daemon.power(kind, DEFAULT_POWER_DELAY_S))
         .map_err(|error| error.to_string())?;
+    remember_quietly(registry, machine.name(), reached.path);
     // Taken after the daemon accepted the action, so no poll that began before
     // the send can be read as having seen it.
     record(
@@ -644,8 +650,20 @@ fn record(
     Ok(())
 }
 
-fn client(registry: &Registry, machine: &Machine) -> Result<barge_machine::DaemonClient, String> {
-    machines::client(registry, machine).map_err(|error| error.to_string())
+fn routes(registry: &Registry, machine: &Machine) -> Result<MachineLink, String> {
+    machines::link(registry, machine).map_err(|error| error.to_string())
+}
+
+fn lan_client(registry: &Registry, machine: &Machine) -> Result<DaemonClient, String> {
+    machines::lan_client(registry, machine).map_err(|error| error.to_string())
+}
+
+/// Remember the route a command reached the machine by. The action is already
+/// done, so a registry that cannot be written is reported and does not fail it.
+fn remember_quietly(registry: &Registry, name: &str, path: Path) {
+    if let Err(error) = barge_machine::remember_path(registry, name, path) {
+        eprintln!("barge: cannot remember the route to {name}: {error}");
+    }
 }
 
 #[tauri::command]
@@ -681,11 +699,11 @@ pub async fn machines_begin(
     .await
 }
 
-fn cancel(client: &barge_machine::DaemonClient) -> Result<(), String> {
-    match client.cancel() {
-        Ok(result) if result.cancelled => Ok(()),
-        Ok(_) => Err("The daemon did not cancel an action".into()),
-        Err(error) => Err(error.to_string()),
+fn check_cancelled(result: &CancelResult) -> Result<(), String> {
+    if result.cancelled {
+        Ok(())
+    } else {
+        Err("The daemon did not cancel an action".into())
     }
 }
 
@@ -802,10 +820,10 @@ mod tests {
             )
             .unwrap();
         });
-        let error = cancel(&barge_machine::DaemonClient::at(format!(
-            "http://{address}"
-        )))
-        .unwrap_err();
+        let result = barge_machine::DaemonClient::at(format!("http://{address}"))
+            .cancel()
+            .unwrap();
+        let error = check_cancelled(&result).unwrap_err();
         assert!(error.contains("did not cancel"));
         server.join().unwrap();
     }

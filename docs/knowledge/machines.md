@@ -1,6 +1,6 @@
 # Machines
 
-Status: design outline approved by Tom, 2026-11-18. Build steps 1, 2, LAN authentication and the daemon/CLI step of discovery and pairing are complete; the Mac app and Decky plugin UIs remain unbuilt.
+Status: design outline approved by Tom, 2026-11-18. Build steps 1, 2, LAN authentication, the daemon/CLI step of discovery and pairing, and `barged` serving the LAN and the tailnet together ([networks](#networks-and-listeners)) are complete; the Mac app's routes and the Decky plugin UI remain to be deployed or built.
 
 Barge manages the machines it distributes resources across. The first is the
 A Linux PC: wake it, see its state, and sleep, restart or shut it down. This
@@ -16,7 +16,7 @@ Remote menu-bar app ([vision](vision.md#direction)).
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
   power actions. On Linux it runs as a systemd user unit and asks logind over
   D-Bus for sleep, restart and shutdown, with a polkit rule granting only those
-  actions. It never runs a shell command it was sent. It binds one configured address and accepts either allowlisted Tailscale nodes or authenticated LAN clients. [Install guide](../install-barged.md).
+  actions. It never runs a shell command it was sent. It serves its LAN address and, when configured, its tailnet address at once: paired LAN clients on the LAN, and paired clients or allowlisted nodes on the tailnet. [Install guide](../install-barged.md).
 - **Barge app:** a menu-bar Tauri app built with Poodle and Longhorn,
   covering machines and storage first ([app](app.md)).
 
@@ -96,11 +96,73 @@ invalid field is an unknown state — exit 3 — never an empty registry. A valu
 an operator gives, such as `barge machine add --port 0`, is a usage error —
 exit 2 — and is refused where the machine is built.
 
+## Networks and listeners
+
+Tom, 2026-11-21: `barged` serves the LAN and the tailnet at once. The Deck
+stays on the LAN at home, and the Mac reaches the PC from anywhere on the
+tailnet, with nothing typed on either side. The Barge planner dispatches the
+change.
+
+A config takes one of three shapes ([install guide](../install-barged.md#3-configure-authentication)):
+
+- **LAN only:** `mode: "lan"`. `listen` is the LAN address.
+- **Tailnet only:** no `mode` (or `mode: "tailscale"`) and no `tailscale`
+  block. `listen` is the tailnet address and `allowed_nodes` is required.
+  Every config written before the combined shape works unchanged.
+- **Both (recommended):** `listen` is the LAN address and a `tailscale` block
+  names the tailnet listener. Its `listen` is `"auto"`, which asks tailscaled
+  for this node's IPv4 address and uses the LAN port, or an explicit
+  `"addr:port"` on the same port: a paired client dials one port on both
+  networks. Its `allowed_nodes` is optional. `mode` may be `lan` or
+  absent; `mode: "tailscale"` and a top-level `allowed_nodes` are refused
+  beside the block.
+
+Both listeners serve the same state, power and countdown. What each surface
+serves and who may call on it:
+
+- **Pairing** (`POST /v1/pair`, `GET /v1/pair/<id>` and the pending, approve
+  and deny endpoints) is served only on the LAN listener. Pairing is a LAN act,
+  so physical presence keeps counting. The tailnet listener refuses it with
+  `400`.
+- **Client management** (`/v1/clients`) is also LAN only. An authenticated
+  paired client gets `400` on the tailnet.
+- **On the LAN,** a caller is a paired client whose HMAC signature checks out.
+- **On the tailnet,** a request is accepted when it carries a paired client's
+  signature, with the same credentials as on the LAN and no allowlist entry
+  needed, or when its Tailscale `whois` matches `tailscale.allowed_nodes`.
+  Anything else gets the same `403` as before.
+- **Tailscale not up yet:** the LAN starts regardless. The tailnet side retries
+  with a backoff that starts at one second and doubles to a cap of one minute,
+  logs once when it fails and once when it comes up, re-reads its address every
+  minute, and rebinds if the address changes.
+- **State** (`GET /v1/state`) reports `tailscale_name` (the MagicDNS name, without
+  its terminal dot) and `tailscale_ip` (the IPv4 address) as optional fields of
+  `barge.machine-state/2` while the tailnet side is up. The mDNS TXT record
+  carries `tailscale=<name>` when the name is known at start.
+
+Tailscale encrypts traffic and is recommended across networks. LAN HTTP still
+authenticates without encrypting, as described below.
+
+## Routes
+
+A paired machine has two routes with the same credentials: its LAN address
+(`hostname`) and its tailnet name (`tailscale_name`). The CLI and the app try the
+LAN address first with a connect timeout of 1.5 seconds, then the tailnet name.
+
+- Only a connection that was never made moves on to the next route. Once a
+  request has gone out, the daemon's answer, or a failure to read it, is the
+  answer. An action is never sent twice.
+- The route that answered is recorded on the machine (`last_path`) and tried
+  first next time.
+- `barge machine status` and the app show the route in use, as `LAN` or
+  `Tailscale`.
+- The tailnet name is stored from the daemon's state the first time a paired
+  daemon reports one, and again if it changes. Nobody types it.
+- Wake stays LAN broadcast only. Listing and revoking clients and pairing use
+  the LAN route alone. An unpaired machine uses the one address its record names.
+
 ## Protocol and trust
 
-- Tailscale mode (the default for existing configs) binds the configured tailnet
-  address and authorizes callers through Tailscale `whois` and an allowlist.
-  Tailscale encrypts traffic and is recommended across networks.
 - LAN mode assigns each paired client its own 256-bit key (`clients.json`,
   owner-only). Requests carry `x-barge-client-id` alongside an HMAC of the
   method, path, timestamp, nonce and body digest; the daemon checks a
@@ -149,6 +211,8 @@ keys.
   - `name`: display name (from config `name`, defaulting to the short OS hostname)
   - `mode`: `"lan"`
   - `version`: `"1"` (protocol version)
+  - `tailscale`: the node's MagicDNS name, when the tailnet side is up at start
+    (optional; see [networks](#networks-and-listeners))
   On Linux it registers through Avahi over D-Bus (`org.freedesktop.Avahi`),
   which ships with the OS; no new service is installed. If Avahi is absent,
   `barged` logs once and keeps serving.
@@ -279,7 +343,9 @@ Poodle and Longhorn, covering Machines and Storage in its first release.
    systemd unit and polkit rule in `packaging/barged/`, and the
    [install guide](../install-barged.md) for Linux.
 3. **Built:** LAN pairing and authenticated requests, with no Tailscale required.
-4. Tailscale on both machines, once Tom is ready for the sign-ins.
+4. **Built (2026-11-21):** Tailscale alongside the LAN: the combined config, the
+   tailnet listener, and the routes the CLI and app try. The PC's config and the
+   deploy follow the merge.
 4a. Discovery and per-client pairing, designed in
    [discovery and pairing](#discovery-and-pairing): `barged` and the CLI
    first, then the Mac app and the Decky plugin.

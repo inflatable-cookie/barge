@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 use barge::{Error, ErrorKind, Result};
 use barge_machine::{
     backfill, follow_addresses, local_hostname, match_registered_with, parse_public_key,
-    request_power, sanitize_machine_name, AssumeYes, Confirmation, DaemonClient, DatagramSender,
-    DiscoveredMachine, KeyPair, Machine, MatchProbe, MdnsBrowser, NetworkProbe, PairRole,
-    PairStatus, PowerActionKind, PowerState, Registry, State, UdpMdnsBrowser, UdpSender,
-    DEFAULT_DISCOVER_TIMEOUT, DEFAULT_POWER_DELAY_S,
+    remember_path, sanitize_machine_name, AssumeYes, Confirmation, DaemonClient, DatagramSender,
+    DiscoveredMachine, KeyPair, Machine, MachineLink, MatchProbe, MdnsBrowser, NetworkProbe,
+    PairRole, PairStatus, Path, PowerActionKind, PowerState, Registry, State, UdpMdnsBrowser,
+    UdpSender, DEFAULT_DISCOVER_TIMEOUT, DEFAULT_POWER_DELAY_S,
 };
 use serde_json::json;
 
@@ -525,7 +525,7 @@ fn clients<S: DatagramSender, B: MdnsBrowser>(
     let name = options.single("machine clients", "name")?;
     let registry = (env.discover)()?;
     let machine = registry.get(&name).map_err(machine_error)?;
-    let (client, _) = machine_client(&registry, &machine)?;
+    let client = lan_client(&registry, &machine)?;
     let list = client.clients().map_err(machine_error)?;
     if json {
         document(
@@ -565,7 +565,7 @@ fn revoke<S: DatagramSender, B: MdnsBrowser>(
     let local_creds = registry
         .credentials(machine.name())
         .map_err(machine_error)?;
-    let (client, _) = machine_client(&registry, &machine)?;
+    let client = lan_client(&registry, &machine)?;
     let revoked = client.revoke_client(&client_id).map_err(machine_error)?;
 
     let revoked_self = local_creds.as_ref().is_some_and(|creds| {
@@ -599,9 +599,12 @@ fn status<S: DatagramSender, B: MdnsBrowser>(
     let name = options.single("machine status", "name")?;
     let registry = (env.discover)()?;
     let machine = registry.get(&name).map_err(machine_error)?;
-    let (client, mode) = machine_client(&registry, &machine)?;
-    let state = client.state().map_err(machine_error)?;
+    let reached = machine_link(&registry, &machine)?
+        .run(|client| client.state())
+        .map_err(machine_error)?;
+    let (state, mode) = (reached.value, reached.path.as_str());
     record_reported(&registry, machine.name(), &state);
+    remember_route(&registry, machine.name(), reached.path)?;
     if json {
         document(
             "barge.machine-status/1",
@@ -641,8 +644,11 @@ fn cancel<S: DatagramSender, B: MdnsBrowser>(
     let name = options.single("machine cancel", "name")?;
     let registry = (env.discover)()?;
     let machine = registry.get(&name).map_err(machine_error)?;
-    let (client, _) = machine_client(&registry, &machine)?;
-    let result = client.cancel().map_err(machine_error)?;
+    let reached = machine_link(&registry, &machine)?
+        .run(|client| client.cancel())
+        .map_err(machine_error)?;
+    remember_route(&registry, machine.name(), reached.path)?;
+    let result = reached.value;
     if json {
         document(
             "barge.machine-cancel/1",
@@ -659,18 +665,32 @@ fn cancel<S: DatagramSender, B: MdnsBrowser>(
     Ok(())
 }
 
-fn machine_client(registry: &Registry, machine: &Machine) -> Result<(DaemonClient, &'static str)> {
-    if let Some(creds) = registry
+/// The routes to a machine's daemon: its LAN address, then its tailnet name,
+/// signed with the stored credentials. Only the route that answered is recorded.
+fn machine_link(registry: &Registry, machine: &Machine) -> Result<MachineLink> {
+    let credentials = registry
         .credentials(machine.name())
-        .map_err(machine_error)?
-    {
-        Ok((
-            DaemonClient::for_lan_client(machine, creds.client_id, creds.key),
-            "lan",
-        ))
-    } else {
-        Ok((DaemonClient::for_machine(machine), "tailscale"))
-    }
+        .map_err(machine_error)?;
+    Ok(MachineLink::for_machine(machine, credentials))
+}
+
+/// The LAN route to a machine's daemon, for the verbs the daemon serves only on
+/// the LAN: listing and revoking paired clients.
+fn lan_client(registry: &Registry, machine: &Machine) -> Result<DaemonClient> {
+    Ok(
+        match registry
+            .credentials(machine.name())
+            .map_err(machine_error)?
+        {
+            Some(creds) => DaemonClient::for_lan_client(machine, creds.client_id, creds.key),
+            None => DaemonClient::for_lan_unauthenticated(machine),
+        },
+    )
+}
+
+/// Remember the route that reached a machine, so it is tried first next time.
+fn remember_route(registry: &Registry, name: &str, path: Path) -> Result<()> {
+    remember_path(registry, name, path).map_err(machine_error)
 }
 
 /// `machine sleep|restart|shutdown <name> [--delay SECONDS] [--yes]`.
@@ -701,13 +721,15 @@ fn machine_power<S: DatagramSender, B: MdnsBrowser>(
     }
     let registry = (env.discover)()?;
     let machine = registry.get(&name).map_err(machine_error)?;
-    let (client, _) = machine_client(&registry, &machine)?;
-    let result = if options.flag("yes") {
-        request_power(&client, machine.name(), action, delay, &AssumeYes)
+    let link = machine_link(&registry, &machine)?;
+    let reached = if options.flag("yes") {
+        link.request_power(machine.name(), action, delay, &AssumeYes)
     } else {
-        request_power(&client, machine.name(), action, delay, &Prompt)
+        link.request_power(machine.name(), action, delay, &Prompt)
     }
     .map_err(machine_error)?;
+    remember_route(&registry, machine.name(), reached.path)?;
+    let result = reached.value;
     if json {
         document(
             "barge.machine-power/1",

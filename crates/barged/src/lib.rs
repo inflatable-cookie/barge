@@ -22,8 +22,9 @@ pub mod peer;
 pub mod power;
 pub mod server;
 pub mod state;
+pub mod tailnet;
 
-pub use config::{AuthMode, Config};
+pub use config::{AuthMode, Config, Serving, TailnetListen, TailscaleConfig};
 #[cfg(target_os = "linux")]
 pub use mdns::AvahiAdvertiser;
 #[cfg(not(target_os = "linux"))]
@@ -46,6 +47,7 @@ pub use power::Unavailable;
 pub use power::{logind_method, Clock, PowerBackend, PowerController, RequestError, SystemClock};
 pub use server::Daemon;
 pub use state::{ClientRecord, DaemonState, LEGACY_CLIENT_ID};
+pub use tailnet::{TailnetSelf, TailnetStatus, TailscaleStatus, Timing};
 
 /// The daemon's error: a message naming what failed.
 #[derive(Debug)]
