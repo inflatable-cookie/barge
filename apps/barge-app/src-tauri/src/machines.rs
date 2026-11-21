@@ -848,7 +848,7 @@ mod tests {
         let registry = Registry::open(temp.child("state")).unwrap();
         registry
             .add(
-                Machine::discovered("mid-1", "bazzite", "192.168.1.20", 9777)
+                Machine::discovered("mid-1", "linux-pc", "192.0.2.20", 9777)
                     .unwrap()
                     .with_mac("00:11:22:33:44:55")
                     .unwrap(),
@@ -860,19 +860,19 @@ mod tests {
         let browser = FakeBrowser(vec![
             DiscoveredMachine {
                 id: "mid-1".to_string(),
-                name: "Bazzite".to_string(),
+                name: "Linux PC".to_string(),
                 mode: "lan".to_string(),
                 protocol_version: "1".to_string(),
-                address: "192.168.1.99".to_string(),
+                address: "192.0.2.99".to_string(),
                 port: 9888,
-                host: "bazzite.local".to_string(),
+                host: "linux-pc.local".to_string(),
             },
             DiscoveredMachine {
                 id: "mid-2".to_string(),
                 name: "SteamDeck".to_string(),
                 mode: "lan".to_string(),
                 protocol_version: "1".to_string(),
-                address: "192.168.1.50".to_string(),
+                address: "192.0.2.50".to_string(),
                 port: 9777,
                 host: "steamdeck.local".to_string(),
             },
@@ -883,12 +883,12 @@ mod tests {
         assert_eq!(found[0].id, "mid-2");
         assert_eq!(found[0].name, "SteamDeck");
 
-        let updated = registry.get("bazzite").unwrap();
-        assert_eq!(updated.hostname(), "192.168.1.99");
+        let updated = registry.get("linux-pc").unwrap();
+        assert_eq!(updated.hostname(), "192.0.2.99");
         assert_eq!(updated.daemon_port(), 9888);
 
         let views = observations.lock().unwrap().snapshot(now_ms());
-        assert_eq!(views[0].address, "192.168.1.99");
+        assert_eq!(views[0].address, "192.0.2.99");
         assert_eq!(views[0].daemon_port, 9888);
     }
 
@@ -910,9 +910,9 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         registry
-            .add(Machine::discovered("mid-1", "bazzite", "127.0.0.1", port).unwrap())
+            .add(Machine::discovered("mid-1", "linux-pc", "127.0.0.1", port).unwrap())
             .unwrap();
-        registry.pair_client("bazzite", "cid-1", &[7; 32]).unwrap();
+        registry.pair_client("linux-pc", "cid-1", &[7; 32]).unwrap();
 
         let server = std::thread::spawn(move || {
             for _ in 0..4 {
@@ -979,27 +979,27 @@ mod tests {
     #[test]
     fn discover_does_not_offer_a_registered_machine_recorded_before_discovery() {
         // The registered record predates discovery: no ID, and the hostname is
-        // bazzite.local, not the address the browse found it at.
+        // linux-pc.local, not the address the browse found it at.
         let temp = barge::testing::TempDir::new("app-discover-reconcile").unwrap();
         let registry = Registry::open(temp.child("state")).unwrap();
         registry
-            .add(Machine::new("bazzite", "bazzite.local", "00:11:22:33:44:55").unwrap())
+            .add(Machine::new("linux-pc", "linux-pc.local", "00:11:22:33:44:55").unwrap())
             .unwrap();
         let observations = Mutex::new(Observations::default());
         ensure_registry(&registry, &observations).unwrap();
         let browser = Browse(vec![DiscoveredMachine {
             id: "mid-1".to_string(),
-            name: "Bazzite".to_string(),
+            name: "Linux PC".to_string(),
             mode: "lan".to_string(),
             protocol_version: "1".to_string(),
-            address: "192.168.1.55".to_string(),
+            address: "192.0.2.55".to_string(),
             port: 9777,
-            host: "Bazzite.local".to_string(),
+            host: "Linux-PC.local".to_string(),
         }]);
 
         let found = discover_with(&registry, &browser, &Offline, &observations).unwrap();
         assert!(found.is_empty(), "{found:?}");
-        assert_eq!(registry.get("bazzite").unwrap().id(), None);
+        assert_eq!(registry.get("linux-pc").unwrap().id(), None);
     }
 
     #[test]
@@ -1013,7 +1013,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         registry
             .add(
-                Machine::new("bazzite", "127.0.0.1", "00:11:22:33:44:55")
+                Machine::new("linux-pc", "127.0.0.1", "00:11:22:33:44:55")
                     .unwrap()
                     .with_daemon_port(port)
                     .unwrap(),
@@ -1023,7 +1023,7 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 2048];
             let _ = stream.read(&mut request).unwrap();
-            let body = r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-1","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1.255"}"#;
+            let body = r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-1","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.0.2.255"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1039,13 +1039,10 @@ mod tests {
         server.join().unwrap();
 
         // The ID is recorded and the MAC it already had is kept.
-        let record = registry.get("bazzite").unwrap();
+        let record = registry.get("linux-pc").unwrap();
         assert_eq!(record.id(), Some("mid-1"));
         assert_eq!(record.mac(), Some("00:11:22:33:44:55"));
-        assert_eq!(
-            record.broadcast(),
-            std::net::Ipv4Addr::new(192, 168, 1, 255)
-        );
+        assert_eq!(record.broadcast(), std::net::Ipv4Addr::new(192, 0, 2, 255));
         assert_eq!(
             observations.lock().unwrap().snapshot(now_ms())[0].mac,
             "00:11:22:33:44:55"

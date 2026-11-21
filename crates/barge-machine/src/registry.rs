@@ -639,7 +639,7 @@ mod discovery_tests {
         let temp = TempDir::new("machine-creds").unwrap();
         let registry = Registry::open(temp.path()).unwrap();
         registry
-            .add(Machine::discovered("mid-1", "pc", "192.168.1.20", 9777).unwrap())
+            .add(Machine::discovered("mid-1", "pc", "192.0.2.20", 9777).unwrap())
             .unwrap();
         let key = [0xab; 32];
         registry.pair_client("pc", "cid-1", &key).unwrap();

@@ -589,7 +589,7 @@
   <Field id="machine-address" label="Address" required>
     <TextInput
       id="machine-address"
-      placeholder="192.168.1.20 or bazzite.local"
+      placeholder="192.0.2.20 or linux-pc.local"
       value={addressInput}
       onValueChange={(value) => (addressInput = value)}
     />

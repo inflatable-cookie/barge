@@ -515,7 +515,7 @@ mod tests {
     }
 
     fn state_document() -> &'static str {
-        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042},"machine_id":"mid-1","mac":"00:11:22:33:44:ff","broadcast":"192.168.1.255"}"#
+        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042},"machine_id":"mid-1","mac":"00:11:22:33:44:ff","broadcast":"192.0.2.255"}"#
     }
 
     #[test]
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(state.mac.as_deref(), Some("00:11:22:33:44:ff"));
         assert_eq!(
             state.broadcast,
-            Some(std::net::Ipv4Addr::new(192, 168, 1, 255))
+            Some(std::net::Ipv4Addr::new(192, 0, 2, 255))
         );
         assert_eq!(
             state.pending,

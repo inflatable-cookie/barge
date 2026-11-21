@@ -53,13 +53,13 @@ const status = (fields: Partial<MachineStatus> & Pick<MachineStatus, "phase">): 
   waiting: false,
   ...fields,
 });
-const bazzite = (fields: Partial<MachineView> & Pick<MachineView, "status">): MachineView => ({
-  name: "bazzite",
-  hostname: "bazzite.local",
+const linuxPc = (fields: Partial<MachineView> & Pick<MachineView, "status">): MachineView => ({
+  name: "linux-pc",
+  hostname: "linux-pc.local",
   mac: "00:11:22:33:44:55",
   mode: "lan",
   paired: true,
-  address: "bazzite.local",
+  address: "linux-pc.local",
   daemon_port: 9777,
   reachable: true,
   error: null,
@@ -67,17 +67,17 @@ const bazzite = (fields: Partial<MachineView> & Pick<MachineView, "status">): Ma
   ...fields,
 });
 
-const foundBazzite: DiscoveredMachineView = {
+const foundLinuxPc: DiscoveredMachineView = {
   id: "9b2a4f01d83c4e21a6f8c01234567890",
-  name: "Bazzite",
+  name: "Linux PC",
   mode: "lan",
   protocol_version: "1",
-  address: "192.168.1.42",
+  address: "192.0.2.42",
   port: 9777,
 };
 
 const approvalPrompt: PendingPairPrompt = {
-  machine_name: "bazzite",
+  machine_name: "linux-pc",
   request_id: "req-deck-1",
   client_name: "Steam Deck",
   code: "340092",
@@ -92,30 +92,30 @@ const clientsFixture: PairedClientView[] = [
 
 /** The machine each Machines scenario shows. */
 const machineFor: Record<string, MachineView[]> = {
-  offline: [bazzite({
+  offline: [linuxPc({
     reachable: false,
     error: "Connection timed out",
     seen_at_unix_ms: now - 12 * 60_000,
     status: status({ phase: "offline", offers: ["wake"], last_seen_unix_ms: now - 12 * 60_000 }),
   })],
-  waking: [bazzite({
+  waking: [linuxPc({
     reachable: false,
     error: "Connection timed out",
     seen_at_unix_ms: now - 12 * 60_000,
     status: status({ phase: "waking", waiting: true, last_seen_unix_ms: now - 12 * 60_000 }),
   })],
-  awake: [bazzite({ status: status({ phase: "awake", offers: awakeOffers }) })],
-  pending: [bazzite({
+  awake: [linuxPc({ status: status({ phase: "awake", offers: awakeOffers }) })],
+  pending: [linuxPc({
     status: status({ phase: "pending", action: "sleep", deadline_unix_ms: now + 12_000, offers: ["cancel"], waiting: true }),
   })],
-  approval: [bazzite({ status: status({ phase: "awake", offers: awakeOffers }) })],
+  approval: [linuxPc({ status: status({ phase: "awake", offers: awakeOffers }) })],
   found: [],
   pairing: [],
 };
 
 const discoveredFor: Record<string, DiscoveredMachineView[]> = {
-  found: [foundBazzite],
-  pairing: [foundBazzite],
+  found: [foundLinuxPc],
+  pairing: [foundLinuxPc],
 };
 
 const pendingFor: Record<string, PendingPairPrompt[]> = {
@@ -147,7 +147,7 @@ const api: AppApi = {
     expires_at_unix_ms: Date.now() + 120_000,
     machine_name: input.name ?? input.address,
   }),
-  pollPair: async () => ({ status: "pending", machine_name: "Bazzite" }),
+  pollPair: async () => ({ status: "pending", machine_name: "Linux PC" }),
   cancelPair: async () => {},
   pendingPairs: async () => pendingFor[scenario] ?? [],
   approvePair: async () => {},

@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn lan_config_needs_no_key_file_and_wildcard_requires_explicit_opt_in() {
-        let minimal_lan = br#"{"listen":"192.168.1.20:9777","mode":"lan"}"#;
+        let minimal_lan = br#"{"listen":"192.0.2.20:9777","mode":"lan"}"#;
         assert_eq!(Config::parse(minimal_lan).unwrap().mode, AuthMode::Lan);
 
         let denied = br#"{"listen":"0.0.0.0:9777","mode":"lan","key_file":"/test/key"}"#;

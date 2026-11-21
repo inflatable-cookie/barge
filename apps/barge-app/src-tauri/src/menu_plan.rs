@@ -159,11 +159,11 @@ mod tests {
         });
         MachineView {
             name: name.into(),
-            hostname: "bazzite.local".into(),
+            hostname: "linux-pc.local".into(),
             mac: "00:11:22:33:44:55".into(),
             mode: "lan",
             paired: true,
-            address: "bazzite.local".into(),
+            address: "linux-pc.local".into(),
             daemon_port: 9777,
             reachable,
             error: None,
@@ -178,7 +178,7 @@ mod tests {
 
     fn volume() -> VolumeSummary {
         VolumeSummary {
-            name: "Stash".into(),
+            name: "External".into(),
             presence: Presence::Present,
             free_bytes: Some(2_284 * 1024 * 1024 * 1024),
         }
@@ -229,54 +229,59 @@ mod tests {
 
     #[test]
     fn an_awake_machine_shows_only_its_clickable_actions() {
-        let entries = plan_for(&[machine("bazzite", Some(awake()), true, None)], None, "");
+        let entries = plan_for(&[machine("linux-pc", Some(awake()), true, None)], None, "");
         assert_eq!(
             ids(&entries),
             vec![
-                "storage:Stash",
+                "storage:External",
                 "-",
-                "header:bazzite",
-                "sleep:bazzite",
-                "restart:bazzite",
-                "shutdown:bazzite",
-                "moonlight:bazzite",
+                "header:linux-pc",
+                "sleep:linux-pc",
+                "restart:linux-pc",
+                "shutdown:linux-pc",
+                "moonlight:linux-pc",
                 "-",
                 "open",
                 "settings",
                 "quit",
             ]
         );
-        assert!(labels(&entries).contains(&"bazzite — Awake".to_string()));
+        assert!(labels(&entries).contains(&"linux-pc — Awake".to_string()));
     }
 
     #[test]
     fn an_offline_machine_offers_wake_and_nothing_else() {
-        let entries = plan_for(&[machine("bazzite", Some(awake()), false, None)], None, "");
+        let entries = plan_for(&[machine("linux-pc", Some(awake()), false, None)], None, "");
         assert_eq!(
             machine_ids(&entries),
-            vec!["header:bazzite", "wake:bazzite"]
+            vec!["header:linux-pc", "wake:linux-pc"]
         );
-        assert!(labels(&entries).contains(&"bazzite — Offline".to_string()));
+        assert!(labels(&entries).contains(&"linux-pc — Offline".to_string()));
     }
 
     #[test]
     fn a_waking_or_going_down_machine_is_a_header_only() {
         let waking = plan_for(
-            &[machine("bazzite", None, false, Some(LastAction::wake(NOW)))],
+            &[machine(
+                "linux-pc",
+                None,
+                false,
+                Some(LastAction::wake(NOW)),
+            )],
             None,
             "",
         );
-        assert_eq!(machine_ids(&waking), vec!["header:bazzite"]);
-        assert!(labels(&waking).contains(&"bazzite — Waking…".to_string()));
+        assert_eq!(machine_ids(&waking), vec!["header:linux-pc"]);
+        assert!(labels(&waking).contains(&"linux-pc — Waking…".to_string()));
 
         let fired = LastAction::power(PowerActionKind::Sleep, NOW - 16_000, 15);
         let going = plan_for(
-            &[machine("bazzite", Some(awake()), true, Some(fired))],
+            &[machine("linux-pc", Some(awake()), true, Some(fired))],
             None,
             "",
         );
-        assert_eq!(machine_ids(&going), vec!["header:bazzite"]);
-        assert!(labels(&going).contains(&"bazzite — Going to sleep…".to_string()));
+        assert_eq!(machine_ids(&going), vec!["header:linux-pc"]);
+        assert!(labels(&going).contains(&"linux-pc — Going to sleep…".to_string()));
     }
 
     #[test]
@@ -285,42 +290,42 @@ mod tests {
             action: PowerActionKind::Sleep,
             deadline_unix_ms: NOW + 12_000,
         }));
-        let entries = plan_for(&[machine("bazzite", Some(state), true, None)], None, "");
+        let entries = plan_for(&[machine("linux-pc", Some(state), true, None)], None, "");
         assert_eq!(
             machine_ids(&entries),
-            vec!["header:bazzite", "cancel:bazzite"]
+            vec!["header:linux-pc", "cancel:linux-pc"]
         );
-        assert!(labels(&entries).contains(&"bazzite — Sleeping in 12 s".to_string()));
+        assert!(labels(&entries).contains(&"linux-pc — Sleeping in 12 s".to_string()));
     }
 
     #[test]
     fn a_failed_wake_offers_wake_and_a_still_on_machine_offers_the_awake_set() {
         let timed_out = LastAction::wake(NOW - 130_000);
         let didnt_wake = plan_for(
-            &[machine("bazzite", Some(awake()), false, Some(timed_out))],
+            &[machine("linux-pc", Some(awake()), false, Some(timed_out))],
             None,
             "",
         );
         assert_eq!(
             machine_ids(&didnt_wake),
-            vec!["header:bazzite", "wake:bazzite"]
+            vec!["header:linux-pc", "wake:linux-pc"]
         );
-        assert!(labels(&didnt_wake).contains(&"bazzite — Didn't wake".to_string()));
+        assert!(labels(&didnt_wake).contains(&"linux-pc — Didn't wake".to_string()));
 
         let sleep = LastAction::power(PowerActionKind::Sleep, NOW - 80_000, 15);
         let still_on = plan_for(
-            &[machine("bazzite", Some(awake()), true, Some(sleep))],
+            &[machine("linux-pc", Some(awake()), true, Some(sleep))],
             None,
             "",
         );
         assert_eq!(
             machine_ids(&still_on),
             vec![
-                "header:bazzite",
-                "sleep:bazzite",
-                "restart:bazzite",
-                "shutdown:bazzite",
-                "moonlight:bazzite"
+                "header:linux-pc",
+                "sleep:linux-pc",
+                "restart:linux-pc",
+                "shutdown:linux-pc",
+                "moonlight:linux-pc"
             ]
         );
     }
@@ -328,7 +333,7 @@ mod tests {
     #[test]
     fn the_menu_has_no_this_mac_refresh_or_no_pending_lines() {
         let entries = plan_for(
-            &[machine("bazzite", Some(awake()), true, None)],
+            &[machine("linux-pc", Some(awake()), true, None)],
             Some(0),
             "",
         );
@@ -342,9 +347,9 @@ mod tests {
     #[test]
     fn the_storage_line_opens_storage_and_names_issues_only_when_there_are_findings() {
         let clean = plan_for(&[], Some(0), "");
-        assert_eq!(labels(&clean)[0], "Stash · 2284.0 GiB free");
+        assert_eq!(labels(&clean)[0], "External · 2284.0 GiB free");
         let dirty = plan_for(&[], Some(1), "");
-        assert_eq!(labels(&dirty)[0], "Stash · 2284.0 GiB free · 1 issue");
+        assert_eq!(labels(&dirty)[0], "External · 2284.0 GiB free · 1 issue");
         let many = plan_for(&[], Some(3), "");
         assert!(labels(&many)[0].ends_with("· 3 issues"));
         let unknown = plan_for(&[], None, "");
@@ -429,7 +434,7 @@ mod tests {
     #[test]
     fn headers_and_the_error_row_are_disabled_and_actions_are_enabled() {
         let entries = plan_for(
-            &[machine("bazzite", Some(awake()), true, None)],
+            &[machine("linux-pc", Some(awake()), true, None)],
             None,
             "boom",
         );
@@ -446,7 +451,7 @@ mod tests {
         let entries = plan_for(&[], None, "");
         assert_eq!(
             ids(&entries),
-            vec!["storage:Stash", "-", "open", "settings", "quit"]
+            vec!["storage:External", "-", "open", "settings", "quit"]
         );
     }
 }

@@ -226,20 +226,20 @@ mod tests {
         assert!(packet[6..].chunks_exact(6).all(|chunk| chunk == mac));
         let machine = Machine::new("pc", "pc.local", "00:11:22:33:44:ff")
             .unwrap()
-            .with_broadcast(Ipv4Addr::new(192, 168, 1, 255));
+            .with_broadcast(Ipv4Addr::new(192, 0, 2, 255));
         let sender = FakeSender::default();
         assert_eq!(
             wake(&machine, &sender).unwrap(),
-            (SocketAddr::from(([192, 168, 1, 255], 9)), 102)
+            (SocketAddr::from(([192, 0, 2, 255], 9)), 102)
         );
         let sent = sender.0.lock().unwrap();
         assert_eq!(sent[0].0, packet);
-        assert_eq!(sent[0].1, SocketAddr::from(([192, 168, 1, 255], 9)));
+        assert_eq!(sent[0].1, SocketAddr::from(([192, 0, 2, 255], 9)));
     }
 
     #[test]
     fn wake_refuses_discovered_machine_without_mac() {
-        let machine = Machine::discovered("mid-1", "pc", "192.168.1.20", 9777).unwrap();
+        let machine = Machine::discovered("mid-1", "pc", "192.0.2.20", 9777).unwrap();
         let sender = FakeSender::default();
         let error = wake(&machine, &sender).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Refused);
@@ -384,7 +384,7 @@ mod tests {
                 State::new(PowerState::Awake, 42)
                     .with_machine_id("mid-1")
                     .with_mac(Some("00:11:22:33:44:ff".to_string()))
-                    .with_broadcast(Some(Ipv4Addr::new(192, 168, 1, 255)))
+                    .with_broadcast(Some(Ipv4Addr::new(192, 0, 2, 255)))
                     .with_pending(Some(Pending {
                         action: PowerActionKind::Sleep,
                         deadline_unix_ms: 15_042,
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(state.observed_at_unix_ms, 42);
         assert_eq!(state.machine_id, "mid-1");
         assert_eq!(state.mac.as_deref(), Some("00:11:22:33:44:ff"));
-        assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 168, 1, 255)));
+        assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 0, 2, 255)));
         assert_eq!(
             state.pending,
             Some(Pending {

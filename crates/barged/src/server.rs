@@ -1023,7 +1023,7 @@ mod tests {
         )
         .unwrap();
 
-        let non_localhost: SocketAddr = "192.168.1.50:40000".parse().unwrap();
+        let non_localhost: SocketAddr = "192.0.2.50:40000".parse().unwrap();
         let localhost: SocketAddr = "127.0.0.1:40000".parse().unwrap();
 
         for (method, url) in [

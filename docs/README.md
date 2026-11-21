@@ -12,6 +12,6 @@ Barge moves heavy, rebuildable developer data (build output, caches, scratch) of
 - [Quality gate](knowledge/contracts/quality.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
-- [Install `barged` on Bazzite](install-barged.md)
+- [Install `barged` on a Linux PC](install-barged.md)
 
 Repository knowledge records current truth, not work status.

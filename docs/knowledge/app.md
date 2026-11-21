@@ -96,9 +96,9 @@ Only clickable items, plus a disabled header per machine. Items appear and
 disappear as state changes; the countdown text updates every second.
 
 ```
-Stash · 2,284 GiB free        → opens the Storage view
+External · 2,284 GiB free        → opens the Storage view
 ─────────
-bazzite — Awake               (disabled header)
+linux-pc — Awake               (disabled header)
   Sleep
   Restart…
   Shut down…
@@ -111,7 +111,7 @@ Quit
 
 - Each registered volume is one storage line that opens the Storage view.
   "· N issues" is added only when the last doctor result has findings.
-- Offline: the header reads "bazzite — Offline" with Wake beneath it only.
+- Offline: the header reads "linux-pc — Offline" with Wake beneath it only.
   Waiting states show the header only. Pending shows its countdown and Cancel.
 - A chosen action shows in the menu's header at once, before the daemon answers
   and before the next poll: the click is recorded in the shared state the
@@ -141,7 +141,7 @@ Quit
     waiting state says its progress once the same way.
   - **Beside it:** the name with one `[...]` button at the card's top right, the
     state label, and a muted line with the mode and address
-    (`LAN · bazzite.local`). An offline machine folds its last observation into
+    (`LAN · linux-pc.local`). An offline machine folds its last observation into
     the state label (`Offline for 27 s`, `Offline for 5 min`, `Offline for
     2 h`); the card has no separate last-seen line. The `[...]` button opens
     a menu with the rest of what the state offers — Restart, Shut down, Open

@@ -59,14 +59,14 @@ Oxide depend on a running Barge.
 
 Tom's rulings of 2026-11-18 set the next steps:
 
-- **One policy surface for storage.** Barge owns the Stash layout at a general
+- **One policy surface for storage.** Barge owns the External layout at a general
   level. Other tools subscribe to it rather than each carrying its own drive
   handling, and the drive is tidied through Barge rather than piecemeal. See
   [resources](resources.md).
 - **Worktrees are Barge's domain.** Warm, reusable worktree pools are built
   into Barge, in the style of Treehouse. Oxide stays standalone because it is a
   drop-in Cargo replacement that only lightly touches Barge's domain.
-- **Barge controls machines.** A daemon on the Bazzite PC and a Barge UI
+- **Barge controls machines.** A daemon on the PC and a Barge UI
   replace MoonDeck Buddy and MoonDeck Remote. The UI is a menu-bar Tauri app
   built with Poodle and Longhorn, covering machines and storage. See
   [machines](machines.md) and [app](app.md).
@@ -95,3 +95,8 @@ On 2026-11-17 Tom reset Barge:
 
 Moving live data, changing host or tool settings, and deleting existing data
 outside Barge's own roots still need Tom's explicit approval.
+
+On 2026-11-21 Tom approved making `inflatable-cookie/barge` public under the MIT
+licence, alongside Oxide v0.2.0. Tom changes the repository's visibility himself.
+The licence and metadata are in `Cargo.toml` and `LICENSE`; the README is the
+public entry point.

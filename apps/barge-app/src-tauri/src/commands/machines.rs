@@ -864,7 +864,7 @@ mod tests {
                     assert!(text.contains("x-barge-client-id: cid-app"), "{text}");
                     (
                         200,
-                        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-bazzite","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1.255"}"#.to_string(),
+                        r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-linux-pc","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.0.2.255"}"#.to_string(),
                     )
                 };
                 write!(
@@ -882,8 +882,8 @@ mod tests {
             PairStartInput {
                 address: "127.0.0.1".to_string(),
                 port,
-                name: Some("Bazzite".to_string()),
-                machine_id: Some("mid-bazzite".to_string()),
+                name: Some("Linux PC".to_string()),
+                machine_id: Some("mid-linux-pc".to_string()),
                 existing_name: None,
             },
         )
@@ -897,16 +897,16 @@ mod tests {
         let approved =
             pair_poll_in(&registry, &sessions, &observations, &started.request_id).unwrap();
         assert_eq!(approved.status, "approved");
-        assert_eq!(approved.machine_name, "bazzite");
+        assert_eq!(approved.machine_name, "linux-pc");
 
         let (expected_key, expected_code) = server.join().unwrap();
         assert_eq!(started.code, expected_code);
 
-        let saved = registry.get("bazzite").unwrap();
-        assert_eq!(saved.id(), Some("mid-bazzite"));
+        let saved = registry.get("linux-pc").unwrap();
+        assert_eq!(saved.id(), Some("mid-linux-pc"));
         assert_eq!(saved.mac(), Some("aa:bb:cc:dd:ee:ff"));
-        assert_eq!(saved.broadcast(), std::net::Ipv4Addr::new(192, 168, 1, 255));
-        let creds = registry.credentials("bazzite").unwrap().unwrap();
+        assert_eq!(saved.broadcast(), std::net::Ipv4Addr::new(192, 0, 2, 255));
+        let creds = registry.credentials("linux-pc").unwrap().unwrap();
         assert_eq!(creds.client_id.as_deref(), Some("cid-app"));
         assert_eq!(creds.key, expected_key);
         assert!(sessions.lock().unwrap().is_empty());
@@ -989,7 +989,7 @@ mod tests {
         let observations = Mutex::new(Observations::default());
         let pending = Mutex::new(PendingPairs::default());
         pending.lock().unwrap().sync(vec![PendingPairPrompt {
-            machine_name: "bazzite".to_string(),
+            machine_name: "linux-pc".to_string(),
             request_id: "req-9".to_string(),
             client_name: "Deck".to_string(),
             code: "123456".to_string(),
@@ -1000,10 +1000,10 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         registry
-            .add(Machine::discovered("mid-1", "bazzite", "127.0.0.1", port).unwrap())
+            .add(Machine::discovered("mid-1", "linux-pc", "127.0.0.1", port).unwrap())
             .unwrap();
         registry
-            .pair_client("bazzite", "cid-mac", &[5; 32])
+            .pair_client("linux-pc", "cid-mac", &[5; 32])
             .unwrap();
 
         let server = std::thread::spawn(move || {
@@ -1029,16 +1029,16 @@ mod tests {
             }
         });
 
-        decide_pair_in(&registry, &pending, "bazzite", "req-9", true).unwrap();
+        decide_pair_in(&registry, &pending, "linux-pc", "req-9", true).unwrap();
         assert!(pending.lock().unwrap().snapshot().is_empty());
 
-        let clients = clients_in(&registry, "bazzite").unwrap();
+        let clients = clients_in(&registry, "linux-pc").unwrap();
         assert_eq!(clients.len(), 2);
         assert!(clients[0].this_client);
         assert!(!clients[1].this_client);
 
-        revoke_client_in(&registry, &observations, "bazzite", "cid-mac").unwrap();
-        assert!(registry.credentials("bazzite").unwrap().is_none());
+        revoke_client_in(&registry, &observations, "linux-pc", "cid-mac").unwrap();
+        assert!(registry.credentials("linux-pc").unwrap().is_none());
         server.join().unwrap();
     }
 }

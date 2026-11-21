@@ -28,7 +28,7 @@ impl PeerNode {
 
 /// The comparison form of a node identity: trimmed, lower case, and without
 /// the FQDN's terminal dot. tailcfg's `Node.Name` is an FQDN with a dot
-/// (`mac.tail1234.ts.net.`); configs and the install guide write it without
+/// (`mac.example.ts.net.`); configs and the install guide write it without
 /// one, so both sides meet here.
 fn canonical(value: &str) -> String {
     value.trim().trim_end_matches('.').to_lowercase()
@@ -324,9 +324,9 @@ mod tests {
         // guide write it without one, in either direction.
         let from_config = Allowlist::new([config_name()]);
         assert!(from_config.accepts(&whois_name()));
-        let from_whois = Allowlist::new(["macbook.tail1234.ts.net.".to_string()]);
-        assert!(from_whois.accepts(&PeerNode::new("n1", "MACBOOK.tail1234.ts.net")));
-        assert!(!from_whois.accepts(&PeerNode::new("n1", "other.tail1234.ts.net.")));
+        let from_whois = Allowlist::new(["laptop.example.ts.net.".to_string()]);
+        assert!(from_whois.accepts(&PeerNode::new("n1", "LAPTOP.example.ts.net")));
+        assert!(!from_whois.accepts(&PeerNode::new("n1", "other.example.ts.net.")));
         // Stable IDs are compared exactly, modulo case.
         let ids = Allowlist::new(["n1234ABCD".to_string()]);
         assert!(ids.accepts(&PeerNode::new(" n1234abcd ", "whatever.tail.ts.net")));
@@ -334,11 +334,11 @@ mod tests {
     }
 
     fn config_name() -> String {
-        "macbook.tail1234.ts.net".to_string()
+        "laptop.example.ts.net".to_string()
     }
 
     fn whois_name() -> PeerNode {
-        PeerNode::new("n1234ABCD", "macbook.tail1234.ts.net.")
+        PeerNode::new("n1234ABCD", "laptop.example.ts.net.")
     }
 
     #[cfg(unix)]
@@ -347,7 +347,7 @@ mod tests {
         // tailcfg.Node.ID is an integer (NodeID) and Name is an FQDN with a
         // trailing dot; StableID is the string an allowlist may name.
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)), 5000);
-        let body = br#"{"Node":{"ID":1234,"StableID":"n1234ABCD","Name":"macbook.tail1234.ts.net.","User":7,"Key":"nodekey:abc"},"User":{"ID":7,"LoginName":"tom@example.com"}}"#;
+        let body = br#"{"Node":{"ID":1234,"StableID":"n1234ABCD","Name":"laptop.example.ts.net.","User":7,"Key":"nodekey:abc"},"User":{"ID":7,"LoginName":"sam@example.com"}}"#;
         let node = TailscaleLookup::parse_whois(body, peer).unwrap();
         assert_eq!(node, whois_name());
         assert_eq!(node.stable_id, "n1234ABCD");
@@ -355,12 +355,12 @@ mod tests {
         // A node with no StableID still parses: the numeric ID is the last
         // resort, and never a whole-document failure.
         let without_stable = TailscaleLookup::parse_whois(
-            br#"{"Node":{"ID":456,"Name":"pc.tail1234.ts.net."}}"#,
+            br#"{"Node":{"ID":456,"Name":"pc.example.ts.net."}}"#,
             peer,
         )
         .unwrap();
         assert_eq!(without_stable.stable_id, "456");
-        assert_eq!(without_stable.name, "pc.tail1234.ts.net");
+        assert_eq!(without_stable.name, "pc.example.ts.net");
 
         assert!(TailscaleLookup::parse_whois(br#"{"Node":null}"#, peer).is_err());
         assert!(TailscaleLookup::parse_whois(b"not json", peer).is_err());
@@ -374,14 +374,14 @@ mod tests {
   "Node": {
     "ID": 1234,
     "StableID": "n1234ABCD",
-    "Name": "macbook.tail1234.ts.net.",
+    "Name": "laptop.example.ts.net.",
     "User": 7,
     "Key": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   },
   "User": {
     "ID": 7,
-    "LoginName": "tom@example.com",
-    "DisplayName": "Tom"
+    "LoginName": "sam@example.com",
+    "DisplayName": "Sam"
   }
 }"#
     }
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn chunked_content_length_and_close_delimited_answers_all_frame() {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)), 5000);
-        let expected = PeerNode::new("n1234ABCD", "macbook.tail1234.ts.net");
+        let expected = PeerNode::new("n1234ABCD", "laptop.example.ts.net");
         for answer in [
             chunked_answer(whois_document()),
             content_length_answer(whois_document()),
@@ -487,7 +487,7 @@ mod tests {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3)), 5000);
         for _ in 0..2 {
             let node = lookup.identify(peer).unwrap();
-            assert_eq!(node, PeerNode::new("n1234ABCD", "macbook.tail1234.ts.net"));
+            assert_eq!(node, PeerNode::new("n1234ABCD", "laptop.example.ts.net"));
         }
         server.join().unwrap();
     }

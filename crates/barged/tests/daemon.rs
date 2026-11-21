@@ -181,7 +181,7 @@ impl Harness {
         let notifier = Arc::new(FakeNotifier::default());
         let network = Arc::new(FakeNetwork(InterfaceInfo {
             mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
-            broadcast: Some(Ipv4Addr::new(192, 168, 1, 255)),
+            broadcast: Some(Ipv4Addr::new(192, 0, 2, 255)),
             interface_index: Some(2),
         }));
         let daemon = Arc::new(
@@ -271,7 +271,7 @@ fn the_state_endpoint_reports_awake_machine_id_mac_broadcast_and_pending() {
     assert_eq!(state.observed_at_unix_ms, harness.clock.now());
     assert_eq!(state.machine_id, harness.machine_id);
     assert_eq!(state.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
-    assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 168, 1, 255)));
+    assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 0, 2, 255)));
     assert_eq!(state.pending, None);
     assert!(harness
         .allowlist
@@ -474,7 +474,7 @@ fn lan_pairing_approve_deny_expiry_per_client_auth_and_revoke() {
     let temp = barge::testing::TempDir::new("barged-pair").unwrap();
     let config = Config::parse(
         format!(
-            r#"{{"listen":"127.0.0.1:0","mode":"lan","name":"Bazzite PC","state_dir":{}}}"#,
+            r#"{{"listen":"127.0.0.1:0","mode":"lan","name":"Linux PC","state_dir":{}}}"#,
             serde_json::to_string(temp.path()).unwrap()
         )
         .as_bytes(),
@@ -491,13 +491,13 @@ fn lan_pairing_approve_deny_expiry_per_client_auth_and_revoke() {
         let ads = harness.mdns.advertised.lock().unwrap();
         assert_eq!(ads.len(), 1);
         assert_eq!(ads[0].service_type, "_barged._tcp");
-        assert_eq!(ads[0].instance_name, "Bazzite PC");
+        assert_eq!(ads[0].instance_name, "Linux PC");
         assert_eq!(ads[0].port, harness.address.port());
         assert_eq!(
             ads[0].txt,
             vec![
                 ("id".to_string(), harness.machine_id.clone()),
-                ("name".to_string(), "Bazzite PC".to_string()),
+                ("name".to_string(), "Linux PC".to_string()),
                 ("mode".to_string(), "lan".to_string()),
                 ("version".to_string(), "1".to_string()),
             ]
@@ -550,7 +550,7 @@ fn lan_pairing_approve_deny_expiry_per_client_auth_and_revoke() {
     let state = client1.state().unwrap();
     assert_eq!(state.machine_id, harness.machine_id);
     assert_eq!(state.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
-    assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 168, 1, 255)));
+    assert_eq!(state.broadcast, Some(Ipv4Addr::new(192, 0, 2, 255)));
 
     // 2. Pair second client ("Steam Deck") and approve via signed paired client (client1)!
     let keys2 = KeyPair::generate().unwrap();

@@ -7,7 +7,7 @@ not change.
 
 ## The problem
 
-Moving data onto Stash was never one move. Each one changed something that
+Moving data onto External was never one move. Each one changed something that
 matters in a different place:
 
 - Paseo's worktree root in `~/.paseo/config.json`;
@@ -58,7 +58,7 @@ volume's availability says whether it can currently be used; its stored
 `durability` field is descriptive metadata and does not set class policy. A
 volume can hold classes of either durability. Each class is placed on one
 registered volume, and different classes can live on different volumes. One
-drive can hold both expendable and kept classes, as Stash does today. A second
+drive can hold both expendable and kept classes, as External does today. A second
 drive can take some classes over by moving them (see [Moving a class](#moving-a-class)).
 Kept classes sit outside every expendable area (Q-006), so pruning can never
 reach them.
@@ -72,7 +72,7 @@ It has two copies, with one authority:
 - **The account layout** (`layout.json` in account state, `barge.layout/1`) is
   the authority on this machine. It covers every volume, so Barge still knows
   where each class belongs while a drive is absent: `barge path scratch` with
-  Stash unplugged applies that class's absent policy rather than guessing
+  External unplugged applies that class's absent policy rather than guessing
   (Tom, 2026-11-18).
 - **The volume record** (`<mount>/.barge/layout.json`) lists the classes that
   volume holds and their folders. Barge rewrites it whenever the account layout
@@ -85,12 +85,12 @@ It has two copies, with one authority:
 {
   "schema": "barge.layout/1",
   "classes": {
-    "scratch":   { "volume": "Stash", "path": "scratch" },
-    "worktrees": { "volume": "Stash", "path": "worktrees" },
-    "builds":    { "volume": "Stash", "path": "builds" },
-    "caches":    { "volume": "Stash", "path": "caches" },
-    "vms":       { "volume": "Stash", "path": "vms" },
-    "archives":  { "volume": "Stash", "path": "archives" }
+    "scratch":   { "volume": "External", "path": "scratch" },
+    "worktrees": { "volume": "External", "path": "worktrees" },
+    "builds":    { "volume": "External", "path": "builds" },
+    "caches":    { "volume": "External", "path": "caches" },
+    "vms":       { "volume": "External", "path": "vms" },
+    "archives":  { "volume": "External", "path": "archives" }
   }
 }
 ```
@@ -98,7 +98,7 @@ It has two copies, with one authority:
 A consumer area (`oxide/pool`) sits inside its class folder by default
 (`builds/oxide/pool`) and can be overridden to an existing path, as Oxide's two
 areas are today ([architecture](architecture.md#layout-on-a-volume)), until a
-move puts them under the class folder. The Stash layout lane settles the actual
+move puts them under the class folder. The External layout lane settles the actual
 target layout. The folder names above are a first proposal.
 
 ### Bindings
@@ -179,7 +179,7 @@ The `workflow` kind is built too. Its rules:
 data:
 
 - A **cache placement** moves a tool's cache onto the class folder and points
-  the tool there, for example `~/.cargo/registry → <Stash>/caches/cargo/registry`.
+  the tool there, for example `~/.cargo/registry → <External>/caches/cargo/registry`.
   Its contents are expendable: Barge may prune whole cache roots, and the tool
   rebuilds them.
 - A **kept placement** does the same for data that must never be pruned, such
@@ -273,7 +273,7 @@ account.
 
 ## Moving a class
 
-Changing where a class lives is the operation the Stash tidy needs, so it is
+Changing where a class lives is the operation the External tidy needs, so it is
 one command with a plan:
 
 ```
@@ -340,7 +340,7 @@ that stopped being real between plan and apply is refused as a changed plan.
 `barge survey <volume>` is read-only. It lists every top-level item with its
 size and classifies it: inside a declared class, a known consumer path not yet
 under a class, or unknown. System items are classified without measuring them;
-unreadable or incomplete trees have approximate sizes. It's the input to the Stash layout lane's migration
+unreadable or incomplete trees have approximate sizes. It's the input to the External layout lane's migration
 plan.
 
 ## Library and CLI
@@ -370,7 +370,7 @@ Each step is its own brief, reviewed as usual.
 3. **Built:** `init` with workflow blocks. Adopting this repository, then
    Effigy's, is the operator's step after merge.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
-5. **Built:** `move --plan|--apply`; the Stash layout lane then uses it item by item.
+5. **Built:** `move --plan|--apply`; the External layout lane then uses it item by item.
 
 ## Questions
 

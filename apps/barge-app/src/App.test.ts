@@ -191,7 +191,7 @@ describe("Machines", () => {
   const AWAKE = ["Restart", "Shut down", "Open Moonlight", "Details"];
   function machine(fields: Partial<MachineView> & { status: MachineStatus }): MachineView {
     return {
-      name: "bazzite", hostname: "bazzite.local", mac: "00:11:22:33:44:55", mode: "lan", paired: true, address: "bazzite.local",
+      name: "linux-pc", hostname: "linux-pc.local", mac: "00:11:22:33:44:55", mode: "lan", paired: true, address: "linux-pc.local",
       daemon_port: 9777, reachable: true, error: null, seen_at_unix_ms: now(), ...fields,
     };
   }
@@ -218,9 +218,9 @@ describe("Machines", () => {
   const restarting = () => machine({ status: status({ phase: "restarting", action: "restart", waiting: true }) });
   const didNotWake = () => machine({ reachable: false, status: status({ phase: "did_not_wake", offers: ["wake"] }) });
 
-  const MENU_BUTTON = "Actions for bazzite";
+  const MENU_BUTTON = "Actions for linux-pc";
 
-  async function card(name = "bazzite") {
+  async function card(name = "linux-pc") {
     return screen.findByLabelText(`${name} machine`);
   }
 
@@ -232,7 +232,7 @@ describe("Machines", () => {
   async function openActions(region: HTMLElement) {
     const [trigger] = within(region).getAllByRole("button", { name: MENU_BUTTON });
     await fireEvent.click(trigger);
-    return screen.findByRole("menu", { name: "bazzite actions" });
+    return screen.findByRole("menu", { name: "linux-pc actions" });
   }
 
   async function openDetails(region: HTMLElement) {
@@ -291,10 +291,10 @@ describe("Machines", () => {
 
     // The click is recorded in the shared state, so the card shows the wait
     // while the daemon is still being asked.
-    expect(api.beginMachineAction).toHaveBeenCalledWith("bazzite", "wake");
+    expect(api.beginMachineAction).toHaveBeenCalledWith("linux-pc", "wake");
     expect(await within(region).findByText("Waking…")).toBeInTheDocument();
     expect(region.querySelector('.power[data-waiting="true"]')).not.toBeNull();
-    expect(api.machineAction).toHaveBeenCalledWith("bazzite", "wake");
+    expect(api.machineAction).toHaveBeenCalledWith("linux-pc", "wake");
     expect(within(region).getByRole("button", { name: "Waking…" })).toBeDisabled();
 
     // The poll owns the state afterwards, not the renderer's copy.
@@ -335,10 +335,10 @@ describe("Machines", () => {
     render(App, { props: { api } });
     const menu = await openActions(await card());
     await fireEvent.click(within(menu).getByRole("menuitem", { name: "Restart" }));
-    expect(await screen.findByText("Restart bazzite?")).toBeInTheDocument();
+    expect(await screen.findByText("Restart linux-pc?")).toBeInTheDocument();
     expect(api.machineAction).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole("button", { name: "Restart" }));
-    await waitFor(() => expect(api.machineAction).toHaveBeenCalledWith("bazzite", "restart"));
+    await waitFor(() => expect(api.machineAction).toHaveBeenCalledWith("linux-pc", "restart"));
   });
 
   it("explains that a cancel cannot be confirmed while the machine is unreachable", async () => {
@@ -368,10 +368,10 @@ describe("Machines", () => {
     const fresh = offline();
     fresh.status.last_seen_unix_ms = Date.now();
     const future = offline();
-    future.name = "bazzite-future";
+    future.name = "linux-pc-future";
     future.status.last_seen_unix_ms = Date.now() + 60_000;
     const never = offline();
-    never.name = "bazzite-never";
+    never.name = "linux-pc-never";
     never.status.last_seen_unix_ms = null;
     vi.mocked(api.machines).mockResolvedValue([fresh, future, never]);
     render(App, { props: { api } });
@@ -394,7 +394,7 @@ describe("Machines", () => {
     const power = within(region).getByRole("button", { name: label });
     expect(power).toBeEnabled();
     await fireEvent.click(power);
-    await waitFor(() => expect(api.machineAction).toHaveBeenCalledWith("bazzite", offer));
+    await waitFor(() => expect(api.machineAction).toHaveBeenCalledWith("linux-pc", offer));
   });
 
   it.each([
@@ -432,7 +432,7 @@ describe("Machines", () => {
     vi.mocked(api.machines).mockResolvedValue([awake()]);
     render(App, { props: { api } });
     await fireEvent.click(within(await openDetails(await card())).getByRole("button", { name: "Remove…" }));
-    expect(await screen.findByText("Remove bazzite?")).toBeInTheDocument();
+    expect(await screen.findByText("Remove linux-pc?")).toBeInTheDocument();
     expect(api.removeMachine).not.toHaveBeenCalled();
   });
 
@@ -535,11 +535,11 @@ describe("Machines", () => {
     const api = fixture();
     vi.mocked(api.discoverMachines).mockResolvedValue([
       {
-        id: "mid-bazzite",
-        name: "Bazzite",
+        id: "mid-linux-pc",
+        name: "Linux PC",
         mode: "lan",
         protocol_version: "1",
-        address: "192.168.1.42",
+        address: "192.0.2.42",
         port: 9777,
       },
     ]);
@@ -547,22 +547,22 @@ describe("Machines", () => {
       request_id: "req-1",
       code: "340092",
       expires_at_unix_ms: Date.now() + 120_000,
-      machine_name: "Bazzite",
+      machine_name: "Linux PC",
     });
-    vi.mocked(api.pollPair).mockResolvedValue({ status: "pending", machine_name: "Bazzite" });
+    vi.mocked(api.pollPair).mockResolvedValue({ status: "pending", machine_name: "Linux PC" });
 
     render(App, { props: { api } });
-    const foundCard = await screen.findByLabelText("Bazzite discovered machine");
+    const foundCard = await screen.findByLabelText("Linux PC discovered machine");
     expect(within(foundCard).getByText("Found on network")).toBeInTheDocument();
-    expect(within(foundCard).getByText("LAN · 192.168.1.42:9777")).toBeInTheDocument();
+    expect(within(foundCard).getByText("LAN · 192.0.2.42:9777")).toBeInTheDocument();
     expect(screen.queryByText(/No machines found on the network/)).not.toBeInTheDocument();
 
     await fireEvent.click(within(foundCard).getByRole("button", { name: "Add" }));
     expect(api.startPair).toHaveBeenCalledWith({
-      address: "192.168.1.42",
+      address: "192.0.2.42",
       port: 9777,
-      name: "Bazzite",
-      machine_id: "mid-bazzite",
+      name: "Linux PC",
+      machine_id: "mid-linux-pc",
       existing_name: null,
     });
     expect(await screen.findByLabelText("Pairing code")).toHaveTextContent("340092");
@@ -581,11 +581,11 @@ describe("Machines", () => {
     const api = fixture();
     vi.mocked(api.discoverMachines).mockResolvedValue([
       {
-        id: "mid-bazzite",
-        name: "Bazzite",
+        id: "mid-linux-pc",
+        name: "Linux PC",
         mode: "lan",
         protocol_version: "1",
-        address: "192.168.1.42",
+        address: "192.0.2.42",
         port: 9777,
       },
     ]);
@@ -593,14 +593,14 @@ describe("Machines", () => {
       request_id: "req-outcome",
       code: "340092",
       expires_at_unix_ms: Date.now() + 120_000,
-      machine_name: "Bazzite",
+      machine_name: "Linux PC",
     });
     vi.mocked(api.pollPair)
-      .mockResolvedValueOnce({ status: "pending", machine_name: "Bazzite" })
-      .mockResolvedValueOnce({ status: outcome, machine_name: "bazzite" });
+      .mockResolvedValueOnce({ status: "pending", machine_name: "Linux PC" })
+      .mockResolvedValueOnce({ status: outcome, machine_name: "linux-pc" });
 
     render(App, { props: { api } });
-    const foundCard = await screen.findByLabelText("Bazzite discovered machine");
+    const foundCard = await screen.findByLabelText("Linux PC discovered machine");
     await fireEvent.click(within(foundCard).getByRole("button", { name: "Add" }));
     expect(await screen.findByLabelText("Pairing code")).toHaveTextContent("340092");
 
@@ -611,8 +611,8 @@ describe("Machines", () => {
   });
 
   it("does not offer a registered machine under Found on network when discovery reconciles it", async () => {
-    // Tom, 2026-11-20: bazzite is registered before discovery existed (hostname
-    // bazzite.local, no ID yet) and the browse finds it at 192.168.1.55. Discovery
+    // Tom, 2026-11-20: linux-pc is registered before discovery existed (hostname
+    // linux-pc.local, no ID yet) and the browse finds it at 192.0.2.55. Discovery
     // reconciles the two, so the window gets no found machine to offer.
     const api = fixture();
     vi.mocked(api.machines).mockResolvedValue([awake()]);
@@ -660,7 +660,7 @@ describe("Machines", () => {
     vi.mocked(api.machines).mockResolvedValue([awake()]);
     vi.mocked(api.pendingPairs).mockResolvedValue([
       {
-        machine_name: "bazzite",
+        machine_name: "linux-pc",
         request_id: "req-deck",
         client_name: "Steam Deck",
         code: "340092",
@@ -668,7 +668,7 @@ describe("Machines", () => {
         expires_at_unix_ms: Date.now() + 115_000,
       },
       {
-        machine_name: "bazzite",
+        machine_name: "linux-pc",
         request_id: "req-ipad",
         client_name: "iPad",
         code: "112233",
@@ -679,17 +679,17 @@ describe("Machines", () => {
 
     render(App, { props: { api } });
     const prompts = await screen.findByLabelText("Pairing requests");
-    expect(within(prompts).getByText("Steam Deck wants to pair with bazzite")).toBeInTheDocument();
+    expect(within(prompts).getByText("Steam Deck wants to pair with linux-pc")).toBeInTheDocument();
     expect(within(prompts).getByText("340092")).toBeInTheDocument();
 
     const [firstApprove] = within(prompts).getAllByRole("button", { name: "Approve" });
     await fireEvent.click(firstApprove);
-    await waitFor(() => expect(api.approvePair).toHaveBeenCalledWith("bazzite", "req-deck"));
-    await waitFor(() => expect(screen.queryByText("Steam Deck wants to pair with bazzite")).not.toBeInTheDocument());
+    await waitFor(() => expect(api.approvePair).toHaveBeenCalledWith("linux-pc", "req-deck"));
+    await waitFor(() => expect(screen.queryByText("Steam Deck wants to pair with linux-pc")).not.toBeInTheDocument());
 
     const denyBtn = within(prompts).getByRole("button", { name: "Deny" });
     await fireEvent.click(denyBtn);
-    await waitFor(() => expect(api.denyPair).toHaveBeenCalledWith("bazzite", "req-ipad"));
+    await waitFor(() => expect(api.denyPair).toHaveBeenCalledWith("linux-pc", "req-ipad"));
     await waitFor(() => expect(screen.queryByLabelText("Pairing requests")).not.toBeInTheDocument());
   });
 
@@ -719,7 +719,7 @@ describe("Machines", () => {
     expect(api.revokeClient).not.toHaveBeenCalled();
 
     await fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
-    await waitFor(() => expect(api.revokeClient).toHaveBeenCalledWith("bazzite", "cid-deck"));
+    await waitFor(() => expect(api.revokeClient).toHaveBeenCalledWith("linux-pc", "cid-deck"));
     await waitFor(() => expect(within(clientsSection).queryByText("Steam Deck")).not.toBeInTheDocument());
   });
 });

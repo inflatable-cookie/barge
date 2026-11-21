@@ -3,7 +3,7 @@
 Status: design outline approved by Tom, 2026-11-18. Build steps 1, 2, LAN authentication and the daemon/CLI step of discovery and pairing are complete; the Mac app and Decky plugin UIs remain unbuilt.
 
 Barge manages the machines it distributes resources across. The first is the
-Bazzite PC: wake it, see its state, and sleep, restart or shut it down. This
+A Linux PC: wake it, see its state, and sleep, restart or shut it down. This
 replaces MoonDeck Buddy, which is no longer maintained, and Tom's MoonDeck
 Remote menu-bar app ([vision](vision.md#direction)).
 
@@ -14,7 +14,7 @@ Remote menu-bar app ([vision](vision.md#direction)).
   needs nothing running on the PC. JSON restart and shutdown requests require
   `--yes` rather than prompting.
 - **`barged` on the PC:** a small Rust daemon. It reports state and performs
-  power actions. On Bazzite it runs as a systemd user unit and asks logind over
+  power actions. On Linux it runs as a systemd user unit and asks logind over
   D-Bus for sleep, restart and shutdown, with a polkit rule granting only those
   actions. It never runs a shell command it was sent. It binds one configured address and accepts either allowlisted Tailscale nodes or authenticated LAN clients. [Install guide](../install-barged.md).
 - **Barge app:** a menu-bar Tauri app built with Poodle and Longhorn,
@@ -149,7 +149,7 @@ keys.
   - `name`: display name (from config `name`, defaulting to the short OS hostname)
   - `mode`: `"lan"`
   - `version`: `"1"` (protocol version)
-  On Bazzite it registers through Avahi over D-Bus (`org.freedesktop.Avahi`),
+  On Linux it registers through Avahi over D-Bus (`org.freedesktop.Avahi`),
   which ships with the OS; no new service is installed. If Avahi is absent,
   `barged` logs once and keeps serving.
 - `GET /v1/state` (`barge.machine-state/2`) also reports `machine_id`, the
@@ -171,7 +171,7 @@ keys.
   3. the record's hostname resolving to the found address, on the same daemon
      port;
   4. the record's hostname equal, ignoring case, to the SRV host (for example
-     `Bazzite.local`).
+     `Linux-PC.local`).
   Rules 2 to 4 consider only records with no ID yet. A record that holds another
   ID is a different machine, so it is listed as found and never matched by name,
   address or MAC.
@@ -224,7 +224,7 @@ the PC, not a terminal):
 
 - **On the PC, in Gaming Mode:** the Barge Decky plugin, installed on the PC
   as well as the Deck, shows "Steam Deck wants to pair" with the code, and
-  Approve or Deny. Bazzite runs Decky Loader, so this reuses the plugin; on
+  Approve or Deny. The PC runs Decky Loader, so this reuses the plugin; on
   the PC it talks to its own `barged` over localhost.
 - **On the PC, in Desktop Mode:** `barged` sends a desktop notification with
   the code and Approve and Deny actions, through the session's
@@ -277,7 +277,7 @@ Poodle and Longhorn, covering Machines and Storage in its first release.
    allowlist and Tailscale `whois`, logind over D-Bus, the client in
    `barge-machine`, `barge machine status|sleep|restart|shutdown|cancel`, the
    systemd unit and polkit rule in `packaging/barged/`, and the
-   [install guide](../install-barged.md) for Bazzite.
+   [install guide](../install-barged.md) for Linux.
 3. **Built:** LAN pairing and authenticated requests, with no Tailscale required.
 4. Tailscale on both machines, once Tom is ready for the sign-ins.
 4a. Discovery and per-client pairing, designed in

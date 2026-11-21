@@ -15,6 +15,8 @@ edition = "2021"
 rust-version = "1.97.1"
 # Barge is consumed by path or Git revision; it is never published to a registry.
 publish = false
+license = "MIT"
+repository = "https://github.com/inflatable-cookie/barge"
 
 # Shared dependency requirements. They are caret requirements, so a consumer
 # that links Barge is not forced onto one exact patch release; `Cargo.lock`
