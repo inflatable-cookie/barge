@@ -159,31 +159,49 @@ impl TailscaleLookup {
 #[cfg(unix)]
 impl PeerLookup for TailscaleLookup {
     fn identify(&self, peer: SocketAddr) -> Result<PeerNode, PeerError> {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
-        use std::time::Duration;
-
-        let mut stream = UnixStream::connect(&self.socket).map_err(|error| {
-            PeerError::new(format!(
-                "cannot reach tailscaled at {}: {error}",
-                self.socket.display()
-            ))
-        })?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|error| PeerError::new(format!("cannot set the whois timeout: {error}")))?;
-        let request = format!(
-            "GET /localapi/v0/whois?addr={peer} HTTP/1.1\r\nHost: local-tailscaled.sock\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(request.as_bytes()).map_err(|error| {
-            PeerError::new(format!("cannot ask tailscaled who {peer} is: {error}"))
-        })?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).map_err(|error| {
-            PeerError::new(format!("cannot read tailscaled's whois answer: {error}"))
-        })?;
-        Self::parse_response(&response, peer)
+        let body = local_api_get(
+            &self.socket,
+            &format!("/localapi/v0/whois?addr={peer}"),
+            &format!("who {peer} is"),
+        )?;
+        Self::parse_whois(&body, peer)
     }
+}
+
+/// One `GET` on tailscaled's local API, answered with a 200 document. The
+/// `what` names the question in an error, such as "who 100.64.0.2 is".
+///
+/// The request is `Connection: close`, so a body with no framing runs to the
+/// end of the answer; [`frame_body`] decodes the framings LocalAPI uses.
+#[cfg(unix)]
+pub(crate) fn local_api_get(
+    socket: &std::path::Path,
+    path: &str,
+    what: &str,
+) -> Result<Vec<u8>, PeerError> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let mut stream = UnixStream::connect(socket).map_err(|error| {
+        PeerError::new(format!(
+            "cannot reach tailscaled at {}: {error}",
+            socket.display()
+        ))
+    })?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| PeerError::new(format!("cannot set the tailscaled timeout: {error}")))?;
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: local-tailscaled.sock\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| PeerError::new(format!("cannot ask tailscaled {what}: {error}")))?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|error| {
+        PeerError::new(format!("cannot read tailscaled's answer ({what}): {error}"))
+    })?;
+    answer_body(&response, what)
 }
 
 #[cfg(unix)]
@@ -198,21 +216,28 @@ impl TailscaleLookup {
     /// header block to serde would see chunk sizes and trailers instead of
     /// JSON, so the chunked, `Content-Length` and close-delimited cases are all
     /// decoded here.
+    #[cfg(test)]
     fn parse_response(response: &[u8], peer: SocketAddr) -> Result<PeerNode, PeerError> {
-        let (head, rest) = split_head(response);
-        let status = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("");
-        if status != "200" {
-            return Err(PeerError::new(format!(
-                "tailscaled did not identify {peer}: {}",
-                head.lines().next().unwrap_or("no status")
-            )));
-        }
-        Self::parse_whois(&frame_body(&head, rest)?, peer)
+        Self::parse_whois(&answer_body(response, &format!("who {peer} is"))?, peer)
     }
+}
+
+/// The decoded body of a 200 response, or the refusal the status line names.
+#[cfg(unix)]
+fn answer_body(response: &[u8], what: &str) -> Result<Vec<u8>, PeerError> {
+    let (head, rest) = split_head(response);
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("");
+    if status != "200" {
+        return Err(PeerError::new(format!(
+            "tailscaled did not answer ({what}): {}",
+            head.lines().next().unwrap_or("no status")
+        )));
+    }
+    frame_body(&head, rest)
 }
 
 /// Split a response at the end of its header block.
@@ -461,7 +486,7 @@ mod tests {
             peer,
         )
         .unwrap_err();
-        assert!(error.message().contains("did not identify"), "{error}");
+        assert!(error.message().contains("did not answer"), "{error}");
         // A truncated chunk is reported by its framing.
         let truncated = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nff\r\n{}\r\n";
         let error = TailscaleLookup::parse_response(truncated, peer).unwrap_err();

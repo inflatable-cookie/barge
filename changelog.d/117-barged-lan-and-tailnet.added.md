@@ -1,0 +1,1 @@
+`barged` serves its LAN address and its tailnet address at once: a `tailscale` block beside `listen` adds the tailnet listener, and a paired client reaches the machine on either network with the same credentials. The CLI and the app try the LAN address first and then the tailnet name, and show which route answered.

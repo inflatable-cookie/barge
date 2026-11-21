@@ -31,6 +31,30 @@ pub struct Machine {
     /// default, so an existing registry keeps working.
     #[serde(default = "default_daemon_port")]
     daemon_port: u16,
+    /// The route a client last reached this machine by, tried first next time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_path: Option<Path>,
+}
+
+/// The route a client reaches a machine's `barged` by: the LAN address, or the
+/// tailnet name. Both carry the same paired-client credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Path {
+    /// The LAN address the record names (`hostname`).
+    Lan,
+    /// The tailnet name the record holds (`tailscale_name`).
+    Tailscale,
+}
+
+impl Path {
+    /// The word the CLI and the app show for this route.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Tailscale => "tailscale",
+        }
+    }
 }
 
 fn default_daemon_port() -> u16 {
@@ -60,6 +84,7 @@ impl Machine {
             broadcast: DEFAULT_BROADCAST,
             port: DEFAULT_PORT,
             daemon_port: DEFAULT_DAEMON_PORT,
+            last_path: None,
         })
     }
 
@@ -95,6 +120,7 @@ impl Machine {
             broadcast: DEFAULT_BROADCAST,
             port: DEFAULT_PORT,
             daemon_port,
+            last_path: None,
         })
     }
 
@@ -163,6 +189,17 @@ impl Machine {
     /// Record the tailnet identity used instead of the hostname.
     pub fn with_tailscale_name(mut self, value: Option<String>) -> Self {
         self.tailscale_name = value;
+        self
+    }
+
+    /// The route a client last reached this machine by, when recorded.
+    pub fn last_path(&self) -> Option<Path> {
+        self.last_path
+    }
+
+    /// Record the route a client reached this machine by.
+    pub fn with_last_path(mut self, value: Option<Path>) -> Self {
+        self.last_path = value;
         self
     }
 

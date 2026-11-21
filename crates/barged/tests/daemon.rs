@@ -16,6 +16,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use barge_machine::{
     auth, parse_public_key, DaemonClient, KeyPair, PairRole, PairStatus, Pending, PowerActionKind,
@@ -25,7 +26,8 @@ use barge_machine::{
 use barged::{
     ActionCallback, Allowlist, Clock, Config, Daemon, InterfaceInfo, MdnsAdvertiser,
     MdnsRegistration, NetworkLookup, PairAction, PairNotification, PairingNotifier, PeerError,
-    PeerLookup, PeerNode, PowerBackend, PowerController, Result, ServiceAdvertisement,
+    PeerLookup, PeerNode, PowerBackend, PowerController, Result, ServiceAdvertisement, TailnetSelf,
+    TailnetStatus, Timing,
 };
 
 #[derive(Debug, Default)]
@@ -123,9 +125,47 @@ impl PairingNotifier for FakeNotifier {
     }
 }
 
+/// A tailnet status the test controls: `None` is tailscaled not running.
+#[derive(Clone, Default)]
+struct FakeTailnet(Arc<Mutex<Option<TailnetSelf>>>);
+
+impl FakeTailnet {
+    fn up(&self, node: TailnetSelf) {
+        *self.0.lock().unwrap() = Some(node);
+    }
+}
+
+impl TailnetStatus for FakeTailnet {
+    fn status(&self) -> Result<TailnetSelf> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| barged::Error::new("tailscaled is not running"))
+    }
+}
+
+/// This node as the tailnet names it.
+fn pc_node() -> TailnetSelf {
+    TailnetSelf {
+        dns_name: Some("pc.tail1234.ts.net".to_string()),
+        ipv4: Some(Ipv4Addr::new(100, 64, 0, 7)),
+    }
+}
+
+/// Retries at millisecond pace, so a test sees the tailnet side come up.
+fn quick_timing() -> Timing {
+    Timing {
+        first_retry: Duration::from_millis(10),
+        cap: Duration::from_millis(40),
+        recheck: Duration::from_millis(40),
+    }
+}
+
 /// A daemon on loopback, its client, its fakes and its stop flag.
 struct Harness {
     _temp: barge::testing::TempDir,
+    daemon: Arc<Daemon>,
     client: DaemonClient,
     address: SocketAddr,
     controller: PowerController,
@@ -155,11 +195,47 @@ impl Harness {
             .as_bytes(),
         )
         .unwrap();
-        Self::start(temp, config, identity, false)
+        Self::start(temp, config, identity, false, None)
     }
 
     fn lan(temp: barge::testing::TempDir, config: Config, fail_mdns: bool) -> Self {
-        Self::start(temp, config, None, fail_mdns)
+        Self::start(temp, config, None, fail_mdns, None)
+    }
+
+    /// A combined daemon: LAN on loopback, and a tailnet listener on loopback
+    /// that the `tailnet` fake reports. `tailnet_nodes` is the tailnet
+    /// allowlist, written as JSON strings.
+    fn combined(identity: Option<PeerNode>, tailnet_nodes: &[&str], tailnet: FakeTailnet) -> Self {
+        let temp = barge::testing::TempDir::new("barged-combined").unwrap();
+        let nodes = tailnet_nodes
+            .iter()
+            .map(|node| format!("{node:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let config = Config::parse(
+            format!(
+                r#"{{"listen":"127.0.0.1:0","mode":"lan","name":"Linux PC","state_dir":{},"tailscale":{{"listen":"127.0.0.1:0","allowed_nodes":[{nodes}]}}}}"#,
+                serde_json::to_string(temp.path()).unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        Self::start(temp, config, identity, false, Some(tailnet))
+    }
+
+    /// Wait until the tailnet listener is up, and return its address.
+    fn wait_for_tailnet(&self) -> SocketAddr {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(address) = self.daemon.tailnet_address() {
+                return address;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tailnet listener never came up"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn start(
@@ -167,6 +243,7 @@ impl Harness {
         config: Config,
         identity: Option<PeerNode>,
         fail_mdns: bool,
+        tailnet: Option<FakeTailnet>,
     ) -> Self {
         let backend = Arc::new(RecordingBackend::default());
         let clock = Arc::new(FakeClock::default());
@@ -184,23 +261,27 @@ impl Harness {
             broadcast: Some(Ipv4Addr::new(192, 0, 2, 255)),
             interface_index: Some(2),
         }));
-        let daemon = Arc::new(
-            Daemon::new(&config, controller.clone(), peers, clock.clone())
-                .unwrap()
-                .with_network(network)
-                .with_mdns_and_notifier(mdns.clone(), notifier.clone()),
-        );
+        let mut built = Daemon::new(&config, controller.clone(), peers, clock.clone())
+            .unwrap()
+            .with_network(network)
+            .with_mdns_and_notifier(mdns.clone(), notifier.clone());
+        if let Some(tailnet) = tailnet {
+            built = built.with_tailnet(Box::new(tailnet), quick_timing());
+        }
+        let daemon = Arc::new(built);
         let machine_id = daemon.state_store().machine_id().to_string();
-        let server = daemon.bind().unwrap();
-        let address = server.local_addr().unwrap();
+        let listeners = daemon.bind_all().unwrap();
+        let address = listeners[0].local_addr().unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let serving = Arc::clone(&running);
+        let serving_daemon = Arc::clone(&daemon);
         let handle = thread::spawn(move || {
-            let served = daemon.serve(server, &serving);
+            let served = serving_daemon.serve_all(listeners, &serving);
             assert!(served.is_ok(), "{served:?}");
         });
         Self {
             _temp: temp,
+            daemon,
             client: DaemonClient::at(format!("http://{address}")),
             address,
             controller,
@@ -228,19 +309,24 @@ impl Harness {
 
     /// One raw request, for the cases the typed client cannot express.
     fn raw(&self, request: &str) -> (u16, String) {
-        let mut stream = TcpStream::connect(self.address).unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
-        let status = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse().ok())
-            .unwrap();
-        (status, body.to_string())
+        raw_at(self.address, request)
     }
+}
+
+/// One raw request to `address`, answered as (status, body).
+fn raw_at(address: SocketAddr, request: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap();
+    (status, body.to_string())
 }
 
 trait DaemonTestExt {
@@ -782,4 +868,139 @@ fn stalled_body_times_out_and_the_next_client_is_served() {
     let mut response = String::new();
     slow.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+}
+
+#[test]
+fn the_tailnet_listener_refuses_pairing_and_serves_a_paired_client_with_no_allowlist_entry() {
+    let tailnet = FakeTailnet::default();
+    tailnet.up(pc_node());
+    let harness = Harness::combined(
+        Some(PeerNode::new("n9", "laptop.tailnet.ts.net")),
+        &[],
+        tailnet,
+    );
+    let tailnet_address = harness.wait_for_tailnet();
+    // Signed requests carry the real time, so the fake clock follows it.
+    harness.clock.at(barged::SystemClock.now_unix_ms());
+
+    // Pairing is a LAN act: the tailnet listener refuses it outright.
+    let (status, body) = raw_at(
+        tailnet_address,
+        "POST /v1/pair HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status, 400);
+    assert!(body.contains("served only on the LAN address"), "{body}");
+
+    // Pair a client on the LAN, as usual.
+    let keys = KeyPair::generate().unwrap();
+    let started = harness
+        .client
+        .start_pair("MacBook", &keys.public_key_hex())
+        .unwrap();
+    let derived = keys
+        .derive(
+            &parse_public_key(&started.public_key).unwrap(),
+            PairRole::Client,
+        )
+        .unwrap();
+    let approved = harness.client.approve_pair(&started.request_id).unwrap();
+
+    // Its signed requests work on the tailnet, though the tailnet allowlist is
+    // empty: the paired client is the credential. The state names the node.
+    let on_tailnet = DaemonClient::at(format!("http://{tailnet_address}"))
+        .with_client_key(&approved.client.id, derived.key().to_vec());
+    let state = on_tailnet.state().unwrap();
+    assert_eq!(state.machine_id, harness.machine_id);
+    assert_eq!(state.tailscale_name.as_deref(), Some("pc.tail1234.ts.net"));
+    assert_eq!(state.tailscale_ip, Some(Ipv4Addr::new(100, 64, 0, 7)));
+
+    // The same credentials work on the LAN, and a LAN-only state read stays
+    // unsigned-refused.
+    let on_lan = DaemonClient::at(format!("http://{}", harness.address))
+        .with_client_key(&approved.client.id, derived.key().to_vec());
+    assert_eq!(on_lan.state().unwrap().machine_id, harness.machine_id);
+    assert_eq!(
+        harness.client.state().unwrap_err().kind(),
+        barge_machine::ErrorKind::Refused
+    );
+
+    // Clients are managed on the LAN only, even by an authenticated client.
+    let error = on_tailnet.clients().unwrap_err();
+    assert_eq!(error.kind(), barge_machine::ErrorKind::Refused);
+    assert!(
+        error.message().contains("served only on the LAN address"),
+        "{error}"
+    );
+
+    // An unpaired caller that is not on the allowlist is refused as before.
+    let error = DaemonClient::at(format!("http://{tailnet_address}"))
+        .state()
+        .unwrap_err();
+    assert_eq!(error.kind(), barge_machine::ErrorKind::Refused);
+    assert!(
+        error.message().contains("is not on the allowlist"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_allowlisted_tailnet_node_is_served_unsigned_and_the_allowlist_still_decides() {
+    let tailnet = FakeTailnet::default();
+    tailnet.up(pc_node());
+    let harness = Harness::combined(
+        Some(PeerNode::new("n1", "macbook.tailnet.ts.net")),
+        &["macbook.tailnet.ts.net"],
+        tailnet,
+    );
+    let tailnet_address = harness.wait_for_tailnet();
+    let state = DaemonClient::at(format!("http://{tailnet_address}"))
+        .state()
+        .unwrap();
+    assert_eq!(state.tailscale_name.as_deref(), Some("pc.tail1234.ts.net"));
+
+    // Power is decided the same way: an allowlisted node may ask for it, and
+    // may cancel it.
+    let tailnet_client = DaemonClient::at(format!("http://{tailnet_address}"));
+    let result = tailnet_client.power(PowerActionKind::Sleep, 15).unwrap();
+    assert_eq!(result.action, PowerActionKind::Sleep);
+    assert!(tailnet_client.cancel().unwrap().cancelled);
+}
+
+#[test]
+fn lan_keeps_serving_while_tailscale_is_down_and_the_tailnet_listener_comes_up_later() {
+    let tailnet = FakeTailnet::default();
+    let temp = barge::testing::TempDir::new("barged-late-tailnet").unwrap();
+    let config = Config::parse(
+        format!(
+            r#"{{"listen":"127.0.0.1:0","mode":"lan","name":"Linux PC","state_dir":{},"tailscale":{{"listen":"auto","allowed_nodes":["macbook.tailnet.ts.net"]}}}}"#,
+            serde_json::to_string(temp.path()).unwrap()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let harness = Harness::start(
+        temp,
+        config,
+        Some(PeerNode::new("n1", "macbook.tailnet.ts.net")),
+        false,
+        Some(tailnet.clone()),
+    );
+
+    // tailscaled has no address yet: the tailnet side is not up, and the LAN
+    // half answers all the same.
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(harness.daemon.tailnet_address(), None);
+    assert!(harness.client.pending_pairs().unwrap().requests.is_empty());
+
+    // Tailscale comes up with an IPv4 address; the listener follows.
+    tailnet.up(TailnetSelf {
+        dns_name: Some("pc.tail1234.ts.net".to_string()),
+        ipv4: Some(Ipv4Addr::LOCALHOST),
+    });
+    let tailnet_address = harness.wait_for_tailnet();
+    assert_eq!(tailnet_address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let state = DaemonClient::at(format!("http://{tailnet_address}"))
+        .state()
+        .unwrap();
+    assert_eq!(state.tailscale_name.as_deref(), Some("pc.tail1234.ts.net"));
 }

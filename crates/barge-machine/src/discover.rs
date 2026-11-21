@@ -162,8 +162,9 @@ pub struct Backfilled {
     pub id_mismatch: Option<String>,
 }
 
-/// Record what a registered machine reported on `GET /v1/state` where the
-/// record lacks it: its machine ID, its MAC and its broadcast address.
+/// Record what a registered machine reported on `GET /v1/state`: its machine
+/// ID, MAC and broadcast address where the record lacks them, and its tailnet
+/// name whenever it reports a different one.
 ///
 /// An ID already on the record is never overwritten. A broadcast address is
 /// missing while the record still holds the default.
@@ -216,6 +217,16 @@ fn fill(record: &Machine, state: &State) -> Result<Machine> {
     if next.broadcast() == DEFAULT_BROADCAST {
         if let Some(broadcast) = state.broadcast.filter(|b| *b != DEFAULT_BROADCAST) {
             next = next.with_broadcast(broadcast);
+        }
+    }
+    if let Some(name) = state
+        .tailscale_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if next.tailscale_name() != Some(name) {
+            next = next.with_tailscale_name(Some(name.to_string()));
         }
     }
     Ok(next)
@@ -908,6 +919,40 @@ mod tests {
             .with_machine_id(machine_id)
             .with_mac(mac.map(str::to_string))
             .with_broadcast(broadcast)
+    }
+
+    #[test]
+    fn backfill_stores_the_tailnet_name_a_daemon_reports_and_a_changed_one_replaces_it() {
+        let temp = barge::testing::TempDir::new("backfill-tailnet").unwrap();
+        let registry = Registry::open(temp.path()).unwrap();
+        let record = Machine::discovered("mid-1", "linux-pc", "linux-pc.local", 9777).unwrap();
+        registry.add(record).unwrap();
+        let reported =
+            state("mid-1", None, None).with_tailscale(Some("pc.tail1234.ts.net".to_string()), None);
+        let first = backfill(&registry, "linux-pc", &reported).unwrap();
+        assert_eq!(first.machine.tailscale_name(), Some("pc.tail1234.ts.net"));
+
+        // A node renamed on the tailnet is followed, because the ID still matches.
+        let renamed = state("mid-1", None, None)
+            .with_tailscale(Some("pc-2.tail1234.ts.net".to_string()), None);
+        let second = backfill(&registry, "linux-pc", &renamed).unwrap();
+        assert_eq!(
+            second.machine.tailscale_name(),
+            Some("pc-2.tail1234.ts.net")
+        );
+        assert_eq!(
+            registry.get("linux-pc").unwrap().tailscale_name(),
+            Some("pc-2.tail1234.ts.net")
+        );
+
+        // A daemon with a different ID is never written from.
+        let other = state("mid-9", None, None)
+            .with_tailscale(Some("nas.tail1234.ts.net".to_string()), None);
+        backfill(&registry, "linux-pc", &other).unwrap();
+        assert_eq!(
+            registry.get("linux-pc").unwrap().tailscale_name(),
+            Some("pc-2.tail1234.ts.net")
+        );
     }
 
     #[test]

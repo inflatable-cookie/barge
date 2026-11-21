@@ -14,9 +14,15 @@ binary plus user unit files is enough and survives image updates.
 LAN mode works without Tailscale. Its trust model is the LAN half of
 [machines](knowledge/machines.md#protocol-and-trust): requests authenticate but
 traffic is not hidden, and both clocks must agree. Tailscale encrypts traffic and is
-recommended across networks. For Tailscale mode, sign both machines into the
-same tailnet and find the PC address with `tailscale ip -4` and the Mac's
-stable node ID or MagicDNS name with `tailscale status --json`.
+recommended across networks.
+
+The recommended setup is both: the LAN address for the house, and the tailnet
+for everywhere else. The combined config in step 3 does both at once, so the
+Deck stays on the LAN and the Mac reaches the PC from anywhere. For the tailnet,
+sign both machines into the same tailnet. Find the PC's tailnet address with
+`tailscale ip -4`, and the Mac's stable node ID or MagicDNS name with
+`tailscale status --json` if you want it in `allowed_nodes`. A paired client
+needs no allowlist entry.
 
 ## 2. Build and install the binary
 
@@ -80,7 +86,30 @@ To inspect or revoke paired clients locally on the PC:
 ~/.local/bin/barged clients remove <client-id> --config ~/.config/barged/config.json
 ```
 
-For Tailscale instead, use this config (omitting `mode` also works):
+For both networks, add a `tailscale` block to the LAN config. This is the
+recommended shape:
+
+```json
+{
+  "listen": "192.0.2.20:9777",
+  "mode": "lan",
+  "name": "Linux PC",
+  "tailscale": {
+    "listen": "auto"
+  }
+}
+```
+
+`"auto"` asks tailscaled for this node's tailnet IPv4 address and listens on
+the LAN port beside the LAN address. Paired clients reach the PC on either
+network with the same credentials, and need no entry in the allowlist. Add
+`"allowed_nodes": ["laptop.example.ts.net"]` inside the `tailscale` block for
+tailnet nodes that may call without pairing; the list may be left out. Pairing
+stays a LAN act, so the tailnet listener refuses it. `"listen"` may also be a
+fixed tailnet address, such as `"100.101.102.103:9777"`, on the same port as
+`listen`: a paired client dials one port on both networks.
+
+For the tailnet only, use this config instead (omitting `mode` also works):
 
 ```json
 {
@@ -92,10 +121,12 @@ For Tailscale instead, use this config (omitting `mode` also works):
 ```
 
 The allowlist matches stable node ID or MagicDNS name, case-insensitively.
-The socket field is optional. A system tailscaled socket is root-only; grant
-this account access with `sudo tailscale set --operator="$USER"`. A user-run
-socket can be configured instead. Wildcard addresses are refused unless
-`"allow_wildcard": true` is set; doing so logs a warning.
+The socket field is optional; inside a `tailscale` block, `"socket"` plays the
+same part. A system tailscaled socket is root-only; grant this account access
+with `sudo tailscale set --operator="$USER"`. A user-run socket can be
+configured instead. Wildcard addresses are refused unless
+`"allow_wildcard": true` is set; doing so logs a warning. Every existing config
+keeps working unchanged.
 
 ## 4. Install the systemd user unit
 
@@ -118,9 +149,11 @@ desktop, so let the user's services run without a session:
 sudo loginctl enable-linger "$USER"
 ```
 
-The user unit cannot order itself after the system `tailscaled.service`. If
-the address is not ready at startup, `Restart=on-failure` retries the daemon.
-Logs: `journalctl --user -u barged -f`.
+The user unit cannot order itself after the system `tailscaled.service`. In
+the combined shape that does not matter: the LAN side starts whether or not
+Tailscale is up, and the tailnet side waits for tailscaled, retrying with a
+backoff, and binds once it has an address. The log says once when the tailnet
+side comes up. Logs: `journalctl --user -u barged -f`.
 
 ## 5. Grant exactly the three power actions
 
@@ -155,7 +188,7 @@ Or register manually (and for Tailscale mode):
 ```sh
 barge machine add --name pc --hostname pc.local \
   --mac 00:11:22:33:44:ff # add --tailscale-name pc.example.ts.net for Tailscale
-barge machine status pc
+barge machine status pc           # reports `lan` at home, `tailscale` away from it
 barge machine sleep pc            # 15 s countdown; `barge machine cancel pc` stops it
 barge machine restart pc          # asks first; `--yes` skips the question
 barge machine shutdown pc --yes
@@ -166,7 +199,8 @@ it must match `listen` in the PC's config.
 
 ## Verification and troubleshooting
 
-For Tailscale, from the Mac on the tailnet:
+For the tailnet, from a node on the allowlist (a paired client signs its
+requests, so `curl` works only from an allowlisted node):
 
 ```sh
 curl http://pc.example.ts.net:9777/v1/state
@@ -175,9 +209,11 @@ curl http://pc.example.ts.net:9777/v1/state
 - **`curl` cannot connect.** Check `systemctl --user status barged` and that
   `listen` is the PC's current Tailscale address. `barged` binds one address,
   and Tailscale addresses can change when a node is re-added to the tailnet.
-- **`403 not_authorized`.** The caller's node is not on `allowed_nodes`, or the
-  daemon could not ask tailscaled who it is. `journalctl --user -u barged` names
-  which. Re-check `tailscale status --json` and `tailscale set --operator`.
+- **`403 not_authorized`.** The caller's node is not on the tailnet allowlist
+  (`allowed_nodes`, in the `tailscale` block when there is one), and the request
+  carries no paired client's signature. The daemon could also not ask tailscaled
+  who the caller is. `journalctl --user -u barged` names which. Re-check
+  `tailscale status --json` and `tailscale set --operator`.
 - **`sleep` accepted but nothing happens.** polkit denied the logind call; the
   journal shows `logind refused Suspend`. Check the rule's account name and
   whether a second active session needs the `-multiple-sessions` variant, or an

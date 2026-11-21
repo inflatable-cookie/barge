@@ -140,10 +140,10 @@ or from standard input (`-`). Input that cannot be read is `usage`.
 | `move-layout` | `class: string`, `before: placement`, `after: placement` |
 | `move-area` | `before: area-record`, `after: area-record` |
 | `area-record` | `schema: string`, `namespace: string`, `name: string`, `volume: string`, `folder?: string`, `absent: absent`, `soft_cap_bytes?: int`, `counts_toward_reserve: bool` |
-| `machine` | `id?: string`, `name: string`, `hostname: string`, `tailscale_name: string?`, `mac: string?`, `broadcast: string`, `port: int`, `daemon_port: int` |
+| `machine` | `id?: string`, `name: string`, `hostname: string`, `tailscale_name: string?`, `mac: string?`, `broadcast: string`, `port: int`, `daemon_port: int`, `last_path?: string` |
 | `discovered-machine` | `id: string`, `name: string`, `mode: string`, `protocol_version: string`, `address: string`, `port: int`, `registered_as: string?` |
 | `paired-client` | `id: string`, `name: string`, `paired_at_unix_ms: int` |
-| `machine-state` | `schema: string`, `power: string`, `observed_at_unix_ms: int`, `pending?: pending`, `machine_id: string`, `mac?: string`, `broadcast?: string` |
+| `machine-state` | `schema: string`, `power: string`, `observed_at_unix_ms: int`, `pending?: pending`, `machine_id: string`, `mac?: string`, `broadcast?: string`, `tailscale_name?: string`, `tailscale_ip?: string` |
 | `pending` | `action: string`, `deadline_unix_ms: int` |
 | `worktree-lease` | `schema: string`, `lease_id: string`, `request: string`, `repo: string`, `base: string`, `base_name?: string`, `branch: string`, `label?: string`, `pool: string`, `root_id: string`, `path: string`, `head: string`, `state: string`, `disposable: bool`, `created_unix_ms: int`, `updated_unix_ms: int` |
 | `worktree-pool` | `repo: string`, `pool: string`, `warm: int`, `max: int`, `location?: string`, `unavailable?: string`, `roots: [worktree-root]` |

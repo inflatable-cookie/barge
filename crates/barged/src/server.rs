@@ -10,7 +10,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use barge_machine::{
@@ -19,11 +19,13 @@ use barge_machine::{
     CANCEL_SCHEMA, PAIR_DECISION_SCHEMA, PAIR_REQUEST_SCHEMA, POWER_REQUEST_SCHEMA,
 };
 
+use crate::config::{Serving, TailnetListen};
 use crate::mdns::{MdnsAdvertiser, MdnsRegistration, ServiceAdvertisement};
 use crate::net::{NetworkLookup, SystemNetworkLookup};
 use crate::notify::{PairAction, PairNotification, PairingNotifier};
 use crate::pairing::{PairDecisionError, PairStartError, PairingStore};
 use crate::state::{DaemonState, LEGACY_CLIENT_ID};
+use crate::tailnet::{TailnetSelf, TailnetSide, TailnetStatus, TailscaleStatus, Timing};
 use crate::{Allowlist, Clock, Config, Error, PeerLookup, PeerNode, PowerController, RequestError};
 
 /// The largest request body the daemon reads; the documents are a few lines.
@@ -32,6 +34,15 @@ const MAX_BODY: u64 = 16 * 1024;
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HEADERS: usize = 16 * 1024;
+
+/// Which listener a request came in on. Pairing and client management are a
+/// LAN act, so they are served only on the LAN surface; the tailnet surface
+/// authenticates by a paired client's signature or by the allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    Lan,
+    Tailnet,
+}
 
 /// One daemon: state, power, mDNS advertisement, pairing and client auth.
 pub struct Daemon {
@@ -46,7 +57,11 @@ pub struct Daemon {
     network: Arc<dyn NetworkLookup>,
     notifier: Arc<dyn PairingNotifier>,
     advertiser: Arc<dyn MdnsAdvertiser>,
-    lan: bool,
+    serving: Serving,
+    /// The tailnet listener's address, when the config names one for the
+    /// combined shape; the side is built from it.
+    tailnet_listen: Option<TailnetListen>,
+    tailnet: Option<Mutex<TailnetSide>>,
     nonces: Mutex<HashMap<String, u64>>,
 }
 
@@ -56,6 +71,7 @@ impl fmt::Debug for Daemon {
             .field("listen", &self.listen)
             .field("machine_id", &self.state.machine_id())
             .field("allowlist", &self.allowlist)
+            .field("serving", &self.serving)
             .field("pending", &self.controller.pending())
             .finish_non_exhaustive()
     }
@@ -77,7 +93,8 @@ impl Daemon {
             config.key_path().as_deref(),
             clock.now_unix_ms(),
         )?;
-        Ok(Self {
+        let tailnet_listen = config.tailscale.as_ref().map(|block| block.listen);
+        let mut daemon = Self {
             listen: config.listen,
             display_name: config.display_name(),
             controller,
@@ -89,9 +106,58 @@ impl Daemon {
             network: Arc::new(SystemNetworkLookup),
             notifier: default_notifier(),
             advertiser: default_advertiser(),
-            lan: config.mode == crate::AuthMode::Lan,
+            serving: config.serving(),
+            tailnet_listen,
+            tailnet: None,
             nonces: Mutex::new(HashMap::new()),
-        })
+        };
+        daemon.tailnet = tailnet_listen.map(|listen| {
+            Mutex::new(TailnetSide::new(
+                listen,
+                config.listen.port(),
+                Box::new(TailscaleStatus::new(config.tailnet_socket())),
+                Timing::default(),
+            ))
+        });
+        Ok(daemon)
+    }
+
+    /// Replace how the tailnet side asks tailscaled about this node, and how it
+    /// paces its checks. Tests use this; a daemon in production keeps tailscaled.
+    pub fn with_tailnet(mut self, status: Box<dyn TailnetStatus>, timing: Timing) -> Self {
+        if let Some(listen) = self.tailnet_listen {
+            let lan_port = self.listen.port();
+            self.tailnet = Some(Mutex::new(TailnetSide::new(
+                listen, lan_port, status, timing,
+            )));
+        }
+        self
+    }
+
+    /// The tailnet listener's bound address, once it is up.
+    pub fn tailnet_address(&self) -> Option<SocketAddr> {
+        self.tailnet.as_ref().and_then(|side| lock(side).bound())
+    }
+
+    /// What tailscaled last reported for this node, when the tailnet side is up.
+    fn tailnet_identity(&self) -> Option<TailnetSelf> {
+        self.tailnet
+            .as_ref()
+            .and_then(|side| lock(side).identity().cloned())
+    }
+
+    /// Whether this daemon has a LAN half: pairing, mDNS and HMAC clients.
+    fn has_lan(&self) -> bool {
+        matches!(self.serving, Serving::Lan | Serving::Both)
+    }
+
+    /// The surface the primary listener serves: the tailnet address in the
+    /// tailnet-only shape, the LAN address otherwise.
+    fn primary_surface(&self) -> Surface {
+        match self.serving {
+            Serving::Tailnet => Surface::Tailnet,
+            Serving::Lan | Serving::Both => Surface::Lan,
+        }
     }
 
     pub fn with_network(mut self, network: Arc<dyn NetworkLookup>) -> Self {
@@ -130,11 +196,13 @@ impl Daemon {
 
     /// Bind the configured address and, when serving a specific LAN address,
     /// also bind loopback on the same port so local callers (Decky plugin,
-    /// `barged pair --approve`) can reach `127.0.0.1:<port>`.
+    /// `barged pair --approve`) can reach `127.0.0.1:<port>`. The tailnet
+    /// listener is not bound here: it comes up from the serving loop, so a
+    /// tailscaled that is not running yet does not stop the LAN half.
     pub fn bind_all(&self) -> crate::Result<Vec<TcpListener>> {
         let primary = self.bind()?;
         let mut listeners = Vec::new();
-        if self.lan && !self.listen.ip().is_loopback() && !self.listen.ip().is_unspecified() {
+        if self.has_lan() && !self.listen.ip().is_loopback() && !self.listen.ip().is_unspecified() {
             if let Ok(local_addr) = primary.local_addr() {
                 let loopback = match local_addr.ip() {
                     IpAddr::V4(_) => {
@@ -163,26 +231,37 @@ impl Daemon {
         self.serve_all(vec![listener], running)
     }
 
-    /// Serve all listeners until `running` clears, advertising via mDNS in LAN mode.
+    /// Serve all listeners until `running` clears, and the tailnet listener
+    /// when the config names one. The first listener is the primary address;
+    /// the rest (loopback, for local approval UIs) are LAN. Advertises via
+    /// mDNS when there is a LAN half.
     pub fn serve_all(
         &self,
         listeners: Vec<TcpListener>,
         running: &AtomicBool,
     ) -> crate::Result<()> {
+        self.check_tailnet(Instant::now());
         let _mdns = self.start_mdns(listeners.first());
+        let primary = self.primary_surface();
         while running.load(Ordering::SeqCst) {
             let mut accepted_any = false;
-            for listener in &listeners {
+            self.check_tailnet(Instant::now());
+            for (index, listener) in listeners.iter().enumerate() {
+                let surface = if index == 0 { primary } else { Surface::Lan };
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         accepted_any = true;
-                        self.handle(stream, peer);
+                        self.handle(stream, peer, surface);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(error) => {
                         return Err(Error::new(format!("cannot accept a request: {error}")))
                     }
                 }
+            }
+            if let Some((stream, peer)) = self.accept_tailnet()? {
+                accepted_any = true;
+                self.handle(stream, peer, Surface::Tailnet);
             }
             if !accepted_any {
                 std::thread::sleep(ACCEPT_POLL);
@@ -191,8 +270,34 @@ impl Daemon {
         Ok(())
     }
 
+    /// Let the tailnet side bind, rebind or retry if its time has come.
+    fn check_tailnet(&self, now: Instant) {
+        if let Some(side) = &self.tailnet {
+            lock(side).check(now);
+        }
+    }
+
+    /// The next tailnet connection, if one is waiting. The side's lock is
+    /// released before the request runs: answering it reads the same side.
+    fn accept_tailnet(&self) -> crate::Result<Option<(TcpStream, SocketAddr)>> {
+        let Some(side) = &self.tailnet else {
+            return Ok(None);
+        };
+        let side = lock(side);
+        let Some(listener) = side.listener() else {
+            return Ok(None);
+        };
+        match listener.accept() {
+            Ok(pair) => Ok(Some(pair)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(Error::new(format!(
+                "cannot accept a tailnet request: {error}"
+            ))),
+        }
+    }
+
     fn start_mdns(&self, primary: Option<&TcpListener>) -> Option<Box<dyn MdnsRegistration>> {
-        if !self.lan {
+        if !self.has_lan() {
             return None;
         }
         let port = primary
@@ -200,18 +305,22 @@ impl Daemon {
             .map(|a| a.port())
             .unwrap_or_else(|| self.listen.port());
         let info = self.network.interface_for(self.listen.ip());
+        let mut txt = vec![
+            ("id".to_string(), self.state.machine_id().to_string()),
+            ("name".to_string(), self.display_name.clone()),
+            ("mode".to_string(), "lan".to_string()),
+            ("version".to_string(), "1".to_string()),
+        ];
+        if let Some(name) = self.tailnet_identity().and_then(|node| node.dns_name) {
+            txt.push(("tailscale".to_string(), name));
+        }
         let service = ServiceAdvertisement {
             service_type: "_barged._tcp".to_string(),
             instance_name: self.display_name.clone(),
             port,
             address: self.listen.ip(),
             interface_index: info.interface_index,
-            txt: vec![
-                ("id".to_string(), self.state.machine_id().to_string()),
-                ("name".to_string(), self.display_name.clone()),
-                ("mode".to_string(), "lan".to_string()),
-                ("version".to_string(), "1".to_string()),
-            ],
+            txt,
         };
         match self.advertiser.advertise(&service) {
             Ok(registration) => Some(registration),
@@ -222,14 +331,14 @@ impl Daemon {
         }
     }
 
-    fn handle(&self, mut stream: TcpStream, peer: SocketAddr) {
+    fn handle(&self, mut stream: TcpStream, peer: SocketAddr, surface: Surface) {
         let result = stream
             .set_nonblocking(false)
             .and_then(|()| stream.set_read_timeout(Some(READ_TIMEOUT)))
             .and_then(|()| stream.set_write_timeout(Some(READ_TIMEOUT)))
             .map_err(|e| (400, failure("bad_request", e.to_string())))
             .and_then(|()| read_request(&mut stream))
-            .and_then(|request| self.route(&request, Some(peer)));
+            .and_then(|request| self.route(&request, Some(peer), surface));
         let (status, body) = result.unwrap_or_else(|refusal| refusal);
         let response = format!("HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", reason(status), body.len());
         if let Err(error) = stream.write_all(response.as_bytes()) {
@@ -237,14 +346,14 @@ impl Daemon {
         }
     }
 
-    fn route(&self, request: &Request, peer: Option<SocketAddr>) -> Answer {
+    fn route(&self, request: &Request, peer: Option<SocketAddr>, surface: Surface) -> Answer {
         let body = &request.body;
         let url = request.url.to_string();
         let path = url.split(['?', '#']).next().unwrap_or("").to_string();
         let method = request.method.as_str();
 
         if path == "/v1/pair" {
-            self.require_lan()?;
+            require_lan_surface(surface)?;
             return match method {
                 "POST" => self.pair_start(body),
                 _ => Err(method_not_allowed(path, method)),
@@ -252,7 +361,7 @@ impl Daemon {
         }
 
         if path == "/v1/pair/pending" {
-            self.require_lan()?;
+            require_lan_surface(surface)?;
             self.authorize_lan_or_localhost(request, peer)?;
             return match method {
                 "GET" => self.pair_pending(),
@@ -261,7 +370,7 @@ impl Daemon {
         }
 
         if let Some(rest) = path.strip_prefix("/v1/pair/") {
-            self.require_lan()?;
+            require_lan_surface(surface)?;
             if let Some(id) = rest.strip_suffix("/approve") {
                 if !valid_segment(id) {
                     return Err((
@@ -296,10 +405,10 @@ impl Daemon {
             }
         }
 
-        let caller = self.authorize_caller(request, peer)?;
+        let caller = self.authorize_caller(request, peer, surface)?;
 
         if path == "/v1/clients" {
-            self.require_lan()?;
+            require_lan_surface(surface)?;
             return match method {
                 "GET" => self.list_clients(),
                 _ => Err(method_not_allowed(path, method)),
@@ -308,7 +417,7 @@ impl Daemon {
 
         if let Some(client_id) = path.strip_prefix("/v1/clients/") {
             if valid_segment(client_id) {
-                self.require_lan()?;
+                require_lan_surface(surface)?;
                 return match method {
                     "DELETE" => self.revoke_client(client_id),
                     _ => Err(method_not_allowed(path, method)),
@@ -330,29 +439,22 @@ impl Daemon {
         }
     }
 
-    fn require_lan(&self) -> std::result::Result<(), Refusal> {
-        if self.lan {
-            Ok(())
-        } else {
-            Err((
-                400,
-                failure(
-                    "bad_request",
-                    "pairing and client management require LAN mode",
-                ),
-            ))
-        }
-    }
-
+    /// Who may call, by the surface the request arrived on. On the LAN a
+    /// signed request is a paired client. On the tailnet a paired client's
+    /// signature counts too (when this daemon has a LAN half to pair on), and
+    /// anything else must be on the allowlist, as it always was.
     fn authorize_caller(
         &self,
         request: &Request,
         peer: Option<SocketAddr>,
+        surface: Surface,
     ) -> std::result::Result<PeerNode, Refusal> {
-        if self.lan {
-            self.authorize_lan(request, request.body.as_bytes())
-        } else {
-            self.authorize(peer)
+        match surface {
+            Surface::Lan => self.authorize_lan(request, request.body.as_bytes()),
+            Surface::Tailnet if self.has_lan() => self
+                .authorize_lan(request, request.body.as_bytes())
+                .or_else(|_| self.authorize(peer)),
+            Surface::Tailnet => self.authorize(peer),
         }
     }
 
@@ -450,11 +552,16 @@ impl Daemon {
 
     fn state_answer(&self) -> Answer {
         let info = self.network.interface_for(self.listen.ip());
+        let tailnet = self.tailnet_identity();
         let state = State::new(PowerState::Awake, self.clock.now_unix_ms())
             .with_pending(self.controller.pending())
             .with_machine_id(self.state.machine_id().to_string())
             .with_mac(info.mac)
-            .with_broadcast(info.broadcast);
+            .with_broadcast(info.broadcast)
+            .with_tailscale(
+                tailnet.as_ref().and_then(|node| node.dns_name.clone()),
+                tailnet.and_then(|node| node.ipv4),
+            );
         Ok((200, encode(&state)?))
     }
 
@@ -631,6 +738,27 @@ impl Daemon {
             )
         })
     }
+}
+
+/// Pairing and client management are a LAN act: physical presence at the LAN
+/// address is what counts. The tailnet listener refuses them outright.
+fn require_lan_surface(surface: Surface) -> std::result::Result<(), Refusal> {
+    match surface {
+        Surface::Lan => Ok(()),
+        Surface::Tailnet => Err((
+            400,
+            failure(
+                "bad_request",
+                "pairing and client management are served only on the LAN address",
+            ),
+        )),
+    }
+}
+
+/// Lock a side the daemon owns. A panic elsewhere cannot leave the side in a
+/// state this code cannot use, so a poisoned lock is read through.
+fn lock<T>(side: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    side.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn decision_refusal(error: PairDecisionError) -> Refusal {
@@ -928,9 +1056,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (stream, peer) = listener.accept().unwrap();
             accepted.send(()).unwrap();
-            daemon.handle(stream, peer);
+            daemon.handle(stream, peer, Surface::Tailnet);
             let (stream, peer) = listener.accept().unwrap();
-            daemon.handle(stream, peer);
+            daemon.handle(stream, peer, Surface::Tailnet);
         });
         let mut slow = TcpStream::connect(address).unwrap();
         slow.write_all(b"POST /v1/power HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
@@ -1037,9 +1165,11 @@ mod tests {
                 headers: Vec::new(),
                 body: String::new(),
             };
-            let refused = daemon.route(&req, Some(non_localhost)).unwrap_err();
+            let refused = daemon
+                .route(&req, Some(non_localhost), Surface::Lan)
+                .unwrap_err();
             assert_eq!(refused.0, 401, "{method} {url}");
-            let no_peer = daemon.route(&req, None).unwrap_err();
+            let no_peer = daemon.route(&req, None, Surface::Lan).unwrap_err();
             assert_eq!(no_peer.0, 401, "{method} {url} with None peer");
         }
 
@@ -1050,7 +1180,13 @@ mod tests {
             headers: Vec::new(),
             body: String::new(),
         };
-        assert_eq!(daemon.route(&pending_req, Some(localhost)).unwrap().0, 200);
+        assert_eq!(
+            daemon
+                .route(&pending_req, Some(localhost), Surface::Lan)
+                .unwrap()
+                .0,
+            200
+        );
 
         let approve_req = Request {
             method: "POST".to_string(),
@@ -1059,7 +1195,10 @@ mod tests {
             body: String::new(),
         };
         assert_eq!(
-            daemon.route(&approve_req, Some(localhost)).unwrap_err().0,
+            daemon
+                .route(&approve_req, Some(localhost), Surface::Lan)
+                .unwrap_err()
+                .0,
             404
         );
 
@@ -1071,7 +1210,10 @@ mod tests {
             body: String::new(),
         };
         assert_eq!(
-            daemon.route(&state_req, Some(localhost)).unwrap_err().0,
+            daemon
+                .route(&state_req, Some(localhost), Surface::Lan)
+                .unwrap_err()
+                .0,
             401
         );
     }

@@ -30,6 +30,12 @@ pub struct State {
     /// The broadcast address of the interface `barged` binds, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broadcast: Option<Ipv4Addr>,
+    /// The node's MagicDNS name on the tailnet, when `barged` serves there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailscale_name: Option<String>,
+    /// The node's tailnet IPv4 address, when `barged` serves there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailscale_ip: Option<Ipv4Addr>,
 }
 
 impl State {
@@ -43,7 +49,16 @@ impl State {
             machine_id: String::new(),
             mac: None,
             broadcast: None,
+            tailscale_name: None,
+            tailscale_ip: None,
         }
+    }
+
+    /// Record the node's tailnet identity, when `barged` serves on the tailnet.
+    pub fn with_tailscale(mut self, name: Option<String>, ip: Option<Ipv4Addr>) -> Self {
+        self.tailscale_name = name;
+        self.tailscale_ip = ip;
+        self
     }
 
     /// Record the action counting down, if any.
