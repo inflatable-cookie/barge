@@ -65,7 +65,7 @@ pub use space::{
 pub use volume::{
     Availability, Durability, Volume, VolumeRegistration, VolumeSpec, VolumeState, VolumeStatus,
 };
-pub use workflow::{BlockState, InitAction, InitCheck, InitReport, WorkflowBlock};
+pub use workflow::{BlockState, ExcludeState, InitAction, InitCheck, InitReport, WorkflowBlock};
 
 /// Small helpers for tests: a private temporary directory that removes itself.
 ///

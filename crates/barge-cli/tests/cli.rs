@@ -812,7 +812,7 @@ fn machine_pair_writes_owner_only_credentials_and_unpair_removes_them() {
 }
 
 #[test]
-fn init_checks_and_doctor_report_the_workflow_block() {
+fn init_checks_and_doctor_report_the_local_scratch_file() {
     let fixture = Fixture::new();
     assert!(register(&fixture).status.success());
     let set = fixture.json(&[
@@ -822,13 +822,24 @@ fn init_checks_and_doctor_report_the_workflow_block() {
     std::fs::create_dir_all(fixture.mount.join("scratch")).unwrap();
     let repo = fixture.temp.folder("repo").unwrap();
     let repo_text = repo.to_str().unwrap();
-    let agents = repo.join("AGENTS.md");
+    let local = repo.join("AGENTS.local.md");
     let canonical_repo = std::fs::canonicalize(&repo).unwrap();
 
-    let written = fixture.run(&["init", "--path", repo_text]);
+    // A folder without `.git` is written, and the report says it is not excluded.
+    let written = fixture.json(&["init", "--path", repo_text]);
     assert_eq!(written.status.code(), Some(0), "{}", stderr(&written));
-    let text = std::fs::read_to_string(&agents).unwrap();
-    assert!(text.starts_with("<!-- barge:workflow:start -->"), "{text}");
+    let document = parse_document(&written);
+    assert_eq!(document["schema"], "barge.init/1");
+    assert_eq!(document["data"]["action"], "inserted");
+    assert_eq!(document["data"]["path"], local.to_str().unwrap());
+    assert_eq!(document["data"]["exclude"], "not_a_repository");
+    assert!(document["data"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("not a Git repository")));
+    let text = std::fs::read_to_string(&local).unwrap();
+    assert!(!text.contains("<!-- barge:workflow"), "{text}");
     assert!(
         text.contains("barge scratch new --volume Builds --project repo"),
         "{text}"
@@ -837,14 +848,19 @@ fn init_checks_and_doctor_report_the_workflow_block() {
         text.contains("Never write scratch to a home folder or a drive root"),
         "{text}"
     );
+    assert!(
+        !repo.join("AGENTS.md").exists(),
+        "the committed file is untouched"
+    );
 
     let check = fixture.json(&["init", "--check", "--path", repo_text]);
     assert_eq!(check.status.code(), Some(0), "{}", stderr(&check));
     let document = parse_document(&check);
     assert_eq!(document["schema"], "barge.init-check/1");
     assert_eq!(document["data"]["block_state"], "current");
+    assert_eq!(document["data"]["exclude"], "not_a_repository");
     assert_eq!(document["data"]["project"], "repo");
-    assert_eq!(document["data"]["path"], agents.to_str().unwrap());
+    assert_eq!(document["data"]["path"], local.to_str().unwrap());
     assert_eq!(document["data"]["diff"].as_array().unwrap().len(), 0);
 
     let doctor = fixture.json(&["doctor"]);
@@ -854,13 +870,13 @@ fn init_checks_and_doctor_report_the_workflow_block() {
     assert_eq!(document["data"]["binding_reports"][0]["state"], "ok");
     assert_eq!(
         document["data"]["binding_reports"][0]["path"],
-        canonical_repo.join("AGENTS.md").to_str().unwrap()
+        canonical_repo.join("AGENTS.local.md").to_str().unwrap()
     );
 
-    // A block that no longer matches the layout is stale: --check and doctor
+    // A file that no longer matches the layout is stale: --check and doctor
     // both exit 1, and the human summary carries a diff.
     std::fs::write(
-        &agents,
+        &local,
         text.replace("## Scratch for this project", "## Old scratch"),
     )
     .unwrap();
@@ -894,11 +910,11 @@ fn init_checks_and_doctor_report_the_workflow_block() {
     assert_eq!(document["schema"], "barge.init/1");
     assert_eq!(document["data"]["action"], "replaced");
     assert_eq!(document["data"]["volume_state"]["state"], "present");
-    let repaired = std::fs::read(&agents).unwrap();
+    let repaired = std::fs::read(&local).unwrap();
     let again = fixture.json(&["init", "--path", repo_text]);
     assert!(again.status.success(), "{}", stderr(&again));
     assert_eq!(parse_document(&again)["data"]["action"], "unchanged");
-    assert_eq!(std::fs::read(&agents).unwrap(), repaired);
+    assert_eq!(std::fs::read(&local).unwrap(), repaired);
     let check = fixture.json(&["init", "--check", "--path", repo_text]);
     assert_eq!(check.status.code(), Some(0), "{}", stderr(&check));
     let doctor = fixture.json(&["doctor"]);
@@ -907,13 +923,13 @@ fn init_checks_and_doctor_report_the_workflow_block() {
     // `--check` and `doctor` are read-only: they change neither the file nor the
     // account, and a missing account stays missing.
     let bindings = std::fs::read(fixture.state.join("bindings.json")).unwrap();
-    let before = std::fs::read(&agents).unwrap();
+    let before = std::fs::read(&local).unwrap();
     assert!(fixture
         .run(&["init", "--check", "--path", repo_text])
         .status
         .success());
     assert!(fixture.run(&["doctor"]).status.success());
-    assert_eq!(std::fs::read(&agents).unwrap(), before);
+    assert_eq!(std::fs::read(&local).unwrap(), before);
     assert_eq!(
         std::fs::read(fixture.state.join("bindings.json")).unwrap(),
         bindings

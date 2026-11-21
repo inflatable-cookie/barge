@@ -11,7 +11,7 @@ use crate::bindings::{observe, BindingKind, BindingRecord, BindingTarget, Observ
 use crate::error::Result;
 use crate::layout::{Class, Layout};
 use crate::volume::{Volume, VolumeState};
-use crate::workflow::{self, Block, FileContents};
+use crate::workflow::{self, FileContents};
 use crate::Barge;
 
 /// Everything doctor found, and whether it is all ok.
@@ -87,8 +87,8 @@ pub struct BindingReport {
     pub consumer: String,
     pub class: Class,
     pub kind: BindingKind,
-    /// The file the binding owns: the link Barge made, or the `AGENTS.md` that
-    /// carries a workflow block.
+    /// The file the binding owns: the link Barge made, or the scratch file in the
+    /// repository.
     pub path: PathBuf,
     #[serde(flatten)]
     pub state: BindingState,
@@ -314,12 +314,13 @@ fn destination_replaced(record: &BindingRecord) -> bool {
     }
 }
 
-/// What a recorded workflow block is now. Unlike a link, it renders while the
-/// volume is away: the block names a location, not a mounted path.
+/// What a recorded scratch file is now. Unlike a link, it renders while the
+/// volume is away: the file names a location, not a mounted path.
 fn workflow_state(layout: &Layout, volume: &Facts, record: &BindingRecord) -> Result<BindingState> {
     let BindingTarget::Workflow {
         repository,
         project,
+        file,
     } = &record.target
     else {
         return Ok(BindingState::Drifted {
@@ -328,6 +329,16 @@ fn workflow_state(layout: &Layout, volume: &Facts, record: &BindingRecord) -> Re
             reason: "the record is not a workflow target".to_string(),
         });
     };
+    // A record that names the committed file predates `barge init` writing the
+    // local one. Doctor only says so; rerunning init replaces the record.
+    if file == workflow::COMMITTED_FILE {
+        return Ok(BindingState::Stale {
+            reason: format!(
+                "the binding records {}, which barge init no longer writes; rerun barge init",
+                workflow::COMMITTED_FILE
+            ),
+        });
+    }
     let rendered = match workflow::render(layout, &volume.base, project) {
         Ok(rendered) => rendered,
         Err(error) => {
@@ -336,26 +347,15 @@ fn workflow_state(layout: &Layout, volume: &Facts, record: &BindingRecord) -> Re
             })
         }
     };
-    let file = repository.join(workflow::AGENTS_FILE);
-    let state = match workflow::read_file(&file)? {
+    let path = repository.join(file);
+    let state = match workflow::read_file(&path)? {
         FileContents::Missing => BindingState::Missing,
         FileContents::NotText => BindingState::Stale {
-            reason: format!("{} is not valid UTF-8", workflow::AGENTS_FILE),
+            reason: format!("{file} is not valid UTF-8"),
         },
-        FileContents::Text(content) => match workflow::locate(&content) {
-            Block::Absent => BindingState::Missing,
-            Block::Broken(reason) => BindingState::Stale {
-                reason: format!("the workflow markers are broken: {reason}"),
-            },
-            Block::Present { start, end } => {
-                if content[start..end] == rendered.interior {
-                    BindingState::Ok
-                } else {
-                    BindingState::Stale {
-                        reason: "the workflow block is stale".to_string(),
-                    }
-                }
-            }
+        FileContents::Text(content) if content == rendered.content => BindingState::Ok,
+        FileContents::Text(_) => BindingState::Stale {
+            reason: format!("the scratch file {file} is stale"),
         },
     };
     Ok(state)

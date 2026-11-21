@@ -6,7 +6,7 @@
 //! never prompt, and the repository overrides a parent process may carry are
 //! dropped, so a hook's `GIT_DIR` cannot point a pool at another repository.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Error, Result};
@@ -176,6 +176,19 @@ pub(crate) fn detach(tree: &Path, target: &str) -> Result<()> {
 pub(crate) fn delete_branch(clone: &Path, branch: &str) -> Result<()> {
     run(Some(clone), &["branch", "--quiet", "-D", branch])?;
     Ok(())
+}
+
+/// The Git directory that holds shared state such as `info/exclude`. In a linked
+/// worktree that is the main repository's directory, not the worktree's own
+/// `.git` file. Git may print it relative to the repository, so it is joined.
+pub(crate) fn common_dir(repository: &Path) -> Result<PathBuf> {
+    let text = run(Some(repository), &["rev-parse", "--git-common-dir"])?;
+    let path = PathBuf::from(text.trim_end_matches(['\n', '\r']));
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        repository.join(path)
+    })
 }
 
 /// The commit a worktree's HEAD names.
