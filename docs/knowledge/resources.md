@@ -120,7 +120,7 @@ because most tools can't be changed to ask Barge.
 Bindings are per machine, stored in account state (`bindings.json`,
 `barge.bindings/1`). Each record holds the consumer, class, kind, target (file
 and key, link path, or repository), the value Barge applied, when it applied
-it, and what was there before, so undo restores it exactly.
+it, and what was there before, so link undo restores it exactly.
 
 The `link` kind's rules:
 
@@ -185,8 +185,8 @@ since it would not work for anyone else checking out the code):
   nothing and works on a read-only account;
 - the file names a location, not a mounted path: it renders from the layout
   while the scratch class's volume is away, and the output says the volume is
-  absent. `bind undo` refuses a workflow binding, since the file has no earlier
-  copy to restore.
+  absent. `bind undo <repository>` removes the workflow record and leaves the
+  file untouched; there is no earlier copy to restore.
 
 **Cache and kept placements** are `link` or `setting` bindings for tool-owned
 data:

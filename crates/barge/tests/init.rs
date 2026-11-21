@@ -530,7 +530,7 @@ fn the_project_defaults_to_the_repository_name_and_can_be_overridden() {
 }
 
 #[test]
-fn init_records_a_workflow_binding_for_the_local_file_that_undo_refuses() {
+fn init_records_a_workflow_binding_that_undo_can_forget() {
     let fixture = Fixture::new();
     fixture.register();
     layout(&fixture);
@@ -546,14 +546,11 @@ fn init_records_a_workflow_binding_for_the_local_file_that_undo_refuses() {
     assert_eq!(record.applied.value, fixture.base().join("scratch/repo"));
     assert_eq!(fixture.barge.bindings().list().unwrap().len(), 1);
 
-    let refused = fixture.barge.bindings().undo(&consumer).unwrap_err();
-    assert_eq!(refused.kind(), ErrorKind::Refused);
-    assert!(
-        refused.message().contains("workflow"),
-        "{}",
-        refused.message()
-    );
-    assert_eq!(fixture.barge.bindings().list().unwrap().len(), 1);
+    let file_contents = fs::read(local(&repo)).unwrap();
+    let forgotten = fixture.barge.bindings().undo(&consumer).unwrap();
+    assert_eq!(forgotten.kind, BindingKind::Workflow);
+    assert_eq!(fs::read(local(&repo)).unwrap(), file_contents);
+    assert!(fixture.barge.bindings().list().unwrap().is_empty());
 
     // The binding survives a reopen, so doctor can check it later.
     let reopened = Barge::open_with(
@@ -562,7 +559,7 @@ fn init_records_a_workflow_binding_for_the_local_file_that_undo_refuses() {
         fixture.clock.clone(),
     )
     .unwrap();
-    assert_eq!(reopened.bindings().list().unwrap().len(), 1);
+    assert!(reopened.bindings().list().unwrap().is_empty());
 }
 
 #[test]

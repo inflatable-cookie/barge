@@ -466,6 +466,29 @@ mod tests {
 
     use crate::{POWER_REQUEST_SCHEMA, STATE_SCHEMA};
 
+    fn read_http_request(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte)?;
+            request.push(byte[0]);
+        }
+        let headers = String::from_utf8_lossy(&request);
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = request.len();
+        request.resize(body_start + length, 0);
+        stream.read_exact(&mut request[body_start..])?;
+        Ok(request)
+    }
+
     /// One canned HTTP response, served to one request on loopback.
     fn stub(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -487,31 +510,7 @@ mod tests {
     }
 
     fn read_request(stream: &mut TcpStream) -> String {
-        let mut bytes = Vec::new();
-        let mut buffer = [0_u8; 1024];
-        loop {
-            let read = stream.read(&mut buffer).unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                let length = head
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if body.len() >= length {
-                    return text;
-                }
-            }
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8(read_http_request(stream).unwrap()).unwrap()
     }
 
     fn state_document() -> &'static str {

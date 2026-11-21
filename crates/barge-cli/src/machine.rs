@@ -789,6 +789,29 @@ mod tests {
         PairRole, PairStatus, PairStatusResponse, Registry,
     };
     use std::io::{self, Read, Write};
+
+    fn read_http_request(stream: &mut impl Read) -> io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte)?;
+            request.push(byte[0]);
+        }
+        let headers = String::from_utf8_lossy(&request);
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = request.len();
+        request.resize(body_start + length, 0);
+        stream.read_exact(&mut request[body_start..])?;
+        Ok(request)
+    }
     use std::net::{SocketAddr, TcpListener};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -919,9 +942,8 @@ mod tests {
             let mut derived_key = None;
             for step in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = [0_u8; 4096];
-                let n = stream.read(&mut buf).unwrap();
-                let text = String::from_utf8_lossy(&buf[..n]);
+                let request = read_http_request(&mut stream).unwrap();
+                let text = String::from_utf8_lossy(&request);
                 let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
                 let (status, reply) = if text.starts_with("POST /v1/pair ") {
                     let req: barge_machine::PairRequest = serde_json::from_str(body).unwrap();

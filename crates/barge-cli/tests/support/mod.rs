@@ -25,6 +25,29 @@ use serde_json::Value;
 /// (`BARGE_TEST_VOLUME_UUID`), so no test depends on the host's own volume.
 pub const TEST_UUID: &str = "11111111-2222-3333-4444-555555555555";
 
+fn read_http_request(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    let mut request = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte)?;
+        request.push(byte[0]);
+    }
+    let headers = String::from_utf8_lossy(&request);
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let body_start = request.len();
+    request.resize(body_start + length, 0);
+    stream.read_exact(&mut request[body_start..])?;
+    Ok(request)
+}
+
 pub struct Fixture {
     pub temp: TempDir,
     pub state: PathBuf,
@@ -141,32 +164,8 @@ pub fn stub_daemon_routes(routes: Routes) -> (u16, Arc<Mutex<Vec<String>>>) {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer).unwrap_or(0);
-                if read == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&buffer[..read]);
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                let Some((head, sent)) = text.split_once("\r\n\r\n") else {
-                    continue;
-                };
-                let length = head
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if sent.len() >= length {
-                    recorded.lock().unwrap().push(text);
-                    break;
-                }
-            }
+            let request = String::from_utf8(read_http_request(&mut stream).unwrap()).unwrap();
+            recorded.lock().unwrap().push(request);
             let request = recorded.lock().unwrap().last().cloned().unwrap_or_default();
             let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
             let (status, body) = routes

@@ -528,6 +528,29 @@ mod tests {
     use super::*;
     use barge_machine::{Pending, PowerActionKind, PowerState};
 
+    fn read_http_request(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte)?;
+            request.push(byte[0]);
+        }
+        let headers = String::from_utf8_lossy(&request);
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = request.len();
+        request.resize(body_start + length, 0);
+        stream.read_exact(&mut request[body_start..])?;
+        Ok(request)
+    }
+
     const T0: u64 = 1_000_000;
 
     fn pc() -> Machine {
@@ -786,7 +809,7 @@ mod tests {
 
     #[test]
     fn empty_and_registered_machines_use_only_the_fixture_registry() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let temp = barge::testing::TempDir::new("app-machine-poll").unwrap();
@@ -807,8 +830,7 @@ mod tests {
             .unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 2048];
-            let _ = stream.read(&mut request).unwrap();
+            let _request = read_http_request(&mut stream).unwrap();
             let body = r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"pending":{"action":"sleep","deadline_unix_ms":15042},"machine_id":"mid-1"}"#;
             write!(
                 stream,
@@ -894,7 +916,7 @@ mod tests {
 
     #[test]
     fn refresh_polls_pending_pairs_and_notifies_once_per_request() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         #[derive(Default)]
@@ -917,9 +939,8 @@ mod tests {
         let server = std::thread::spawn(move || {
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0; 2048];
-                let n = stream.read(&mut request).unwrap();
-                let text = String::from_utf8_lossy(&request[..n]);
+                let request = read_http_request(&mut stream).unwrap();
+                let text = String::from_utf8_lossy(&request);
                 let body = if text.starts_with("GET /v1/state ") {
                     r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-1"}"#
                 } else {
@@ -1004,7 +1025,7 @@ mod tests {
 
     #[test]
     fn refresh_records_the_id_and_mac_a_registered_machine_reports() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         use std::net::TcpListener;
 
         let temp = barge::testing::TempDir::new("app-refresh-backfill").unwrap();
@@ -1021,8 +1042,7 @@ mod tests {
             .unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0; 2048];
-            let _ = stream.read(&mut request).unwrap();
+            let _request = read_http_request(&mut stream).unwrap();
             let body = r#"{"schema":"barge.machine-state/2","power":"awake","observed_at_unix_ms":42,"machine_id":"mid-1","mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.0.2.255"}"#;
             write!(
                 stream,
