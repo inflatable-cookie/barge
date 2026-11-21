@@ -31,7 +31,7 @@ network connection are needed; no Rust toolchain is installed on the host.
 
 ```sh
 mkdir -p ~/.local/bin
-podman run --rm -v "$PWD:/src:ro" -v "$HOME/.local/bin:/out:Z" \
+podman run --rm -v "$PWD:/src:ro,z" -v "$HOME/.local/bin:/out:Z" \
   docker.io/library/rust:1.100.0 sh -c \
   'cp -a /src /tmp/barge && cd /tmp/barge && CARGO_TARGET_DIR=/tmp/build cargo build --release --locked -p barged && install -m 0755 /tmp/build/release/barged /out/barged'
 ```
