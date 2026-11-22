@@ -32,7 +32,9 @@ ReadWritePaths=-%h/.config/barged
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK lets getifaddrs read the bound interface's MAC and broadcast
+# address, which the state reports so clients can wake the machine.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

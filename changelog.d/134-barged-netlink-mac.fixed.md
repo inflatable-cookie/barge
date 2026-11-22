@@ -1,0 +1,1 @@
+- The packaged `barged` unit allows `AF_NETLINK`, so the daemon can read its interface's MAC and broadcast address and report them in its state. Without it, clients that learn the MAC from the state, such as the Decky plugin, had nothing to wake the PC with.
