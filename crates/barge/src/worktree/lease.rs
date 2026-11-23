@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 use super::git;
 use super::leases::{self, LeaseRequest, WorktreeLease, WorktreeLeaseState, LEASE_SCHEMA};
 use super::pools::{self, Pool};
-use super::{area_directory, ensure_clone, tree_path};
+use super::warm::{self, WarmReport};
+use super::{area_directory, ensure_clone, tree_path, ROOT_LABEL};
 use crate::area::Area;
 use crate::error::{Error, Result};
+use crate::hold::Mode;
 use crate::root::{mint_id, RootInfo};
 use crate::Barge;
 
-/// The label of roots a pool makes. The folder is `wt-<id>`.
-const ROOT_LABEL: &str = "wt";
 /// How often a waiting lease tries again.
 const POLL: Duration = Duration::from_millis(20);
 
@@ -113,7 +113,7 @@ fn take_root(
     let mut free: Vec<&RootInfo> = listing
         .roots
         .iter()
-        .filter(|root| !root.held && !reserved.contains(root.id.as_str()))
+        .filter(|root| !root.held && !root.pinned && !reserved.contains(root.id.as_str()))
         .collect();
     free.sort_by(|left, right| {
         (left.last_used_unix_ms, left.id.as_str())
@@ -127,8 +127,11 @@ fn take_root(
         }
         None => return Ok(None),
     };
+    let Some(_fence) = area.try_hold(&root_id, Mode::Exclusive)? else {
+        return Ok(None);
+    };
     let tree = tree_path(&root_path);
-    check_out(clone, &tree, &request.branch, &request.base)?;
+    let warm = check_out(pool, clone, &root_path, &request.branch, &request.base)?;
 
     let lease_id = mint_id()?;
     let now = barge.core.clock.now_unix_ms();
@@ -145,6 +148,8 @@ fn take_root(
         root_id: root_id.clone(),
         path: tree.to_string_lossy().into_owned(),
         head: request.base.clone(),
+        warm_kept: warm.kept,
+        warm_removed: warm.removed,
         state: WorktreeLeaseState::Leased,
         disposable: false,
         created_unix_ms: now,
@@ -165,21 +170,36 @@ fn take_root(
 /// Check out `branch` at `base` in the root's tree, creating the tree when the
 /// root has none. A tree that exists must be clean: it is refused untouched
 /// otherwise. A checkout that does not verify is undone.
-fn check_out(clone: &Path, tree: &Path, branch: &str, base: &str) -> Result<()> {
-    let existing = tree.exists();
-    if existing {
-        require_clean(tree)?;
-    }
-    let made = if existing {
-        git::checkout_branch(tree, branch, base)
+fn check_out(
+    pool: &Pool,
+    clone: &Path,
+    root: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<WarmReport> {
+    let tree = tree_path(root);
+    let existing = tree
+        .try_exists()
+        .map_err(|source| Error::io("cannot inspect", &tree, &source))?;
+    let (made, previous) = if existing {
+        require_clean(&tree)?;
+        let previous = warm::candidates(&tree, pool)?;
+        (git::checkout_branch(&tree, branch, base), previous)
     } else {
-        git::add_worktree(clone, tree, branch, base)
+        (
+            git::add_worktree(clone, &tree, branch, base),
+            BTreeSet::new(),
+        )
     };
-    if let Err(error) = made.and_then(|()| verify(tree, base)) {
-        abandon(clone, tree, branch, base);
-        return Err(error);
+    let checked = made.and_then(|()| {
+        let report = warm::validate(root, &tree, pool, previous)?;
+        verify(&tree, base)?;
+        Ok(report)
+    });
+    if checked.is_err() {
+        abandon(clone, &tree, branch, base);
     }
-    Ok(())
+    checked
 }
 
 fn require_clean(tree: &Path) -> Result<()> {

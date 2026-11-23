@@ -185,6 +185,9 @@ pub(crate) fn print_doctor(report: &DoctorReport) {
             describe_binding(&binding.state)
         );
     }
+    for problem in &report.worktree_clone_problems {
+        println!("worktree pool {}: {}", problem.repo, problem.reason);
+    }
     println!(
         "doctor: {}",
         if report.ok {

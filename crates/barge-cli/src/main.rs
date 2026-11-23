@@ -35,16 +35,29 @@ use crate::output::report_error;
 use crate::usage::usage_text;
 
 fn main() -> ExitCode {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let json = arguments
+    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
+    let json_flag = if arguments
         .first()
-        .is_some_and(|argument| argument == "--json");
-    let arguments = if json {
-        &arguments[1..]
+        .is_some_and(|argument| argument == "--json")
+    {
+        Some(0)
+    } else if arguments
+        .first()
+        .is_some_and(|argument| argument == "worktree")
+        && arguments.get(1).is_some_and(|argument| argument == "prune")
+        && arguments
+            .last()
+            .is_some_and(|argument| argument == "--json")
+    {
+        Some(arguments.len() - 1)
     } else {
-        &arguments[..]
+        None
     };
-    match run(arguments, json) {
+    if let Some(index) = json_flag {
+        arguments.remove(index);
+    }
+    let json = json_flag.is_some();
+    match run(&arguments, json) {
         Ok(code) => code,
         Err(error) => {
             report_error(&error, json);

@@ -355,18 +355,110 @@ fn declared_disposable_paths_are_removed_on_return() {
 }
 
 #[test]
-fn warm_paths_survive_a_return() {
-    let warm = json!([{ "path": "node_modules", "keys": ["package.json"] }]);
-    let (fixture, origin) = setup("origin-warm", 2, warm, &[]);
+fn a_lease_keeps_warm_paths_with_unchanged_keys() {
+    let warm = json!([{ "path": "apps/*/node_modules", "keys": ["missing.lock", "bun.lock"] }]);
+    let (fixture, mut origin) = setup("origin-warm", 1, warm, &[]);
+    fs::create_dir_all(origin.path.join("apps/web")).unwrap();
+    fs::write(origin.path.join("apps/web/README.md"), "apps\n").unwrap();
+    fs::write(origin.path.join("bun.lock"), "base lock\n").unwrap();
+    origin.base = commit(&origin.path, "dependency keys");
+
     let leased = lease(&fixture, &origin, "req-1", "task/one");
-    fs::create_dir_all(tree(&leased).join("node_modules/pkg")).unwrap();
-    fs::write(tree(&leased).join("node_modules/pkg/index.js"), "dep\n").unwrap();
+    let deps = tree(&leased).join("apps/web/node_modules");
+    fs::create_dir_all(&deps).unwrap();
+    fs::write(deps.join("index.js"), "dep\n").unwrap();
+    assert!(leased.warm_kept.is_empty());
+    assert!(leased.warm_removed.is_empty());
 
     fixture
         .barge
         .worktree_return(&leased.lease_id, None, false)
         .unwrap();
-    assert!(tree(&leased).join("node_modules/pkg/index.js").exists());
+    let next = lease(&fixture, &origin, "req-2", "task/two");
+    assert_eq!(next.warm_kept, ["apps/web/node_modules"]);
+    assert!(next.warm_removed.is_empty());
+    assert_eq!(fs::read_to_string(deps.join("index.js")).unwrap(), "dep\n");
+    assert_eq!(
+        fixture.barge.worktree_lease_by_id(&next.lease_id).unwrap(),
+        next
+    );
+}
+
+#[test]
+fn a_changed_key_invalidates_the_warm_path_without_following_links() {
+    let warm = json!([
+        { "path": "node_modules", "keys": ["bun.lock"] },
+        { "path": "node_modules", "keys": ["another.lock"] }
+    ]);
+    let (fixture, mut origin) = setup("origin-warm-change", 1, warm, &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let outside = fixture.temp.folder("outside-warm").unwrap();
+    fs::write(outside.join("keep"), "outside\n").unwrap();
+    let deps = tree(&leased).join("node_modules");
+    fs::create_dir(&deps).unwrap();
+    std::os::unix::fs::symlink(&outside, deps.join("link")).unwrap();
+    fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+
+    // A present, empty key file differs from a missing one.
+    fs::write(origin.path.join("bun.lock"), "").unwrap();
+    origin.base = commit(&origin.path, "add an empty lockfile");
+    let next = lease(&fixture, &origin, "req-2", "task/two");
+    assert!(next.warm_kept.is_empty());
+    assert_eq!(next.warm_removed, ["node_modules"]);
+    assert!(!deps.exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("keep")).unwrap(),
+        "outside\n"
+    );
+}
+
+#[test]
+fn a_return_records_the_tasks_keys_before_resetting_to_base() {
+    let warm = json!([{ "path": "node_modules", "keys": ["bun.lock"] }]);
+    let (fixture, mut origin) = setup("origin-warm-task", 1, warm, &[]);
+    fs::write(origin.path.join("bun.lock"), "old keys\n").unwrap();
+    origin.base = commit(&origin.path, "old dependencies");
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let checkout = tree(&leased);
+    let deps = checkout.join("node_modules");
+    fs::create_dir(&deps).unwrap();
+    fs::write(deps.join("installed"), "new dependencies\n").unwrap();
+    fs::write(checkout.join("bun.lock"), "new keys\n").unwrap();
+    let task_head = commit(&checkout, "new dependencies");
+
+    fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, true)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(checkout.join("bun.lock")).unwrap(),
+        "old keys\n"
+    );
+    origin.base = task_head;
+    let next = lease(&fixture, &origin, "req-2", "task/two");
+    assert_eq!(next.warm_kept, ["node_modules"]);
+    assert!(deps.join("installed").exists());
+}
+
+#[test]
+fn a_legacy_root_without_a_hash_is_cold() {
+    let warm = json!([{ "path": "node_modules", "keys": ["bun.lock"] }]);
+    let (fixture, origin) = setup("origin-warm-legacy", 1, warm, &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let checkout = tree(&leased);
+    fs::create_dir(checkout.join("node_modules")).unwrap();
+    fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+    fs::remove_file(checkout.parent().unwrap().join(".barge-warm-paths.json")).unwrap();
+
+    let next = lease(&fixture, &origin, "req-2", "task/two");
+    assert_eq!(next.warm_removed, ["node_modules"]);
+    assert!(!checkout.join("node_modules").exists());
 }
 
 #[test]
@@ -672,4 +764,146 @@ fn a_run_hold_never_waits_for_a_return_and_blocks_one_while_it_lasts() {
         .worktree_return(&leased.lease_id, None, false)
         .unwrap();
     assert_eq!(returned.action, ReturnAction::Returned);
+}
+
+#[test]
+fn prune_previews_and_prepares_a_fresh_pool_at_the_origins_default_branch() {
+    let (fixture, origin) = setup("origin-prune-grow", 2, json!([]), &[]);
+    git(&origin.path, &["branch", "-m", "trunk"]);
+
+    let status = fixture.barge.worktree_status(None).unwrap();
+    let before = common::snapshot(fixture.temp.path());
+    let preview = fixture
+        .barge
+        .worktree_prune(Some(origin.path.to_str().unwrap()), true)
+        .unwrap();
+    assert_eq!(common::snapshot(fixture.temp.path()), before);
+    assert_eq!(preview[0].created, 1);
+    assert_eq!(fixture.barge.worktree_status(None).unwrap(), status);
+    assert!(
+        fixture.barge.areas().unwrap().is_empty(),
+        "no area declared by preview"
+    );
+
+    assert_eq!(fixture.barge.worktree_prune(None, false).unwrap(), preview);
+    let status = fixture.barge.worktree_status(None).unwrap();
+    let root = &status[0].roots[0];
+    assert_eq!(root.state, "free");
+    let checkout = root.path.join("checkout");
+    assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), origin.base);
+    assert_eq!(
+        git(&checkout, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "HEAD"
+    );
+    assert_eq!(
+        fixture.barge.worktree_prune(None, false).unwrap()[0].created,
+        0
+    );
+
+    let first = lease(&fixture, &origin, "req-1", "task/one");
+    assert_eq!(root.id, first.root_id);
+    lease(&fixture, &origin, "req-2", "task/two");
+    assert_eq!(
+        fixture.barge.worktree_prune(None, false).unwrap()[0].created,
+        0
+    );
+}
+
+#[test]
+fn prune_evicts_oldest_free_roots_and_preserves_reserved_and_held_roots() {
+    let (fixture, origin) = setup("origin-prune-trim", 5, json!([]), &[]);
+    let oldest = lease(&fixture, &origin, "req-1", "task/one");
+    let older = lease(&fixture, &origin, "req-2", "task/two");
+    let newest = lease(&fixture, &origin, "req-3", "task/three");
+    let held = lease(&fixture, &origin, "req-4", "task/four");
+    let reserved = lease(&fixture, &origin, "req-5", "task/five");
+    let area = pool_area(&fixture, &oldest);
+    for lease in [&oldest, &older, &newest, &held] {
+        fixture.clock.advance(10);
+        fixture
+            .barge
+            .worktree_return(&lease.lease_id, None, false)
+            .unwrap();
+    }
+    // A durable reservation must still protect a root whose pin is absent.
+    area.unpin(&reserved.root_id).unwrap();
+    let _hold = area.try_hold(&held.root_id, Mode::Shared).unwrap().unwrap();
+
+    let preview = fixture.barge.worktree_prune(None, true).unwrap();
+    assert_eq!(
+        preview[0].evicted,
+        [oldest.root_id.clone(), older.root_id.clone()]
+    );
+    assert_eq!(
+        fixture.barge.worktree_status(None).unwrap()[0].roots.len(),
+        5
+    );
+    assert_eq!(fixture.barge.worktree_prune(None, false).unwrap(), preview);
+    assert!(!tree(&oldest).exists());
+    assert!(!tree(&older).exists());
+    assert!(tree(&held).exists());
+    assert!(tree(&newest).exists());
+    assert!(tree(&reserved).exists());
+}
+
+#[test]
+fn prune_previews_and_finishes_an_interrupted_return_once_it_is_unheld() {
+    let (fixture, origin) = setup("origin-prune-interrupted", 1, json!([]), &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    set_lease_state(&fixture, &leased.lease_id, "interrupted");
+
+    let area = pool_area(&fixture, &leased);
+    let hold = area
+        .try_hold(&leased.root_id, Mode::Shared)
+        .unwrap()
+        .unwrap();
+    assert!(fixture.barge.worktree_prune(None, false).unwrap()[0]
+        .finished
+        .is_empty());
+    drop(hold);
+
+    let before = common::snapshot(fixture.temp.path());
+    let preview = fixture.barge.worktree_prune(None, true).unwrap();
+    assert_eq!(common::snapshot(fixture.temp.path()), before);
+    assert_eq!(preview[0].created, 0);
+    assert_eq!(preview[0].finished, std::slice::from_ref(&leased.lease_id));
+    assert_eq!(
+        state_of(&fixture, &leased.lease_id),
+        WorktreeLeaseState::Interrupted
+    );
+    assert!(branch_exists(&clone_of(&leased), &leased.branch));
+    assert_eq!(fixture.barge.worktree_prune(None, false).unwrap(), preview);
+    assert_eq!(
+        state_of(&fixture, &leased.lease_id),
+        WorktreeLeaseState::Returned
+    );
+    assert!(!branch_exists(&clone_of(&leased), &leased.branch));
+    assert!(fixture.barge.worktree_prune(None, false).unwrap()[0]
+        .finished
+        .is_empty());
+}
+
+#[test]
+fn doctor_reports_missing_and_corrupt_clones() {
+    let (fixture, origin) = setup("origin-doctor", 1, json!([]), &[]);
+    let report = fixture.barge.doctor().unwrap();
+    assert!(!report.ok);
+    assert_eq!(report.worktree_clone_problems[0].repo, identity(&origin));
+    assert!(report.worktree_clone_problems[0].reason.contains("missing"));
+
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    assert!(fixture
+        .barge
+        .doctor()
+        .unwrap()
+        .worktree_clone_problems
+        .is_empty());
+    let clone = clone_of(&leased);
+    fs::write(clone.join("HEAD"), "corrupt\n").unwrap();
+    let report = fixture.barge.doctor().unwrap();
+    assert!(!report.ok);
+    assert_eq!(
+        report.worktree_clone_problems[0].path.as_ref(),
+        Some(&clone)
+    );
 }

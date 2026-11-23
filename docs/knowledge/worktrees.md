@@ -1,10 +1,7 @@
 # Worktree pools
 
-Status: step 1 is built (the git module, pools, lease, return and status, with
-the CLI), and so is the consumer hold seam, `barge worktree run`
-([run](#run)). Tom approved this design on 2026-11-20; what step 1 changed from
-it is in [step 1 as built](#step-1-as-built). Warm-path key checks and `prune`
-are step 2.
+Barge supports lease, return, run, status and prune, with key-file validation
+for warm dependency folders. Tom approved this design on 2026-11-20.
 
 Barge keeps a warm pool of git worktrees per repository on External and leases
 them to agents. An agent starts in a checkout that already has its dependencies
@@ -58,7 +55,9 @@ barge worktree lease --repo <origin> --base <sha> [--base-name main]
   fetches, checks out a new branch `<name>` at `<sha>`, and verifies the tree
   is clean.
 - It returns the canonical path, a stable lease ID, the branch and the
-  verified head.
+  verified head. The lease reports any warm paths it kept or removed as
+  `warm_kept` and `warm_removed`. These fields are omitted when empty and
+  are available when reading the lease back.
 - The lease is recorded durably before the call returns, so a caller that lost
   the reply can read it back:
   `barge worktree lease get --request <id>` or `--lease <id>`.
@@ -125,23 +124,23 @@ What makes a pooled tree worth having is what survives between leases.
 - A pool declares its **warm paths**: ignored dependency folders, such as
   `node_modules` or `apps/*/node_modules`, each with the **key files** that
   decide whether it is still valid, such as `bun.lock` or `package-lock.json`.
-- At lease, after checking out the base, Barge hashes each warm path's key
-  files. If the hash matches the one recorded when the folder was last valid,
-  the folder stays. If not, Barge removes it before handing the tree over, and
-  the agent's own install rebuilds it. Barge never runs an install itself.
-- Rust build output is not a warm path: Oxide places it in its own pool, and
-  pairing a warm worktree with a warm Oxide slot is a later step.
-- Barge also re-hashes the key files of the outgoing checkout at return. If a
-  task changed a lockfile and reinstalled, the folder is recorded under the
-  new key or removed, so the next task never gets dependencies under an old
-  key.
+- After return preflight passes, Barge stores a SHA-256 hash for each warm
+  path from the outgoing checkout's key files, in declared order. Missing
+  files contribute to the hash and differ from empty files. The snapshot is
+  saved before reset, so it reflects a task's committed lockfile changes.
+- At lease, Barge checks out the requested base and compares fresh hashes
+  with the snapshot. Ignored entries with matching hashes stay. Entries with
+  changed or missing hashes are removed before handover, including on roots
+  created before hashes were stored. Barge never runs an install.
+- Rust build output lives in Oxide's own pool. Pairing a warm worktree with
+  a warm Oxide slot is a later step.
 
 ## Cleanup rules
 
 At return, Barge removes only what it can name:
 
 - tracked changes are already refused by the return preflight;
-- warm paths stay or go by their key, as above;
+- warm paths stay on return and are validated at the next lease;
 - ignored paths the pool declares disposable, such as `dist` or `.cache`, are
   removed;
 - any other ignored file refuses the return: it could be local data, and Barge
@@ -167,8 +166,14 @@ state directory:
   waits or fails rather than growing without bound (`--wait <seconds>`).
 - `barge worktree status [--repo]` lists pools, roots, leases and their
   holders' request IDs.
-- `barge worktree prune` returns the pool to `warm` through the class's
-  eviction. Doctor reports a pool whose clone is missing or corrupt.
+- `barge worktree prune [--repo <origin>] [--dry-run] [--json]` finishes
+  accepted, interrupted returns when their roots are unheld. It prepares
+  detached checkouts at the origin's default commit up to `warm` available
+  roots, subject to the total `max`, or evicts the oldest excess free roots
+  through the area's trash. Active leases, live holds and pins protect roots
+  from eviction. A dry run reports the counts and IDs without making changes
+  or contacting the origin.
+- Doctor reports declared pools whose bare clones are missing or corrupt.
 
 ## Nucleus and Paseo
 
@@ -220,13 +225,13 @@ whole surface; holds do the coordination), and running installs.
 
 1. Built: git module, pools, `lease`, `return`, `lease get`, `status` and `run`,
    with tests against real temporary repositories. See
-   [step 1 as built](#step-1-as-built).
-2. Warm paths with key-file validation, and `prune`.
+   [on disk and CLI](#on-disk-and-cli).
+2. Built: warm paths with key-file validation, and `prune`.
 3. Nucleus integration: the Nucleus planner briefs its allocator change
    against this contract.
 4. Later: pairing a leased worktree with a warm Oxide slot.
 
-## Step 1 as built
+## On disk and CLI
 
 The code is `crates/barge/src/worktree/`, the CLI is `barge worktree`, and the
 tests are `crates/barge/tests/worktrees.rs` and
@@ -236,15 +241,16 @@ repositories in temporary folders.
 On disk, in the account state directory:
 
 - `worktree-pools.json` (`barge.worktree-pools/1`) declares the pools. Barge
-  reads it and never writes it. Step 1 has no declare verb, so the operator
-  writes the file.
+  reads it and never writes it. The operator writes the declaration.
 - `worktree-leases/<lease-id>.json` (`barge.worktree-lease/1`) is one durable
   record per lease, published before the call replies.
 
 On the volume, the `worktrees` class placement gives the volume and the path.
 Each pool is the area `worktrees/<slug>` at `<path>/<slug>`, with its bare clone
 at `<area>/.barge/clone.git`. Each root is `wt-<id>/`, and its checkout is
-`wt-<id>/checkout`.
+`wt-<id>/checkout`. The root's `.barge-warm-paths.json` file
+(`barge.worktree-warm-paths/1`) stores the outgoing key hashes outside the
+checkout, so Git resets leave the snapshot intact.
 
 ```
 barge worktree lease --repo <origin> --base <sha> --branch <name> --request <id>
@@ -253,6 +259,7 @@ barge worktree lease get (--request <id> | --lease <id>) [--json]
 barge worktree return --lease <id> [--request <id>] [--disposable] [--json]
 barge worktree run --lease <id> [--exclusive] -- <command> [args...]
 barge worktree status [--repo <origin>] [--json]
+barge worktree prune [--repo <origin>] [--dry-run] [--json]
 ```
 
 Implementation details and differences from the approved design:
@@ -265,16 +272,12 @@ Implementation details and differences from the approved design:
   cannot be fetched from its identity alone.
 - **`--request` on return is optional.** When it is given, it must match the
   lease's request.
-- **`warm` is recorded, not enforced.** Roots are made on demand, up to `max`.
-  Keeping `warm` trees ready belongs to `prune`, in step 2.
 - **Pool roots do not count toward the volume reserve**, so reserve pruning does
   not evict them. An operator can still evict a free root by hand. The next lease
   clears the stale git metadata for it.
 - **An interrupted return is finished without a second preflight.** The first
-  preflight accepted the work. The root stays out of the pool until the next
-  return finishes it.
-- **Warm paths are kept on return.** Their key files are stored, but not checked
-  until step 2.
+  preflight accepted the work. The root stays reserved until return or prune
+  finishes the reset.
 
 ## Rulings
 

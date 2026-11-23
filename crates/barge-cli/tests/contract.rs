@@ -350,6 +350,24 @@ fn every_documented_success_document_matches_its_commands_output() {
         "pools": [{ "repo": origin_text.to_ascii_lowercase(), "origin": origin_text, "max": 2 }],
     });
     std::fs::write(fixture.state.join("worktree-pools.json"), pools.to_string()).unwrap();
+    let doctor = fixture.json(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(1), "{}", stderr(&doctor));
+    assert_eq!(
+        parse_document(&doctor)["data"]["worktree_clone_problems"][0]["repo"],
+        origin_text.to_ascii_lowercase()
+    );
+    let preview = fixture.run(&[
+        "worktree",
+        "prune",
+        "--repo",
+        &origin_text,
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview = parse_document(&preview);
+    assert_eq!(preview["data"]["dry_run"], true);
+    assert_eq!(preview["data"]["worktree_prune"][0]["created"], 2);
     let leased = fixture.json(&[
         "worktree",
         "lease",

@@ -12,23 +12,25 @@ use crate::error::Result;
 use crate::layout::{Class, Layout};
 use crate::volume::{Volume, VolumeState};
 use crate::workflow::{self, FileContents};
+use crate::worktree::{self, WorktreeCloneProblem};
 use crate::Barge;
 
 /// Everything doctor found, and whether it is all ok.
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
-    /// True when every volume is present with an agreeing layout and every
-    /// class folder exists, and every binding is `ok`.
+    /// True when doctor found no problems.
     pub ok: bool,
     pub volume_reports: Vec<VolumeReport>,
     pub binding_reports: Vec<BindingReport>,
     /// Areas whose recorded folder is missing while their roots sit elsewhere on
     /// the volume: a relocation that stopped between its rename and its record.
     pub misplaced_areas: Vec<MisplacedArea>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub worktree_clone_problems: Vec<WorktreeCloneProblem>,
 }
 
 impl DoctorReport {
-    /// How many volumes, bindings and misplaced areas are not ok.
+    /// How many issues doctor found.
     pub fn problems(&self) -> usize {
         self.volume_reports
             .iter()
@@ -40,6 +42,7 @@ impl DoctorReport {
                 .filter(|binding| !binding.state.is_ok())
                 .count()
             + self.misplaced_areas.len()
+            + self.worktree_clone_problems.len()
     }
 }
 
@@ -192,14 +195,17 @@ impl Barge {
                 });
             }
         }
+        let worktree_clone_problems = worktree::clone_problems(self)?;
         let ok = volumes.iter().all(VolumeReport::ok)
             && bindings.iter().all(|binding| binding.state.is_ok())
-            && misplaced_areas.is_empty();
+            && misplaced_areas.is_empty()
+            && worktree_clone_problems.is_empty();
         Ok(DoctorReport {
             ok,
             volume_reports: volumes,
             binding_reports: bindings,
             misplaced_areas,
+            worktree_clone_problems,
         })
     }
 

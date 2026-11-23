@@ -49,6 +49,7 @@ usage: barge [--json] <command>
   worktree run --lease ID [--exclusive] -- CMD [ARGS...]
                                           run CMD in the checkout, holding it
   worktree status [--repo R]              pools, roots and the leases on them
+  worktree prune [--repo R] [--dry-run]   maintain each pool’s free checkout target
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
   machine discover [--timeout SECONDS]

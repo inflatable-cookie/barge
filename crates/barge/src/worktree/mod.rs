@@ -12,9 +12,11 @@ pub(crate) mod git;
 mod lease;
 mod leases;
 mod pools;
+mod prune;
 mod returns;
 mod run;
 mod status;
+mod warm;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,9 +24,11 @@ use std::time::Duration;
 
 pub use leases::{LeaseRequest, WorktreeLease, WorktreeLeaseState, LEASE_SCHEMA};
 pub use pools::POOLS_SCHEMA;
+pub use prune::WorktreePrune;
 pub use returns::{ReturnAction, WorktreeReturn};
 pub use run::WorktreeHold;
-pub use status::{WorktreePool, WorktreeRoot};
+pub(crate) use status::clone_problems;
+pub use status::{WorktreeCloneProblem, WorktreePool, WorktreeRoot};
 
 use crate::area::{Area, Location, BARGE_DIR};
 use crate::error::{Error, Result};
@@ -37,6 +41,8 @@ use pools::{Pool, NAMESPACE};
 const CLONE_NAME: &str = "clone.git";
 /// The checkout's folder inside a root.
 const TREE_NAME: &str = "checkout";
+/// The label of roots a pool makes. The folder is `wt-<id>`.
+const ROOT_LABEL: &str = "wt";
 
 impl Barge {
     /// Lease a checkout of `request.base` on a new branch. Waits up to `wait` for
@@ -86,6 +92,12 @@ impl Barge {
         status::status(self, repo)
     }
 
+    /// Bring each selected pool's free roots to its warm target, within its
+    /// total capacity. A dry run reports the proposed changes without writing.
+    pub fn worktree_prune(&self, repo: Option<&str>, dry_run: bool) -> Result<Vec<WorktreePrune>> {
+        prune::prune(self, repo, dry_run)
+    }
+
     /// The `worktrees` class placement, or `None` when the class has no layout.
     fn worktree_placement(&self) -> Result<Option<Placement>> {
         Ok(self.layout()?.classes.get(&Class::Worktrees).cloned())
@@ -93,17 +105,22 @@ impl Barge {
 
     /// The area a pool's roots live in, declared on first use.
     fn pool_area(&self, pool: &Pool) -> Result<Area> {
+        self.area(self.pool_area_spec(pool)?)
+    }
+
+    fn pool_area_spec(&self, pool: &Pool) -> Result<crate::AreaSpec> {
         let placement = self.worktree_placement()?.ok_or_else(|| {
             Error::refused(
                 "resource class worktrees has no layout; place it with `barge layout set worktrees`",
             )
         })?;
         let slug = pool.slug()?;
-        let spec = crate::AreaSpec::new(NAMESPACE, slug.clone(), placement.volume.clone())
-            .folder(format!("{}/{slug}", placement.path))
-            .absent(placement.absent.clone())
-            .counts_toward_reserve(false);
-        self.area(spec)
+        Ok(
+            crate::AreaSpec::new(NAMESPACE, slug.clone(), placement.volume)
+                .folder(format!("{}/{slug}", placement.path))
+                .absent(placement.absent)
+                .counts_toward_reserve(false),
+        )
     }
 
     /// The area of a pool that has already been declared, without declaring it.
@@ -137,11 +154,15 @@ fn clone_path(directory: &Path) -> PathBuf {
 /// The bare clone, created on first use from the pool's origin.
 fn ensure_clone(directory: &Path, pool: &Pool) -> Result<PathBuf> {
     let clone = clone_path(directory);
-    if !clone.exists() {
+    if !clone
+        .try_exists()
+        .map_err(|source| Error::io("cannot inspect", &clone, &source))?
+    {
         let barge = directory.join(BARGE_DIR);
         fs::create_dir_all(&barge).map_err(|source| Error::io("cannot create", &barge, &source))?;
         git::init_bare(&clone, &pool.origin)?;
     }
+    git::require_bare(&clone)?;
     Ok(clone)
 }
 

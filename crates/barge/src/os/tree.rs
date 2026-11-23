@@ -15,7 +15,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -95,6 +95,100 @@ impl Tree {
         remove_opened(self, &same_device)
     }
 
+    /// Remove one relative entry using the same walk and filesystem boundary.
+    pub(crate) fn remove_entry(&self, relative: &Path) -> Result<Removed> {
+        let root_device = device_of(&self.directory)
+            .map_err(|source| Error::io("cannot inspect", &self.path, &source))?;
+        let path = self.path.join(relative);
+        let mut removed = Removed::default();
+        if let Some((directory, name)) = self.entry_parent(relative, root_device)? {
+            removed.removed = remove_child(
+                &directory,
+                name,
+                &path,
+                root_device,
+                0,
+                &same_device,
+                &mut removed,
+            )?;
+        } else {
+            removed.removed = true; // An absent entry needs no removal.
+        }
+        Ok(removed)
+    }
+
+    /// Open a relative regular file, without traversing symlinks or mounts.
+    pub(crate) fn open_file(&self, relative: &Path) -> Result<Option<File>> {
+        let root_device = device_of(&self.directory)
+            .map_err(|source| Error::io("cannot inspect", &self.path, &source))?;
+        let Some((parent, name)) = self.entry_parent(relative, root_device)? else {
+            return Ok(None);
+        };
+        let path = self.path.join(relative);
+        let name = name
+            .to_str()
+            .ok_or_else(|| Error::usage("file name must be UTF-8"))?;
+        let file = match super::open_marker_at(&parent, name) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(Error::io("cannot open", &path, &source)),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|source| Error::io("cannot inspect", &path, &source))?;
+        if !metadata.is_file() || metadata.dev() != root_device {
+            return Err(Error::refused(format!(
+                "{} is not a regular file on the checkout filesystem",
+                path.display()
+            )));
+        }
+        Ok(Some(file))
+    }
+
+    fn entry_parent<'a>(
+        &self,
+        relative: &'a Path,
+        device: u64,
+    ) -> Result<Option<(File, &'a OsStr)>> {
+        let mut parts = relative.components().peekable();
+        let mut path = self.path.clone();
+        let mut directory = self
+            .directory
+            .try_clone()
+            .map_err(|source| Error::io("cannot open", &path, &source))?;
+        while let Some(Component::Normal(name)) = parts.next() {
+            if parts.peek().is_none() {
+                return Ok(Some((directory, name)));
+            }
+            path.push(name);
+            directory = match open_at(Some(&directory), name) {
+                Ok(directory) => directory,
+                Err(source)
+                    if matches!(
+                        source.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(source) => return Err(Error::io("cannot open", &path, &source)),
+            };
+            if device_of(&directory)
+                .map_err(|source| Error::io("cannot inspect", &path, &source))?
+                != device
+            {
+                return Err(Error::refused(format!(
+                    "{} is on another filesystem",
+                    path.display()
+                )));
+            }
+        }
+        Err(Error::usage(format!(
+            "{} is not a relative entry path",
+            relative.display()
+        )))
+    }
+
     /// The testable core of [`Tree::remove`].
     #[cfg(test)]
     pub(crate) fn remove_with(self, device: DeviceFn<'_>) -> Result<Removed> {
@@ -159,57 +253,69 @@ fn remove_contents(
         read_names(directory).map_err(|source| Error::io("cannot list", path, &source))?;
     let mut empty = true;
     for name in entries {
-        let child = path.join(&name);
-        let metadata = match stat_at(directory, &name) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(Error::io("cannot inspect", &child, &source)),
-        };
-        let kind = metadata.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFLNK {
-            unlink_at(directory, &name, 0)
-                .map_err(|source| Error::io("cannot remove a symlink", &child, &source))?;
-            continue;
-        }
-        if kind != libc::S_IFDIR {
-            removed.bytes = removed.bytes.saturating_add(allocated_bytes(&metadata));
-            unlink_at(directory, &name, 0)
-                .map_err(|source| Error::io("cannot remove", &child, &source))?;
-            continue;
-        }
-        let nested = match open_at(Some(directory), &name) {
-            Ok(nested) => nested,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(Error::io("cannot open", &child, &source)),
-        };
-        // The filesystem is read from the descriptor, not from the entry seen a
-        // moment ago: a replacement mount cannot be descended.
-        let nested_device =
-            device_of(&nested).map_err(|source| Error::io("cannot inspect", &child, &source))?;
-        if device(&child, nested_device) != root_device {
-            removed.skipped.push(child);
-            empty = false;
-            continue;
-        }
-        if remove_contents(&nested, &child, root_device, depth + 1, device, removed)? {
-            // Remove the folder this walk emptied, and only while the name still
-            // means it: a replacement must not lose an empty folder.
-            let current = super::file_identity(&nested)
-                .ok()
-                .zip(super::path_identity(&child).ok().flatten())
-                .is_some_and(|(opened, named)| opened == named);
-            if current {
-                unlink_at(directory, &name, libc::AT_REMOVEDIR)
-                    .map_err(|source| Error::io("cannot remove", &child, &source))?;
-            } else {
-                removed.skipped.push(child);
-                empty = false;
-            }
-        } else {
-            empty = false;
-        }
+        empty &= remove_child(
+            directory,
+            &name,
+            &path.join(&name),
+            root_device,
+            depth,
+            device,
+            removed,
+        )?;
     }
     Ok(empty)
+}
+
+fn remove_child(
+    directory: &File,
+    name: &OsStr,
+    path: &Path,
+    root_device: u64,
+    depth: usize,
+    device: DeviceFn<'_>,
+    removed: &mut Removed,
+) -> Result<bool> {
+    let metadata = match stat_at(directory, name) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => return Err(Error::io("cannot inspect", path, &source)),
+    };
+    let kind = metadata.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFDIR {
+        if kind != libc::S_IFLNK {
+            removed.bytes = removed.bytes.saturating_add(allocated_bytes(&metadata));
+        }
+        unlink_at(directory, name, 0)
+            .map_err(|source| Error::io("cannot remove", path, &source))?;
+        return Ok(true);
+    }
+    let nested = match open_at(Some(directory), name) {
+        Ok(nested) => nested,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => return Err(Error::io("cannot open", path, &source)),
+    };
+    // Decide from the opened descriptor, so a replacement mount is left alone.
+    let nested_device =
+        device_of(&nested).map_err(|source| Error::io("cannot inspect", path, &source))?;
+    if device(path, nested_device) != root_device {
+        removed.skipped.push(path.to_path_buf());
+        return Ok(false);
+    }
+    if !remove_contents(&nested, path, root_device, depth + 1, device, removed)? {
+        return Ok(false);
+    }
+    // Remove this folder only while its name still identifies the opened one.
+    let current = super::file_identity(&nested)
+        .ok()
+        .zip(super::path_identity(path).ok().flatten())
+        .is_some_and(|(opened, named)| opened == named);
+    if !current {
+        removed.skipped.push(path.to_path_buf());
+        return Ok(false);
+    }
+    unlink_at(directory, name, libc::AT_REMOVEDIR)
+        .map_err(|source| Error::io("cannot remove", path, &source))?;
+    Ok(true)
 }
 
 /// Measure a tree without following a symlink, without crossing into another

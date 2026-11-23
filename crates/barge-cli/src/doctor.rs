@@ -12,15 +12,19 @@ pub(crate) fn doctor(arguments: &[String], json: bool) -> Result<ExitCode> {
     expect_no_positionals(&options)?;
     let report = Barge::open_read_only()?.doctor()?;
     if json {
-        document(
-            "barge.doctor/1",
-            vec![
-                ("ok", json!(report.ok)),
-                ("volume_reports", json!(report.volume_reports)),
-                ("binding_reports", json!(report.binding_reports)),
-                ("misplaced_areas", json!(report.misplaced_areas)),
-            ],
-        )?;
+        let mut fields = vec![
+            ("ok", json!(report.ok)),
+            ("volume_reports", json!(report.volume_reports)),
+            ("binding_reports", json!(report.binding_reports)),
+            ("misplaced_areas", json!(report.misplaced_areas)),
+        ];
+        if !report.worktree_clone_problems.is_empty() {
+            fields.push((
+                "worktree_clone_problems",
+                json!(report.worktree_clone_problems),
+            ));
+        }
+        document("barge.doctor/1", fields)?;
     } else {
         print_doctor(&report);
     }

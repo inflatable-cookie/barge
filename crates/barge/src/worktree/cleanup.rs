@@ -2,11 +2,10 @@
 //! (a warm path), removed (declared disposable), or undeclared (refuses the
 //! return), and remove the disposable ones without following a symlink.
 
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::os::Tree;
 
 /// How the ignored paths of one worktree were sorted.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -87,33 +86,16 @@ fn segment_matches(pattern: &str, text: &str) -> bool {
 /// followed; a folder is emptied through the same rule, and a nested folder on
 /// another filesystem is refused rather than walked.
 pub(crate) fn remove_entry(tree: &Path, entry: &str) -> Result<()> {
-    let path = tree.join(entry.trim_end_matches('/'));
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => return Err(Error::io("cannot inspect", &path, &source)),
-    };
-    remove_tree(&path, metadata.dev())
-}
-
-fn remove_tree(path: &Path, device: u64) -> Result<()> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|source| Error::io("cannot inspect", path, &source))?;
-    if metadata.dev() != device {
-        return Err(Error::refused(format!(
-            "{} is on another filesystem; nothing was removed from it",
-            path.display()
-        )));
+    let relative = Path::new(entry.trim_end_matches('/'));
+    let removed = Tree::open(tree)?.remove_entry(relative)?;
+    if removed.removed {
+        return Ok(());
     }
-    if !metadata.is_dir() {
-        return fs::remove_file(path).map_err(|source| Error::io("cannot remove", path, &source));
-    }
-    let entries = fs::read_dir(path).map_err(|source| Error::io("cannot list", path, &source))?;
-    for entry in entries {
-        let entry = entry.map_err(|source| Error::io("cannot list", path, &source))?;
-        remove_tree(&entry.path(), device)?;
-    }
-    fs::remove_dir(path).map_err(|source| Error::io("cannot remove", path, &source))
+    Err(Error::refused(format!(
+        "could not remove {}: {}",
+        tree.join(relative).display(),
+        crate::trash::stayed_reason(&removed)
+    )))
 }
 
 #[cfg(test)]
