@@ -51,9 +51,12 @@ barge worktree lease --repo <origin> --base <sha> [--base-name main]
   the same payload returns the same lease; repeating it with a changed payload
   is refused. A branch name that already exists in the pool's clone is
   refused, not reused. A different request can never get a leased root.
-- Barge picks a free warm root (or makes one if the pool is below its size),
-  fetches, checks out a new branch `<name>` at `<sha>`, and verifies the tree
-  is clean.
+- Barge prefers a free root with a warm-path record, most recently used first,
+  since its dependency folders are likeliest to match the current lockfiles.
+  With no recorded root it takes the least recently used free root (or makes
+  one if the pool is below its size), then fetches, checks out a new branch
+  `<name>` at `<sha>`, and verifies the tree is clean. Eviction and `prune`
+  still trim the oldest idle roots first.
 - It returns the canonical path, a stable lease ID, the branch and the
   verified head. The lease reports any warm paths it kept or removed as
   `warm_kept` and `warm_removed`. These fields are omitted when empty and

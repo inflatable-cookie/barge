@@ -48,6 +48,13 @@ pub(super) fn record_return(root: &Path, tree: &Path, pool: &Pool) -> Result<()>
 }
 
 /// Find the ignored entries covered by warm declarations, with normalized paths.
+/// Whether the root carries a warm-path snapshot from a previous return.
+/// Lease prefers such roots: their dependency folders are likeliest to still
+/// match the current lockfiles. A missing file simply reads as cold.
+pub(super) fn has_record(root: &Path) -> bool {
+    root.join(RECORD).is_file()
+}
+
 pub(super) fn candidates(tree: &Path, pool: &Pool) -> Result<BTreeSet<String>> {
     if pool.warm_paths.is_empty() {
         return Ok(BTreeSet::new());
