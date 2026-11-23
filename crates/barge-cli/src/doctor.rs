@@ -18,6 +18,7 @@ pub(crate) fn doctor(arguments: &[String], json: bool) -> Result<ExitCode> {
                 ("ok", json!(report.ok)),
                 ("volume_reports", json!(report.volume_reports)),
                 ("binding_reports", json!(report.binding_reports)),
+                ("misplaced_areas", json!(report.misplaced_areas)),
             ],
         )?;
     } else {

@@ -88,7 +88,7 @@ pub(crate) fn volume_line(volume: &VolumeStatus) -> String {
 pub(crate) fn area_line(area: &AreaStatus) -> String {
     match (&area.location, &area.unavailable) {
         (Some(path), _) => format!(
-            "area {}/{} at {}{} roots {}, {}{}",
+            "area {}/{} at {}{} roots {}, {}{}{}",
             area.namespace,
             area.name,
             path.display(),
@@ -99,7 +99,13 @@ pub(crate) fn area_line(area: &AreaStatus) -> String {
                 format!(", {} kept stragglers", area.stragglers)
             } else {
                 String::new()
-            }
+            },
+            area.displaced_at
+                .as_ref()
+                .map_or_else(String::new, |found| format!(
+                    "; folder missing, roots found at {}",
+                    found.display()
+                ))
         ),
         (None, Some(reason)) => format!(
             "area {}/{} unavailable: {reason}",
@@ -160,6 +166,14 @@ pub(crate) fn print_doctor(report: &DoctorReport) {
                 println!("  unknown {}", path.display());
             }
         }
+    }
+    for area in &report.misplaced_areas {
+        println!(
+            "area {} misplaced: folder {} is missing, its roots are at {}",
+            area.area,
+            area.recorded.display(),
+            area.found.display()
+        );
     }
     for binding in &report.binding_reports {
         println!(

@@ -69,7 +69,7 @@ below read `_name`, `_key` and `_state`.
 | `barge.bind-plan/2` | `plan: link-plan` | bind plan |
 | `barge.binding/1` | `action: string`, `binding: binding-record` | bind apply, bind adopt, bind undo |
 | `barge.move/1` | `report: move-report` | move apply |
-| `barge.doctor/1` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]` | doctor |
+| `barge.doctor/1` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]`, `misplaced_areas: [misplaced-area]` | doctor |
 | `barge.init/1` | `project: string`, `path: string`, `action: string`, `exclude: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state`, `warnings: [string]` | init |
 | `barge.init-check/1` | `project: string`, `path: string`, `block_state: string`, `exclude: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state`, `diff: [string]`, `warnings: [string]` | init --check |
 | `barge.machine-discover/1` | `discovered: [discovered-machine]` | machine discover |
@@ -105,7 +105,7 @@ or from standard input (`-`). Input that cannot be read is `usage`.
 | `volume-spec` | `name: string`, `uuid: string`, `mount: string`, `root_dir: string`, `availability: string`, `durability: string`, `reserve_bytes: int`, `floor_bytes: int` |
 | `volume-state` | `state: string`, `registered?: string`, `found?: string` |
 | `volume-status` | `name: string`, `uuid: string`, `mount: string`, `root_dir: string`, `availability: string`, `durability: string`, `reserve_bytes: int`, `floor_bytes: int`, `state: volume-state`, `free_bytes: int?`, `areas: [area-status]` |
-| `area-status` | `namespace: string`, `name: string`, `volume: string`, `folder: string`, `absent: absent`, `soft_cap_bytes?: int`, `counts_toward_reserve: bool`, `location?: string`, `fallback: bool`, `roots: int`, `bytes: int`, `stragglers: int`, `unavailable?: string` |
+| `area-status` | `namespace: string`, `name: string`, `volume: string`, `folder: string`, `absent: absent`, `soft_cap_bytes?: int`, `counts_toward_reserve: bool`, `location?: string`, `fallback: bool`, `roots: int`, `bytes: int`, `stragglers: int`, `unavailable?: string`, `displaced_at?: string` |
 | `absent` | `kind: string`, `path?: string` |
 | `root` | `id: string`, `label: string`, `path: string`, `folder: string`, `created_unix_ms: int`, `expires_unix_ms?: int` |
 | `listed-root` | `id: string`, `label: string`, `path: string`, `created_unix_ms: int`, `last_used_unix_ms: int`, `expires_unix_ms?: int`, `held: bool`, `pinned: bool`, `bytes: int`, `bytes_approximate: bool`, `on_volume: bool` |
@@ -131,7 +131,8 @@ or from standard input (`-`). Input that cannot be read is `usage`.
 | `layout-report` | `agrees: bool`, `classes: [class-folder]`, `unknown: [string]` |
 | `class-folder` | `class: string`, `path: string`, `exists: bool` |
 | `binding-report` | `consumer: string`, `class: string`, `kind: string`, `path: string`, `state: string`, `observed?: string?`, `expected?: string`, `reason?: string` |
-| `doctor-report` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]` |
+| `misplaced-area` | `area: string`, `recorded: string`, `found: string` |
+| `doctor-report` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]`, `misplaced_areas: [misplaced-area]` |
 | `move-report` | `plan: move-plan`, `doctor: doctor-report?`, `doctor_error: string?` |
 | `move-plan` | `schema: string`, `volume: string`, `volume_spec: volume-spec`, `class: string`, `source: string`, `source_identity: move-identity`, `destination: string`, `destination_parent_identity: move-identity`, `create_directory?: string`, `bindings: [move-binding]`, `unrecorded_links: [unrecorded-link]`, `layout: move-layout?`, `areas: [move-area]`, `consumers: [string]`, `manual_steps: [string]` |
 | `move-identity` | `dev: int`, `ino: int` |

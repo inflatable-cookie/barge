@@ -1,0 +1,1 @@
+Add `Barge::relocate_area` to move a declared area's folder to another folder on the same volume and record the new one. `status` and `doctor` report a move that was interrupted before its record was written.
