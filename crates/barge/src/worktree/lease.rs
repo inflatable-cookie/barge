@@ -110,16 +110,40 @@ fn take_root(
         .map(|lease| lease.root_id.as_str())
         .collect();
     let listing = area.list_without_bytes()?;
-    let mut free: Vec<&RootInfo> = listing
+    let free: Vec<&RootInfo> = listing
         .roots
         .iter()
         .filter(|root| !root.held && !root.pinned && !reserved.contains(root.id.as_str()))
         .collect();
-    free.sort_by(|left, right| {
-        (left.last_used_unix_ms, left.id.as_str())
-            .cmp(&(right.last_used_unix_ms, right.id.as_str()))
-    });
-    let (root_id, root_path) = match free.first() {
+    // A recorded root is likeliest to still have valid dependency folders,
+    // so it wins over a cold one even when the cold one has sat idle longer.
+    // Among recorded roots the most recently used wins, since its folders
+    // are likeliest to match the current lockfiles. With no record anywhere
+    // — including a pool that declares no warm paths — the choice keeps the
+    // LRU order below, and eviction and prune keep theirs regardless.
+    let ordered: Vec<&RootInfo> = if pool.warm_paths.is_empty() {
+        let mut lru = free;
+        lru.sort_by(|left, right| {
+            (left.last_used_unix_ms, left.id.as_str())
+                .cmp(&(right.last_used_unix_ms, right.id.as_str()))
+        });
+        lru
+    } else {
+        let (mut warm, mut cold): (Vec<&RootInfo>, Vec<&RootInfo>) = free
+            .into_iter()
+            .partition(|root| warm::has_record(&root.path));
+        warm.sort_by(|left, right| {
+            (right.last_used_unix_ms, left.id.as_str())
+                .cmp(&(left.last_used_unix_ms, right.id.as_str()))
+        });
+        cold.sort_by(|left, right| {
+            (left.last_used_unix_ms, left.id.as_str())
+                .cmp(&(right.last_used_unix_ms, right.id.as_str()))
+        });
+        warm.extend(cold);
+        warm
+    };
+    let (root_id, root_path) = match ordered.first() {
         Some(root) => (root.id.clone(), root.path.clone()),
         None if listing.roots.len() < usize::try_from(pool.max).unwrap_or(usize::MAX) => {
             let root = area.create_root(ROOT_LABEL)?;

@@ -463,6 +463,85 @@ fn a_legacy_root_without_a_hash_is_cold() {
 }
 
 #[test]
+fn a_lease_prefers_the_recorded_root_over_a_cold_one() {
+    let warm = json!([{ "path": "node_modules", "keys": ["bun.lock"] }]);
+    let (fixture, origin) = setup("origin-lease-warm-first", 2, warm, &[]);
+    let first = lease(&fixture, &origin, "req-1", "task/one");
+    let second = lease(&fixture, &origin, "req-2", "task/two");
+
+    // The cold root is returned first, so the recorded root below is the most
+    // recently used: the old LRU order would hand out the cold root here.
+    fixture.clock.advance(10);
+    fixture
+        .barge
+        .worktree_return(&second.lease_id, None, false)
+        .unwrap();
+    fs::remove_file(
+        tree(&second)
+            .parent()
+            .unwrap()
+            .join(".barge-warm-paths.json"),
+    )
+    .unwrap();
+    let deps = tree(&first).join("node_modules");
+    fs::create_dir(&deps).unwrap();
+    fs::write(deps.join("installed"), "dependencies\n").unwrap();
+    fixture.clock.advance(10);
+    fixture
+        .barge
+        .worktree_return(&first.lease_id, None, false)
+        .unwrap();
+
+    let next = lease(&fixture, &origin, "req-3", "task/three");
+    assert_eq!(next.root_id, first.root_id);
+    assert_eq!(next.warm_kept, ["node_modules"]);
+    assert_eq!(
+        fs::read_to_string(deps.join("installed")).unwrap(),
+        "dependencies\n"
+    );
+}
+
+#[test]
+fn a_lease_without_warm_records_keeps_lru_order() {
+    let warm = json!([{ "path": "node_modules", "keys": ["bun.lock"] }]);
+    let (fixture, origin) = setup("origin-lease-lru-fallback", 2, warm, &[]);
+    let first = lease(&fixture, &origin, "req-1", "task/one");
+    let second = lease(&fixture, &origin, "req-2", "task/two");
+
+    // Neither root keeps its record, so the lease falls back to the least
+    // recently used free root even though the pool declares warm paths.
+    fixture.clock.advance(10);
+    fixture
+        .barge
+        .worktree_return(&second.lease_id, None, false)
+        .unwrap();
+    fs::remove_file(
+        tree(&second)
+            .parent()
+            .unwrap()
+            .join(".barge-warm-paths.json"),
+    )
+    .unwrap();
+    fixture.clock.advance(10);
+    fixture
+        .barge
+        .worktree_return(&first.lease_id, None, false)
+        .unwrap();
+    fs::remove_file(
+        tree(&first)
+            .parent()
+            .unwrap()
+            .join(".barge-warm-paths.json"),
+    )
+    .unwrap();
+
+    let next = lease(&fixture, &origin, "req-3", "task/three");
+    assert_eq!(next.root_id, second.root_id);
+    assert!(next.warm_kept.is_empty());
+    assert!(next.warm_removed.is_empty());
+}
+
+#[test]
 fn a_lease_record_naming_another_folder_is_refused_before_anything_runs() {
     let (fixture, origin) = setup("origin-tampered", 2, json!([]), &[]);
     let leased = lease(&fixture, &origin, "req-1", "task/one");
