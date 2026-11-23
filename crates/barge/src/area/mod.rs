@@ -33,6 +33,8 @@ use crate::Core;
 /// The schema name of a pin record.
 pub use crate::pin::PIN_SCHEMA;
 
+mod relocate;
+
 pub(crate) const BARGE_DIR: &str = ".barge";
 pub(crate) const TRASH_DIR: &str = ".trash";
 pub(crate) const LOCKS_DIR: &str = "locks";
@@ -747,6 +749,7 @@ impl Area {
             }
             None => (0, 0, 0),
         };
+        let displaced_at = self.displaced_folder()?;
         let (path, fallback, unavailable) = match &location {
             Location::Volume(path) => (Some(path.clone()), false, None),
             Location::Fallback(path) => (Some(path.clone()), true, None),
@@ -766,6 +769,7 @@ impl Area {
             bytes,
             stragglers,
             unavailable,
+            displaced_at,
         })
     }
 
@@ -837,6 +841,10 @@ pub struct AreaStatus {
     pub stragglers: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<String>,
+    /// Where this area's roots are when its recorded folder is missing: a
+    /// relocation that stopped before its declaration was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub displaced_at: Option<PathBuf>,
 }
 
 /// The area lock: pinning, unpinning, eviction and the trash sweep take it, so a
@@ -995,5 +1003,7 @@ fn list_calls() -> usize {
     LIST_CALLS.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+mod relocate_tests;
 #[cfg(test)]
 mod tests;

@@ -22,10 +22,13 @@ pub struct DoctorReport {
     pub ok: bool,
     pub volume_reports: Vec<VolumeReport>,
     pub binding_reports: Vec<BindingReport>,
+    /// Areas whose recorded folder is missing while their roots sit elsewhere on
+    /// the volume: a relocation that stopped between its rename and its record.
+    pub misplaced_areas: Vec<MisplacedArea>,
 }
 
 impl DoctorReport {
-    /// How many volumes and bindings are not ok.
+    /// How many volumes, bindings and misplaced areas are not ok.
     pub fn problems(&self) -> usize {
         self.volume_reports
             .iter()
@@ -36,7 +39,17 @@ impl DoctorReport {
                 .iter()
                 .filter(|binding| !binding.state.is_ok())
                 .count()
+            + self.misplaced_areas.len()
     }
+}
+
+/// An area whose declared folder is missing while its roots were found at
+/// `found`. Nothing repairs it; the report says where the roots are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MisplacedArea {
+    pub area: String,
+    pub recorded: PathBuf,
+    pub found: PathBuf,
 }
 
 /// One registered volume.
@@ -169,12 +182,24 @@ impl Barge {
                 });
             bindings.push(binding);
         }
+        let mut misplaced_areas = Vec::new();
+        for area in self.areas()? {
+            if let Some(found) = area.displaced_folder()? {
+                misplaced_areas.push(MisplacedArea {
+                    area: area.key().label(),
+                    recorded: area.volume().base().join(area.record().effective_folder()),
+                    found,
+                });
+            }
+        }
         let ok = volumes.iter().all(VolumeReport::ok)
-            && bindings.iter().all(|binding| binding.state.is_ok());
+            && bindings.iter().all(|binding| binding.state.is_ok())
+            && misplaced_areas.is_empty();
         Ok(DoctorReport {
             ok,
             volume_reports: volumes,
             binding_reports: bindings,
+            misplaced_areas,
         })
     }
 

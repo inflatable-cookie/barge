@@ -80,7 +80,9 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   declaration carries the area's absent-volume policy, an optional soft cap,
   and whether it counts toward the volume reserve. The stored declaration is
   authoritative: a caller that presents a different one is refused, with the
-  differing fields named (Q-013).
+  differing fields named (Q-013). A consumer that moves its area's folder
+  changes the stored declaration with `relocate_area`, and its later declarations
+  must name the new folder.
 - **Root.** A directory inside an area that Barge owns. Barge-created roots are
   named `<label>-<id>` with a random `id`; an existing directory can be adopted
   under its caller-chosen folder name. Its `.barge-root.json` marker records
@@ -177,6 +179,8 @@ area.list_without_bytes()?;                       // roots, holds, pins and stra
 area.list()?;                                     // same listing, with root byte totals
 area.pin(&root.id, "selected output")?; area.unpin(&root.id)?;
 area.evict(&root.id)?;                            // refuses if held or pinned
+barge.relocate_area(&AreaKey::parse("oxide/pool")?, "builds/oxide/pool")?;
+                                                  // same volume only; refused while held
 
 barge.space("Builds")?;                           // free, reserve, floor
 barge.prune("Builds", false)?;                    // LRU idle unpinned roots to the reserve
@@ -201,6 +205,27 @@ and readers continue to accept schema 1 records.
 Root schema 1 keeps the derived `<label>-<id>` folder rule, while schema 2
 records an adopted folder. A reader that does not know a schema refuses it
 rather than guessing.
+
+**Moving an area's folder** (`relocate_area`) renames the declared folder to
+another folder on the same volume and records the new one. The volume, absent
+policy, soft cap and reserve flag are unchanged, and nothing else is written: no
+layout record, no class placement, so a private account moves its own
+declaration alone. Roots keep their IDs and markers; pins, the area lock, hold
+locks, activity and trash sit inside the folder and move with it.
+
+The move is same-volume only. It is one `rename` on one filesystem, which is the
+only step that is atomic here; a copy across filesystems would be a second
+mechanic with its own partial-failure handling, and nothing needs it. It refuses
+an absent or different volume, a missing or non-directory source, an existing
+destination, a destination nested with the source, a destination on another
+filesystem, a read-only account, and any held root. It holds the account lock and
+the area lock. It renames first and then writes the declaration; if that write
+fails, it renames back. A crash between the two leaves the folder at the new
+path and the declaration at the old one. Nothing repairs that: `status` reports
+the area's `displaced_at` and `doctor` lists it under `misplaced_areas`, both
+naming where the roots are. The search covers three folders below the volume
+base and skips dot-folders, so a moved area deeper than that, or one with no
+roots yet, is not reported. The operator decides the repair.
 
 Warm reuse is the consumer's choice: a consumer that finds an idle root it
 wants takes an exclusive hold on it and reuses it, contents and all. Barge
@@ -329,6 +354,9 @@ identity. Required cases:
 - pins survive prune; the floor refuses only when nothing idle remains;
 - a different volume at the registered mount is refused;
 - a mismatched area declaration is refused with the differing fields named;
+- an area move renames once, records the new folder, refuses each unsafe case
+  and a live hold, rolls the rename back when the declaration write fails, and
+  reports an interrupted move as a displaced folder;
 - plan, apply, adopt and undo of a link on temporary paths, including a target
   that changed after the plan, a preserved directory, an adopted link whose text
   is relative or runs through a symlinked folder, and deletion that never
