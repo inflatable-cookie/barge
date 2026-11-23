@@ -82,7 +82,7 @@ impl Barge {
 
     /// Hold a lease's checkout for a command, without waiting. Refused unless the
     /// lease is `leased` and no return holds its root. Dropping the hold releases
-    /// it; `WorktreeHold::exec` keeps it for the command and its children.
+    /// it. Pass it on with [`WorktreeHold::spawn`] or [`WorktreeHold::exec`].
     pub fn worktree_hold(&self, lease_id: &str, mode: Mode) -> Result<WorktreeHold> {
         run::hold(self, lease_id, mode)
     }

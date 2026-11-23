@@ -182,6 +182,9 @@ area.evict(&root.id)?;                            // refuses if held or pinned
 barge.relocate_area(&AreaKey::parse("oxide/pool")?, "builds/oxide/pool")?;
                                                   // same volume only; refused while held
 
+let hold = barge.worktree_hold(lease_id, Mode::Shared)?;
+let child = hold.spawn(command)?;                 // child and descendants hold the checkout
+
 barge.space("Builds")?;                           // free, reserve, floor
 barge.prune("Builds", false)?;                    // LRU idle unpinned roots to the reserve
 barge.admit("Builds")?;                           // prune to the floor; refuse only below it
@@ -196,6 +199,9 @@ state without creating directories, lock files, markers or activity records.
 Missing state is empty. Mutating operations refuse before filesystem access;
 `prune(..., true)` remains available as a preview. A missing hold lock is
 reported as unheld.
+
+[`WorktreeHold`](worktrees.md#run) supports spawning from a service with
+`spawn` or `spawn_with`, and replacing the caller with `exec`.
 
 The stored documents carry their own schema names (`barge.volumes/1`,
 `barge.layout/1`, `barge.bindings/1`, `barge.area/1`, `barge.root/1` and `/2`,

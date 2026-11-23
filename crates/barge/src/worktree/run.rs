@@ -1,15 +1,14 @@
-//! Holding a leased checkout for a command: the seam a non-Rust host uses
-//! (`barge worktree run`). The hold is taken without waiting, then its descriptor
-//! is kept inheritable and the process is replaced by the command, in the
-//! checkout. The hold lives as long as the command and any child that keeps the
-//! descriptor. Barge scans no process and writes no record for it.
+//! Holding a leased checkout for a command. `barge worktree run` replaces its
+//! process with the command. A Rust service can spawn a child and keep running.
+//! The hold lives as long as the command and any descendant that keeps the
+//! descriptor. Barge scans no process and writes no record when it closes.
 //!
 //! A return holds its root exclusively while it runs, so a hold that finds the
 //! root held is refused rather than queued behind the return.
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 
 use super::leases::{self, WorktreeLease, WorktreeLeaseState};
 use super::pools;
@@ -31,6 +30,49 @@ impl WorktreeHold {
     /// The lease the hold is for.
     pub fn lease(&self) -> &WorktreeLease {
         &self.lease
+    }
+
+    /// Spawn a child with the hold. It starts in the leased checkout unless
+    /// `command` already sets a working directory.
+    ///
+    /// The parent gives up its copy without recording a release time or size.
+    /// Return stays blocked until the child and all descendants that kept the
+    /// descriptor have closed it or exited. A descendant that closes inherited
+    /// descriptors can continue running outside this guarantee.
+    ///
+    /// ```no_run
+    /// use barge::{Barge, Mode};
+    /// use std::process::Command;
+    ///
+    /// # fn launch(lease_id: &str) -> barge::Result<std::process::Child> {
+    /// let hold = Barge::open()?.worktree_hold(lease_id, Mode::Shared)?;
+    /// let mut command = Command::new("git");
+    /// command.arg("status");
+    /// hold.spawn(command)
+    /// # }
+    /// ```
+    pub fn spawn(self, command: Command) -> Result<Child> {
+        self.spawn_with(command, |mut command| command.spawn())
+    }
+
+    /// Like [`Self::spawn`], using another process API to launch the child.
+    /// The launcher must synchronously spawn one child from the supplied
+    /// command and drop the command before returning, including on failure.
+    /// The command owns the parent's copy of the descriptor until it drops.
+    ///
+    /// With Tokio, pass `|command| tokio::process::Command::from(command).spawn()`
+    /// as `launch` and await the returned Tokio child's `wait` as usual.
+    pub fn spawn_with<T>(
+        self,
+        mut command: Command,
+        launch: impl FnOnce(Command) -> std::io::Result<T>,
+    ) -> Result<T> {
+        if command.get_current_dir().is_none() {
+            command.current_dir(&self.lease.path);
+        }
+        let program = command.get_program().to_owned();
+        crate::os::inherit_on_spawn(&mut command, self.hold.into_spawn_file()?);
+        launch(command).map_err(|source| Error::io("cannot spawn", Path::new(&program), &source))
     }
 
     /// Replace this process with `program` in the lease's checkout, keeping the

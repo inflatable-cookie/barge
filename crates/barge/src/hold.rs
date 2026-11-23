@@ -97,6 +97,26 @@ impl Hold {
         self.set_inheritable(true)?;
         Ok(self)
     }
+
+    /// Hand the lock to a command without recording a release. The command
+    /// can outlive this handle and so can its descendants.
+    pub(crate) fn into_spawn_file(mut self) -> Result<File> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| Error::unknown_state("hold has no descriptor"))?;
+        // On Unix, try_clone duplicates atomically with close-on-exec and
+        // above the stdio descriptors, which a command may redirect.
+        let child_file = file.try_clone().map_err(|source| {
+            Error::io(
+                "cannot duplicate the hold lock for",
+                &self.root_path,
+                &source,
+            )
+        })?;
+        drop(self.file.take());
+        Ok(child_file)
+    }
 }
 
 impl Drop for Hold {
@@ -104,7 +124,10 @@ impl Drop for Hold {
         // Release first: a consumer waiting for the lock must not wait for this
         // walk, and an eviction may follow the release immediately. The recorded
         // size is advisory, so a tree that changes under it is not a problem.
-        self.file.take();
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        drop(file);
         #[cfg(test)]
         DROP_HOOK.with(|hook| {
             if let Some(callback) = hook.borrow_mut().take() {
