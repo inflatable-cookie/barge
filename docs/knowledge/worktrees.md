@@ -117,6 +117,19 @@ child that keeps the descriptor. Barge stays out of the process tree.
 - Errors before the command starts use the CLI's error contract under
   `--json`. After it starts, the exit status is the command's own.
 
+On Unix, a Rust service can call `Barge::worktree_hold(lease_id, mode)?`
+and pass the resulting hold to `WorktreeHold::spawn(command)`. The service
+keeps running, and the child starts in the checkout unless its `Command`
+specifies a working directory. Only the spawned child receives the hold
+across exec. The parent gives up its copy without recording a release time or
+size. Return stays blocked while a child or descendant keeps the descriptor
+open. A process that closes inherited descriptors leaves that guarantee.
+
+For Tokio, use `WorktreeHold::spawn_with(command, |command|
+tokio::process::Command::from(command).spawn())` and await the returned child's
+`wait`. The launcher spawns one child and drops the configured command before
+returning. `WorktreeHold::exec` is the library form that replaces the caller.
+
 ## Warm paths
 
 What makes a pooled tree worth having is what survives between leases.

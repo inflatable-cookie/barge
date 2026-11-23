@@ -9,8 +9,9 @@
 mod common;
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use barge::worktree::{LeaseRequest, ReturnAction, WorktreeLease, WorktreeLeaseState};
@@ -691,7 +692,7 @@ fn set_lease_state(fixture: &Fixture, lease_id: &str, state: &str) {
 }
 
 #[test]
-fn a_run_hold_is_refused_for_every_lease_that_is_not_leased() {
+fn a_run_hold_refuses_to_spawn_for_every_lease_that_is_not_leased() {
     let (fixture, origin) = setup("origin-run-states", 4, json!([]), &[]);
     let leased = lease(&fixture, &origin, "req-1", "task/one");
     let returned = fixture
@@ -699,13 +700,18 @@ fn a_run_hold_is_refused_for_every_lease_that_is_not_leased() {
         .worktree_return(&leased.lease_id, None, false)
         .unwrap();
     assert_eq!(returned.action, ReturnAction::Returned);
+    let marker = fixture.temp.path().join("ran");
     for state in ["returned", "returning", "interrupted"] {
         set_lease_state(&fixture, &leased.lease_id, state);
+        let mut command = Command::new("touch");
+        command.arg(&marker);
         let refused = fixture
             .barge
             .worktree_hold(&leased.lease_id, Mode::Shared)
+            .and_then(|hold| hold.spawn(command))
             .unwrap_err();
         assert_eq!(refused.kind(), ErrorKind::Refused, "{state}: {refused}");
+        assert!(!marker.exists(), "{state}: the command must not run");
     }
     let unknown = fixture
         .barge
@@ -759,6 +765,129 @@ fn a_run_hold_never_waits_for_a_return_and_blocks_one_while_it_lasts() {
 
     drop(first);
     drop(second);
+    let returned = fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+    assert_eq!(returned.action, ReturnAction::Returned);
+}
+
+#[test]
+fn a_spawned_child_and_its_grandchild_hold_the_checkout() {
+    let (fixture, origin) = setup("origin-spawn", 2, json!([]), &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let return_lease = || fixture.barge.worktree_return(&leased.lease_id, None, false);
+    let hold = fixture
+        .barge
+        .worktree_hold(&leased.lease_id, Mode::Shared)
+        .unwrap();
+    let activity = tree(&leased)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".barge/activity")
+        .join(format!("{}.json", leased.root_id));
+    let before_spawn = fs::read(&activity).unwrap();
+    fixture.clock.advance(1);
+
+    // Start the grandchild only on our signal. It keeps the same pipes open
+    // after the shell exits and waits for EOF from the test.
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            "pwd -P; IFS= read -r start || exit 1; \
+             sh -c 'echo grandchild; cat >/dev/null' <&0 &",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = hold.spawn(command).unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(
+        line.trim(),
+        fs::canonicalize(tree(&leased)).unwrap().to_string_lossy()
+    );
+    assert_eq!(return_lease().unwrap_err().kind(), ErrorKind::Refused);
+    assert_eq!(fs::read(&activity).unwrap(), before_spawn);
+
+    writeln!(input, "start").unwrap();
+    assert!(child.wait().unwrap().success());
+    line.clear();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(line, "grandchild\n");
+    assert_eq!(return_lease().unwrap_err().kind(), ErrorKind::Refused);
+
+    drop(input);
+    line.clear();
+    assert_eq!(output.read_to_string(&mut line).unwrap(), 0);
+    // The kernel can close stdout just before closing the hold at exit.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match return_lease() {
+            Ok(returned) => {
+                assert_eq!(returned.action, ReturnAction::Returned);
+                break;
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::Refused, "{error}");
+                assert!(Instant::now() < deadline, "{error}");
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unrelated_child_spawned_during_launch_does_not_inherit_the_hold() {
+    let (fixture, origin) = setup("origin-spawn-unrelated", 2, json!([]), &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let hold = fixture
+        .barge
+        .worktree_hold(&leased.lease_id, Mode::Exclusive)
+        .unwrap();
+    let mut command = Command::new("pwd");
+    command.arg("-P").current_dir(&origin.path);
+
+    // Launch outside the prepared command while the descriptor is still open
+    // in the parent. Keep that process alive until after the return.
+    let mut unrelated = None;
+    let output = hold
+        .spawn_with(command, |mut command| {
+            unrelated = Some(Command::new("cat").stdin(Stdio::piped()).spawn()?);
+            command.output()
+        })
+        .unwrap();
+    let mut unrelated = unrelated.unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        fs::canonicalize(&origin.path).unwrap().to_string_lossy()
+    );
+    assert!(unrelated.try_wait().unwrap().is_none());
+    let returned = fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+    assert_eq!(returned.action, ReturnAction::Returned);
+    assert!(unrelated.wait().unwrap().success());
+}
+
+#[test]
+fn a_failed_spawn_drops_the_hold() {
+    let (fixture, origin) = setup("origin-spawn-failure", 2, json!([]), &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let hold = fixture
+        .barge
+        .worktree_hold(&leased.lease_id, Mode::Exclusive)
+        .unwrap();
+    let error = hold
+        .spawn(Command::new(fixture.temp.path().join("missing-command")))
+        .unwrap_err();
+    assert_eq!(error.io_kind(), Some(std::io::ErrorKind::NotFound));
     let returned = fixture
         .barge
         .worktree_return(&leased.lease_id, None, false)

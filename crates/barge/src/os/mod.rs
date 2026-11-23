@@ -21,7 +21,9 @@ pub(crate) mod tree;
 use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -286,6 +288,26 @@ pub(crate) fn set_inheritable(file: &File, inheritable: bool) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Keep this close-on-exec file open across exec in the spawned child only.
+pub(crate) fn inherit_on_spawn(command: &mut Command, file: File) {
+    let parent = std::process::id();
+    // SAFETY: the hook owns the file, so its descriptor stays open until
+    // spawn. The hook uses only async-signal-safe syscalls and constructs
+    // errors from errno without allocating. It refuses an in-place exec.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            if libc::getpid().cast_unsigned() == parent {
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            if libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Open a persistent lock file without truncating it.
