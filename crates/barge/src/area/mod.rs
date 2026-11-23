@@ -640,40 +640,58 @@ impl Area {
         let _ = fs::remove_file(&lock_path);
         let _ = fs::remove_file(hold::activity_path(&activity, &id));
         let _ = fs::remove_file(crate::pin::pin_path(&directory, &id));
+        // Open the trash entry and take the exclusive lock the deletion holds,
+        // before the area lock is released: a sweep claims only under that lock,
+        // so from here neither a claim nor an empty reap can touch a folder this
+        // eviction is still walking.
+        let tree = crate::os::Tree::open(&trash_path).map_err(|error| {
+            Error::io_message(format!(
+                "{}; the evicted root remains in trash at {}",
+                error.message(),
+                trash_path.display()
+            ))
+        })?;
+        if !crate::os::flock(tree.directory(), Mode::Exclusive, false)? {
+            return Err(Error::unknown_state(format!(
+                "{} is held by another deletion; the evicted root stays in the trash for a sweep",
+                trash_path.display()
+            )));
+        }
         // The rename is done and the hold lock's file is unlinked, so it protects
-        // nothing more. The area lock is also released before the tree delete.
+        // nothing more. The area lock is also released before the tree delete; the
+        // entry keeps its own lock until the walk is done.
         drop(hold_lock);
         drop(area_lock);
-        let (deleted, kept_reason, size) =
-            match crate::trash::remove_evicted_tree(&trash_path, &key, &id) {
-                // The walk counted every byte it removed, so the size is exact.
-                Ok(removed) if removed.removed => (
-                    true,
-                    None,
-                    TreeSize {
-                        bytes: removed.bytes,
+        let (deleted, kept_reason, size) = match crate::trash::remove_evicted_tree(tree, &key, &id)
+        {
+            // The walk counted every byte it removed, so the size is exact.
+            Ok(removed) if removed.removed => (
+                true,
+                None,
+                TreeSize {
+                    bytes: removed.bytes,
+                    approximate: false,
+                },
+            ),
+            Ok(removed) => (
+                false,
+                Some(crate::trash::stayed_reason(&removed)),
+                recorded.map_or_else(
+                    || tree_bytes(&trash_path),
+                    |bytes| TreeSize {
+                        bytes,
                         approximate: false,
                     },
                 ),
-                Ok(removed) => (
-                    false,
-                    Some(crate::trash::stayed_reason(&removed)),
-                    recorded.map_or_else(
-                        || tree_bytes(&trash_path),
-                        |bytes| TreeSize {
-                            bytes,
-                            approximate: false,
-                        },
-                    ),
-                ),
-                Err(error) => {
-                    return Err(Error::io_message(format!(
-                        "{}; evicted root remains in trash at {}",
-                        error.message(),
-                        trash_path.display()
-                    )))
-                }
-            };
+            ),
+            Err(error) => {
+                return Err(Error::io_message(format!(
+                    "{}; evicted root remains in trash at {}",
+                    error.message(),
+                    trash_path.display()
+                )))
+            }
+        };
         Ok(Eviction {
             area: key,
             id,

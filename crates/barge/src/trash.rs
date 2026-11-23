@@ -13,7 +13,9 @@
 //! releasing the lock, so a large deletion never stalls holds. A claim renames
 //! the entry to [`CLAIM_PREFIX`] plus its name and keeps the exclusive lock on
 //! the folder it opened, so a later sweep finishes a claim an interrupted sweep
-//! left behind and never walks a tree another deletion is walking.
+//! left behind and never walks a tree another deletion is walking. An eviction
+//! takes that same lock on its entry at the rename, under the same area lock, so a
+//! sweep treats a live eviction exactly like a live claim.
 //!
 //! A deletion removes a root's marker last, so the only folder it can leave with
 //! no marker is the empty one its own last step could not remove. A sweep reaps
@@ -47,11 +49,17 @@ enum Opened {
     Refused(String),
 }
 
-/// Open a folder and read its marker through the descriptor the removal then
-/// walks, so one read decides ownership and a replacement at the path between the
-/// check and the removal is never walked.
+/// Open a folder and classify it from the marker read through the descriptor the
+/// removal then walks, so one read decides ownership and a replacement at the path
+/// between the check and the removal is never walked.
 fn open_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Opened> {
-    let tree = Tree::open(path)?;
+    Ok(classify(Tree::open(path)?, area, id))
+}
+
+/// Whether a folder already opened for deletion is Barge's, from the marker read
+/// through that same descriptor.
+fn classify(tree: Tree, area: &str, id: Option<&str>) -> Opened {
+    let path = tree.path().to_path_buf();
     // A racing writer may put a different folder at the path now; the walk below
     // still sees the one that was opened.
     #[cfg(test)]
@@ -61,7 +69,7 @@ fn open_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Opened> {
             hook();
         }
     });
-    Ok(match read_marker_in(tree.directory(), tree.path()) {
+    match read_marker_in(tree.directory(), &path) {
         MarkerRead::Valid(marker) if marker.area == area && id.is_none_or(|id| marker.id == id) => {
             Opened::Owned(tree)
         }
@@ -74,12 +82,16 @@ fn open_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Opened> {
         MarkerRead::Invalid(reason) => {
             Opened::Refused(format!("refusing to delete {}: {reason}", path.display()))
         }
-    })
+    }
 }
 
-/// Delete an evicted root's trash entry, which must still name the area and the
-/// root ID.
-pub(crate) fn remove_evicted_tree(path: &Path, area: &str, id: &str) -> Result<Removed> {
+/// Delete an evicted root's trash entry through the folder the eviction opened and
+/// locked at its rename, which must still name the area and the root ID.
+///
+/// The eviction holds that folder's exclusive lock, so the lock, the marker the
+/// ownership is decided from and the walk are all one folder: a sweep treats this
+/// eviction as a live deletion and leaves its entry alone.
+pub(crate) fn remove_evicted_tree(tree: Tree, area: &str, id: &str) -> Result<Removed> {
     #[cfg(test)]
     if FAIL_DELETE.with(|flag| flag.replace(false)) {
         return Err(Error::io_message("injected deletion failure"));
@@ -90,8 +102,9 @@ pub(crate) fn remove_evicted_tree(path: &Path, area: &str, id: &str) -> Result<R
             hook();
         }
     });
-    match remove_owned(path, area, Some(id)) {
-        Err(error) if matches!(fs::symlink_metadata(path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) =>
+    let path = tree.path().to_path_buf();
+    match remove_owned(tree, area, Some(id)) {
+        Err(error) if matches!(fs::symlink_metadata(&path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) =>
         {
             let _ = error;
             Ok(Removed {
@@ -103,16 +116,16 @@ pub(crate) fn remove_evicted_tree(path: &Path, area: &str, id: &str) -> Result<R
     }
 }
 
-fn remove_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Removed> {
-    match open_owned(path, area, id)? {
+fn remove_owned(tree: Tree, area: &str, id: Option<&str>) -> Result<Removed> {
+    match classify(tree, area, id) {
         Opened::Owned(tree) => tree.remove(),
         // An eviction deletes the root it evicted, which carried a marker, so a
         // folder without one is not the entry it renamed: it is refused here and
         // the next sweep decides. An eviction that stopped leaves its entry in
         // the trash with its marker, and a sweep covers all of the trash.
-        Opened::Unmarked(_) => Err(Error::refused(format!(
+        Opened::Unmarked(tree) => Err(Error::refused(format!(
             "refusing to delete {}: it has no {MARKER_NAME}",
-            path.display()
+            tree.path().display()
         ))),
         Opened::Refused(reason) => Err(Error::refused(reason)),
     }
@@ -177,11 +190,12 @@ impl Area {
     /// interrupted deletion can leave in its place.
     ///
     /// The area lock is taken to list the trash and to claim what this pass will
-    /// delete: an eviction renames its root into the trash under that same lock,
-    /// so a sweep never deletes an entry whose rename it has not seen finish. The
-    /// lock is released before any tree is deleted, so holds and other area
-    /// operations continue while a large tree goes; the only removal under the
-    /// lock is an empty leftover's single `rmdir`.
+    /// delete: an eviction renames its root into the trash under that same lock
+    /// and keeps the entry's exclusive lock from then on, so a sweep neither
+    /// deletes an entry whose rename it has not seen finish nor touches one a live
+    /// eviction is still walking. The lock is released before any tree is deleted,
+    /// so holds and other area operations continue while a large tree goes; the
+    /// only removal under the lock is an empty leftover's single `rmdir`.
     ///
     /// A sweep covers the whole trash, so an eviction that stopped after its
     /// rename is finished here too: its entry still carries the marker, which is
@@ -564,6 +578,49 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_leaves_a_live_eviction_to_finish_its_own_entry() {
+        let (_temp, area) = fixture("trash-live-eviction");
+        let root = area.create_root("old").unwrap();
+        fs::write(root.path.join("artifact.bin"), b"artifact").unwrap();
+        let trash = root.path.parent().unwrap().join(TRASH_DIR);
+        let entry = trash.join(&root.folder);
+        // The sweep runs while the eviction is inside its deletion: the entry is
+        // renamed into the trash and the eviction holds its exclusive lock, which
+        // it took under the area lock at the rename.
+        let sweep_area = area.clone();
+        let swept = Rc::new(RefCell::new(None));
+        let record = swept.clone();
+        DELETE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                record
+                    .borrow_mut()
+                    .replace(sweep_area.sweep_trash().unwrap());
+            }))
+        });
+
+        let eviction = area.evict(&root.id).unwrap();
+
+        assert!(eviction.deleted, "the eviction finished its own entry");
+        assert!(!entry.exists());
+        assert_eq!(
+            fs::read_dir(&trash).unwrap().count(),
+            0,
+            "the trash holds no claim or leftover"
+        );
+        let swept = swept.borrow_mut().take().expect("the sweep ran");
+        assert!(swept.deleted.is_empty(), "{:#?}", swept.deleted);
+        assert_eq!(swept.kept.len(), 1, "{:#?}", swept.kept);
+        assert_eq!(swept.kept[0].path, entry);
+        assert!(
+            swept.kept[0]
+                .reason
+                .contains("another sweep is deleting it"),
+            "{}",
+            swept.kept[0].reason
+        );
+    }
+
+    #[test]
     fn a_final_step_that_cannot_remove_the_entry_leaves_it_for_the_next_sweep() {
         if crate::os::running_as_root() {
             // Root ignores the mode that makes the last step fail.
@@ -581,7 +638,8 @@ mod tests {
         // removal, so the deletion fails at its last step with the marker gone.
         deny_parent_writes(&trash);
 
-        let error = remove_evicted_tree(&entry, "test/area", &marker.id).unwrap_err();
+        let error =
+            remove_evicted_tree(Tree::open(&entry).unwrap(), "test/area", &marker.id).unwrap_err();
 
         allow_writes(&trash);
         assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
@@ -914,7 +972,9 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         fs::write(root.join("file.txt"), b"data").unwrap();
 
-        let deletion = remove_evicted_tree(&root, "test/area", "0123456789abcdef").unwrap();
+        let deletion =
+            remove_evicted_tree(Tree::open(&root).unwrap(), "test/area", "0123456789abcdef")
+                .unwrap();
 
         assert!(deletion.bytes >= 4, "the file's bytes are counted");
         assert!(deletion.skipped.is_empty());
@@ -945,7 +1005,9 @@ mod tests {
             }))
         });
 
-        let deletion = remove_evicted_tree(&entry, "test/area", "0123456789abcdef").unwrap();
+        let deletion =
+            remove_evicted_tree(Tree::open(&entry).unwrap(), "test/area", "0123456789abcdef")
+                .unwrap();
 
         assert!(
             entry.join("replacement.bin").exists(),
@@ -967,7 +1029,7 @@ mod tests {
         let root = temp.path().join("root");
         fs::create_dir(&root).unwrap();
         crate::root::write_marker(&root, &marker("replacement")).unwrap();
-        assert!(remove_evicted_tree(&root, "test/area", "original").is_err());
+        assert!(remove_evicted_tree(Tree::open(&root).unwrap(), "test/area", "original").is_err());
         assert!(root.exists());
     }
 
@@ -990,7 +1052,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = remove_evicted_tree(&root, "test/area", "0123456789abcdef").unwrap_err();
+        let error =
+            remove_evicted_tree(Tree::open(&root).unwrap(), "test/area", "0123456789abcdef")
+                .unwrap_err();
 
         assert_eq!(error.kind(), crate::error::ErrorKind::Refused);
         assert!(root.exists());
