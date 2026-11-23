@@ -1,5 +1,5 @@
 //! `barge worktree`: lease a checkout from a pool, read a lease back, return it,
-//! and see pool status. The mechanics are in `barge::worktree`.
+//! see pool status and prune it. The mechanics are in `barge::worktree`.
 
 use std::time::Duration;
 
@@ -12,7 +12,9 @@ use crate::output::document;
 
 pub(crate) fn worktree(arguments: &[String], json: bool) -> Result<()> {
     let Some(subcommand) = arguments.first().map(String::as_str) else {
-        return Err(Error::usage("worktree needs lease, return or status"));
+        return Err(Error::usage(
+            "worktree needs lease, return, run, status or prune",
+        ));
     };
     let rest = &arguments[1..];
     match subcommand {
@@ -21,8 +23,9 @@ pub(crate) fn worktree(arguments: &[String], json: bool) -> Result<()> {
         "return" => give_back(rest, json),
         "run" => run(rest),
         "status" => status(rest, json),
+        "prune" => prune(rest, json),
         other => Err(Error::usage(format!(
-            "unknown worktree command {other:?}; use lease, lease get, return, run or status"
+            "unknown worktree command {other:?}; use lease, lease get, return, run, status or prune"
         ))),
     }
 }
@@ -144,6 +147,43 @@ fn status(arguments: &[String], json: bool) -> Result<()> {
     }
     for pool in &pools {
         describe_pool(pool);
+    }
+    Ok(())
+}
+
+fn prune(arguments: &[String], json: bool) -> Result<()> {
+    let options = Options::parse(arguments, &["repo"], &["dry-run"])?;
+    expect_no_positionals(&options)?;
+    let dry_run = options.flag("dry-run");
+    let barge = if dry_run {
+        Barge::open_read_only()?
+    } else {
+        Barge::open()?
+    };
+    let pools = barge.worktree_prune(options.get("repo").as_deref(), dry_run)?;
+    if json {
+        return document(
+            "barge.worktree-prune/1",
+            vec![
+                ("dry_run", json!(dry_run)),
+                ("worktree_prune", json!(pools)),
+            ],
+        );
+    }
+    if pools.is_empty() {
+        println!("no worktree pools are declared");
+    }
+    for pool in pools {
+        let verb = if dry_run { "would prepare" } else { "prepared" };
+        println!("{}: {verb} {} checkouts", pool.repo, pool.created);
+        for root in pool.evicted {
+            let verb = if dry_run { "would evict" } else { "evicted" };
+            println!("  {verb} root {root}");
+        }
+        for lease in pool.finished {
+            let verb = if dry_run { "would finish" } else { "finished" };
+            println!("  {verb} return of lease {lease}");
+        }
     }
     Ok(())
 }

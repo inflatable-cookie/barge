@@ -6,6 +6,7 @@
 //! never prompt, and the repository overrides a parent process may carry are
 //! dropped, so a hook's `GIT_DIR` cannot point a pool at another repository.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -34,7 +35,9 @@ fn raw(dir: Option<&Path>, args: &[&str]) -> Result<Output> {
         .map_err(|source| Error::io_message(format!("cannot run git: {source}")))?;
     Ok(Output {
         success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stdout: String::from_utf8(output.stdout).map_err(|_| {
+            Error::unknown_state("git returned a path or other output that is not UTF-8")
+        })?,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
     })
 }
@@ -88,6 +91,64 @@ pub(crate) fn init_bare(clone: &Path, origin: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check this exact folder so Git cannot fall back to an enclosing repo.
+pub(crate) fn require_bare(clone: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(clone)
+        .map_err(|source| Error::io("cannot inspect bare clone", clone, &source))?;
+    let clone_arg = text(clone)?;
+    if !metadata.is_dir()
+        || run(
+            None,
+            &["--git-dir", clone_arg, "rev-parse", "--is-bare-repository"],
+        )?
+        .trim()
+            != "true"
+    {
+        return Err(Error::unknown_state(format!(
+            "{} is not a bare Git repository",
+            clone.display()
+        )));
+    }
+    run(
+        None,
+        &["--git-dir", clone_arg, "remote", "get-url", "origin"],
+    )?;
+    Ok(())
+}
+
+/// Check the bare clone's objects and refs without fetching or repairing it.
+pub(crate) fn check_bare(clone: &Path) -> Result<()> {
+    require_bare(clone)?;
+    run(
+        None,
+        &["--git-dir", text(clone)?, "fsck", "--full", "--no-dangling"],
+    )?;
+    Ok(())
+}
+
+/// Fetch the origin's default commit, regardless of the branch's name.
+pub(crate) fn fetch_default(clone: &Path) -> Result<String> {
+    run(
+        Some(clone),
+        &["fetch", "--no-tags", "--quiet", "origin", "HEAD"],
+    )?;
+    commit_of(clone, "FETCH_HEAD")?.ok_or_else(|| {
+        Error::unknown_state(format!(
+            "{} did not fetch a default commit",
+            clone.display()
+        ))
+    })
+}
+
+/// Prepare an unassigned checkout without creating a local branch.
+pub(crate) fn add_detached(clone: &Path, tree: &Path, base: &str) -> Result<()> {
+    run(
+        Some(clone),
+        &["worktree", "add", "--quiet", "--detach", text(tree)?, base],
+    )?;
+    Ok(())
+}
+
 /// Fetch every branch of the origin into the clone's remote-tracking refs.
 pub(crate) fn fetch(clone: &Path) -> Result<()> {
     run(
@@ -99,7 +160,7 @@ pub(crate) fn fetch(clone: &Path) -> Result<()> {
 
 /// Drop the metadata of worktrees whose folder is gone.
 pub(crate) fn prune_worktrees(clone: &Path) -> Result<()> {
-    run(Some(clone), &["worktree", "prune"])?;
+    run(Some(clone), &["worktree", "prune", "--expire", "now"])?;
     Ok(())
 }
 
@@ -232,6 +293,13 @@ pub(crate) fn ignored_entries(tree: &Path) -> Result<Vec<String>> {
         .filter(|entry| !entry.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// The index paths a cleanup may never remove.
+pub(crate) fn tracked_entries(tree: &Path) -> Result<BTreeSet<String>> {
+    require_worktree(tree)?;
+    let output = run(Some(tree), &["ls-files", "--cached", "-z"])?;
+    Ok(output.split_terminator('\0').map(str::to_string).collect())
 }
 
 /// How many commits HEAD has beyond `base`.

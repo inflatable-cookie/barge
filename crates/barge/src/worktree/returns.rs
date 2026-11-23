@@ -13,7 +13,7 @@ use super::cleanup::{self, classify};
 use super::git;
 use super::leases::{self, WorktreeLease, WorktreeLeaseState};
 use super::pools::{self, Pool};
-use super::{area_directory, clone_path, tree_path};
+use super::{area_directory, clone_path, tree_path, warm};
 use crate::area::Area;
 use crate::error::{Error, ErrorKind, Result};
 use crate::hold::Mode;
@@ -54,7 +54,7 @@ pub(crate) fn give_back(
     barge.core.ensure_writable()?;
     let state = barge.core.state.root();
     let _lock = barge.core.state.lock()?;
-    let mut lease = leases::read_lease(state, lease_id)?
+    let lease = leases::read_lease(state, lease_id)?
         .ok_or_else(|| Error::not_found(format!("no lease {lease_id}")))?;
     if let Some(request) = request {
         if request != lease.request {
@@ -81,7 +81,26 @@ pub(crate) fn give_back(
     let area = barge
         .declared_pool_area(pool)?
         .ok_or_else(|| Error::unknown_state(format!("pool {} has no area", lease.pool)))?;
-    let directory = area_directory(&area)?;
+    area_directory(&area)?;
+    let root_id = lease.root_id.clone();
+    reset_lease(barge, &area, pool, lease, disposable)?.ok_or_else(|| {
+        Error::refused(format!(
+            "root {root_id} is held by a process; nothing was returned"
+        ))
+    })
+}
+
+/// Reset a lease under the caller's account lock. An interrupted return uses
+/// the acceptance and outgoing key hashes recorded before its first reset.
+pub(super) fn reset_lease(
+    barge: &Barge,
+    area: &Area,
+    pool: &Pool,
+    mut lease: WorktreeLease,
+    disposable: bool,
+) -> Result<Option<WorktreeReturn>> {
+    let state = barge.core.state.root();
+    let lease_id = &lease.lease_id;
     // The record names the checkout the git calls will run in and clean, so it
     // must be the checkout of the root it reserves, and nothing else.
     let root = area.resolve(&lease.root_id)?;
@@ -95,31 +114,33 @@ pub(crate) fn give_back(
     // Holding the root exclusively fences it: a hold that starts during the
     // return waits for it, and a non-waiting one is refused.
     let Some(_fence) = area.try_hold(&lease.root_id, Mode::Exclusive)? else {
-        return Err(Error::refused(format!(
-            "root {} is held by a process; nothing was returned",
-            lease.root_id
-        )));
+        return Ok(None);
     };
-    let clone = clone_path(&directory);
+    let directory = root
+        .path
+        .parent()
+        .ok_or_else(|| Error::unknown_state("worktree pool root has no area directory"))?;
+    let clone = clone_path(directory);
 
     if lease.state == WorktreeLeaseState::Leased {
         preflight(&tree, &lease.base, pool, disposable)?;
+        warm::record_return(&root.path, &tree, pool)?;
         lease.disposable = disposable;
         lease.state = WorktreeLeaseState::Returning;
         lease.updated_unix_ms = barge.core.clock.now_unix_ms();
         leases::write_lease(state, &lease)?;
     }
 
-    match reset_and_free(&area, pool, &clone, &tree, &lease) {
+    match reset_and_free(area, pool, &clone, &tree, &lease) {
         Ok(head) => {
             lease.state = WorktreeLeaseState::Returned;
             lease.head = head;
             lease.updated_unix_ms = barge.core.clock.now_unix_ms();
             leases::write_lease(state, &lease)?;
-            Ok(WorktreeReturn {
+            Ok(Some(WorktreeReturn {
                 lease,
                 action: ReturnAction::Returned,
-            })
+            }))
         }
         Err(error) => {
             // A failed write leaves `returning`, which the next return resumes
@@ -189,6 +210,7 @@ fn reset_and_free(
     tree: &Path,
     lease: &WorktreeLease,
 ) -> Result<String> {
+    git::require_bare(clone)?;
     git::fetch(clone)?;
     let target = reset_target(clone, lease)?;
     let (warm, disposable_paths) = declared_patterns(pool);

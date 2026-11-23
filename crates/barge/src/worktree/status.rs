@@ -8,8 +8,9 @@ use serde::Serialize;
 
 use super::leases::{self, WorktreeLease};
 use super::pools::{self, Pool};
+use super::{area_directory, clone_path, git};
 use crate::area::Location;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::Barge;
 
 /// One pool's line in the status report.
@@ -50,21 +51,12 @@ pub struct WorktreeRoot {
 pub(crate) fn status(barge: &Barge, repo: Option<&str>) -> Result<Vec<WorktreePool>> {
     let state = barge.core.state.root();
     let pools = pools::read_pools(state)?;
-    let filter = repo.map(pools::canonical_repo).transpose()?;
-    if let Some(identity) = &filter {
-        pools::find_pool(&pools, identity)?;
-    }
+    let selected = pools::select_pools(&pools, repo)?;
     let leases = leases::all_leases(state)?;
-    let mut report = Vec::new();
-    for pool in &pools {
-        if filter
-            .as_ref()
-            .is_none_or(|identity| *identity == pool.repo)
-        {
-            report.push(pool_status(barge, pool, &leases)?);
-        }
-    }
-    Ok(report)
+    selected
+        .into_iter()
+        .map(|pool| pool_status(barge, pool, &leases))
+        .collect()
 }
 
 fn pool_status(barge: &Barge, pool: &Pool, leases: &[WorktreeLease]) -> Result<WorktreePool> {
@@ -106,4 +98,37 @@ fn pool_status(barge: &Barge, pool: &Pool, leases: &[WorktreeLease]) -> Result<W
         });
     }
     Ok(report)
+}
+
+/// A bare clone that doctor could not find or verify.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorktreeCloneProblem {
+    pub repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    pub reason: String,
+}
+
+pub(crate) fn clone_problems(barge: &Barge) -> Result<Vec<WorktreeCloneProblem>> {
+    let mut problems = Vec::new();
+    for pool in pools::read_pools(barge.core.state.root())? {
+        let mut path = None;
+        let check = (|| {
+            let area = barge.declared_pool_area(&pool)?.ok_or_else(|| {
+                Error::not_found("bare clone is missing; the pool area has not been declared")
+            })?;
+            let clone = clone_path(&area_directory(&area)?);
+            let checked = git::check_bare(&clone);
+            path = Some(clone);
+            checked
+        })();
+        if let Err(error) = check {
+            problems.push(WorktreeCloneProblem {
+                repo: pool.repo,
+                path,
+                reason: error.to_string(),
+            });
+        }
+    }
+    Ok(problems)
 }

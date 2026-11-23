@@ -69,7 +69,7 @@ below read `_name`, `_key` and `_state`.
 | `barge.bind-plan/2` | `plan: link-plan` | bind plan |
 | `barge.binding/1` | `action: string`, `binding: binding-record` | bind apply, bind adopt, bind undo |
 | `barge.move/1` | `report: move-report` | move apply |
-| `barge.doctor/1` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]`, `misplaced_areas: [misplaced-area]` | doctor |
+| `barge.doctor/1` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]`, `misplaced_areas: [misplaced-area]`, `worktree_clone_problems?: [worktree-clone-problem]` | doctor |
 | `barge.init/1` | `project: string`, `path: string`, `action: string`, `exclude: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state`, `warnings: [string]` | init |
 | `barge.init-check/1` | `project: string`, `path: string`, `block_state: string`, `exclude: string`, `scratch: string`, `volume_name: string`, `volume_state: volume-state`, `diff: [string]`, `warnings: [string]` | init --check |
 | `barge.machine-discover/1` | `discovered: [discovered-machine]` | machine discover |
@@ -87,6 +87,7 @@ below read `_name`, `_key` and `_state`.
 | `barge.worktree-lease/1` | `lease: worktree-lease` | worktree lease, worktree lease get |
 | `barge.worktree-return/1` | `action: string`, `lease: worktree-lease` | worktree return |
 | `barge.worktree-status/1` | `pools: [worktree-pool]` | worktree status |
+| `barge.worktree-prune/1` | `dry_run: bool`, `worktree_prune: [worktree-prune]` | worktree prune |
 
 ## Error documents
 
@@ -94,7 +95,8 @@ A failing command writes `{"schema": "barge.error/1", "error": {"kind": "...",
 "message": "..."}}` to **stderr** in `--json` mode, and nothing to stdout. Human mode prints a plain error to stderr. `kind`
 is one of `refused`, `not_found`, `usage`, `io`, `unknown_state`,
 `unsupported`. [Architecture](../architecture.md#cli) owns the exit codes each
-kind maps to. `--json` precedes the command and selects the document form. `env` emits
+kind maps to. `--json` precedes the command and selects the document form.
+`worktree prune` also accepts `--json` at the end. `env` emits
 shell assignments and refuses `--json`. A move or bind plan is read from a file
 or from standard input (`-`). Input that cannot be read is `usage`.
 
@@ -132,7 +134,7 @@ or from standard input (`-`). Input that cannot be read is `usage`.
 | `class-folder` | `class: string`, `path: string`, `exists: bool` |
 | `binding-report` | `consumer: string`, `class: string`, `kind: string`, `path: string`, `state: string`, `observed?: string?`, `expected?: string`, `reason?: string` |
 | `misplaced-area` | `area: string`, `recorded: string`, `found: string` |
-| `doctor-report` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]`, `misplaced_areas: [misplaced-area]` |
+| `doctor-report` | `ok: bool`, `volume_reports: [volume-report]`, `binding_reports: [binding-report]`, `misplaced_areas: [misplaced-area]`, `worktree_clone_problems?: [worktree-clone-problem]` |
 | `move-report` | `plan: move-plan`, `doctor: doctor-report?`, `doctor_error: string?` |
 | `move-plan` | `schema: string`, `volume: string`, `volume_spec: volume-spec`, `class: string`, `source: string`, `source_identity: move-identity`, `destination: string`, `destination_parent_identity: move-identity`, `create_directory?: string`, `bindings: [move-binding]`, `unrecorded_links: [unrecorded-link]`, `layout: move-layout?`, `areas: [move-area]`, `consumers: [string]`, `manual_steps: [string]` |
 | `move-identity` | `dev: int`, `ino: int` |
@@ -146,8 +148,10 @@ or from standard input (`-`). Input that cannot be read is `usage`.
 | `paired-client` | `id: string`, `name: string`, `paired_at_unix_ms: int` |
 | `machine-state` | `schema: string`, `power: string`, `observed_at_unix_ms: int`, `pending?: pending`, `machine_id: string`, `mac?: string`, `broadcast?: string`, `tailscale_name?: string`, `tailscale_ip?: string` |
 | `pending` | `action: string`, `deadline_unix_ms: int` |
-| `worktree-lease` | `schema: string`, `lease_id: string`, `request: string`, `repo: string`, `base: string`, `base_name?: string`, `branch: string`, `label?: string`, `pool: string`, `root_id: string`, `path: string`, `head: string`, `state: string`, `disposable: bool`, `created_unix_ms: int`, `updated_unix_ms: int` |
+| `worktree-lease` | `schema: string`, `lease_id: string`, `request: string`, `repo: string`, `base: string`, `base_name?: string`, `branch: string`, `label?: string`, `pool: string`, `root_id: string`, `path: string`, `head: string`, `warm_kept?: [string]`, `warm_removed?: [string]`, `state: string`, `disposable: bool`, `created_unix_ms: int`, `updated_unix_ms: int` |
 | `worktree-pool` | `repo: string`, `pool: string`, `warm: int`, `max: int`, `location?: string`, `unavailable?: string`, `roots: [worktree-root]` |
 | `worktree-root` | `id: string`, `path: string`, `held: bool`, `state: string`, `lease_id?: string`, `request?: string`, `branch?: string` |
+| `worktree-prune` | `repo: string`, `created: int`, `evicted: [string]`, `finished: [string]` |
+| `worktree-clone-problem` | `repo: string`, `path?: string`, `reason: string` |
 
 `doctor` and `init --check` can exit 1 while emitting their success document when they detect drift.

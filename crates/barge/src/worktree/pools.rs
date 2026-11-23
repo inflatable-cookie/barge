@@ -25,8 +25,7 @@ const DEFAULT_WARM: u32 = 2;
 const DEFAULT_MAX: u32 = 6;
 const MAX_SLUG: usize = 64;
 
-/// A folder of ignored dependencies kept between leases. Step 1 keeps it on
-/// return; key-file validation is a later step, so `keys` is parsed and kept.
+/// A folder of ignored dependencies and the key files that determine its validity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WarmPath {
@@ -154,6 +153,14 @@ pub(crate) fn find_pool<'a>(pools: &'a [Pool], repo: &str) -> Result<&'a Pool> {
             "no worktree pool is declared for {repo}; declare it in {POOLS_FILE}"
         ))
     })
+}
+
+/// The requested pool, or all pools when no repository is specified.
+pub(super) fn select_pools<'a>(pools: &'a [Pool], repo: Option<&str>) -> Result<Vec<&'a Pool>> {
+    match repo {
+        Some(repo) => Ok(vec![find_pool(pools, &canonical_repo(repo)?)?]),
+        None => Ok(pools.iter().collect()),
+    }
 }
 
 /// The canonical identity of a repository: scheme, user and `.git` removed,

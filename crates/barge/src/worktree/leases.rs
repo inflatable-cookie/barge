@@ -49,6 +49,11 @@ impl WorktreeLeaseState {
         }
     }
 
+    /// A reset that already passed return preflight and can be resumed.
+    pub(super) fn resumes_return(self) -> bool {
+        matches!(self, Self::Returning | Self::Interrupted)
+    }
+
     /// Whether the lease still reserves its root.
     pub fn reserves_root(self) -> bool {
         !matches!(self, Self::Returned)
@@ -124,6 +129,12 @@ pub struct WorktreeLease {
     pub path: String,
     /// The commit the checkout was verified at when it was leased or returned.
     pub head: String,
+    /// Ignored paths retained at lease after checking their keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warm_kept: Vec<String>,
+    /// Invalid warm paths removed before this lease was handed over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warm_removed: Vec<String>,
     pub state: WorktreeLeaseState,
     /// Whether the return that began this lease's reset accepted commits beyond
     /// base as published, merged or abandoned.
