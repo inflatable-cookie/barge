@@ -219,7 +219,10 @@ mechanic with its own partial-failure handling, and nothing needs it. It refuses
 an absent or different volume, a missing or non-directory source, an existing
 destination, a destination nested with the source, a destination on another
 filesystem, a read-only account, and any held root. It holds the account lock and
-the area lock. It renames first and then writes the declaration; if that write
+the area lock, and it takes every root's hold lock without waiting and keeps them
+until the move ends. A hold that starts during the move finds its lock taken, so
+no consumer gets a root path that the move is about to change. It renames first
+and then writes the declaration; if that write
 fails, it renames back. A crash between the two leaves the folder at the new
 path and the declaration at the old one. Nothing repairs that: `status` reports
 the area's `displaced_at` and `doctor` lists it under `misplaced_areas`, both

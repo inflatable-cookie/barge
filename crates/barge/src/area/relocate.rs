@@ -18,9 +18,10 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use super::{Area, AreaLock, BARGE_DIR, TRASH_DIR};
+use super::{parent, Area, AreaLock, BARGE_DIR, TRASH_DIR};
 use crate::area_spec::{AreaKey, AreaRecord};
 use crate::error::{Error, Result};
+use crate::hold::{self, Mode};
 use crate::root::{read_marker, MarkerRead};
 use crate::volume::VolumeState;
 use crate::Barge;
@@ -32,8 +33,8 @@ const DISPLACED_SEARCH_DEPTH: u32 = 3;
 
 #[cfg(test)]
 thread_local! {
-    /// Runs after the rename and before the declaration is written, so a test can
-    /// make the write fail and check the rename is rolled back.
+    /// Runs with every root locked and before the rename, so a test can try a hold
+    /// during the move. A test can also make the declaration write fail.
     pub(crate) static RELOCATE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
 }
@@ -49,9 +50,11 @@ impl Barge {
     /// the source or the source inside the destination; a destination on another
     /// filesystem; and any root of the area that is held.
     ///
-    /// The account state lock and the area lock are held throughout. If the new
-    /// declaration cannot be written, the folder is renamed back and the write's
-    /// error is returned.
+    /// The account state lock and the area lock are held throughout, and every
+    /// root's hold lock is taken without waiting and kept until the move ends. A
+    /// hold that starts during the move finds its lock taken, so it gets no hold
+    /// on a root the move is about to change. If the new declaration cannot be
+    /// written, the folder is renamed back and the write's error is returned.
     pub fn relocate_area(&self, key: &AreaKey, new_folder: &str) -> Result<AreaRecord> {
         self.core.ensure_writable()?;
         let _state = self.core.state.lock()?;
@@ -124,15 +127,30 @@ impl Barge {
         let area = self.area_from_record(stored.clone())?;
         area.ensure_layout(&source)?;
         let _area_lock = AreaLock::acquire(&source)?;
+        // Locking, not probing, closes the gap between the check and the rename: a
+        // probe releases the lock, so a hold could start right after it. These
+        // locks are declared after the area lock, so they release before it.
+        let mut root_locks = Vec::new();
         for info in area.list_without_bytes()?.roots {
-            if info.held {
+            let directory = parent(&info.path)?;
+            let lock_path = hold::hold_lock_path(&directory, &info.id);
+            let Some(lock) = hold::lock_root_try(&lock_path, Mode::Exclusive)? else {
                 return Err(Error::refused(format!(
                     "root {} in area {} is held; refusing to move the area",
                     info.id,
                     key.label()
                 )));
-            }
+            };
+            root_locks.push(lock);
         }
+
+        #[cfg(test)]
+        RELOCATE_HOOK.with(|hook| {
+            let callback = hook.borrow_mut().take();
+            if let Some(hook) = callback {
+                hook();
+            }
+        });
 
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)
@@ -149,14 +167,6 @@ impl Barge {
                 Error::io("cannot move the area to", &destination, &rename_error)
             }
         })?;
-
-        #[cfg(test)]
-        RELOCATE_HOOK.with(|hook| {
-            let callback = hook.borrow_mut().take();
-            if let Some(hook) = callback {
-                hook();
-            }
-        });
 
         if let Err(write_error) = self.core.state.write_area(&target) {
             return Err(match crate::os::rename_no_replace(&destination, &source) {

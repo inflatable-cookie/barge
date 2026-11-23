@@ -6,8 +6,10 @@ use crate::area_spec::AreaKey;
 use crate::os::FakeOs;
 use crate::testing::TempDir;
 use crate::{AreaSpec, Barge, ErrorKind, ManualClock, Mode, VolumeRegistration};
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 const UUID: &str = "11111111-2222-3333-4444-555555555555";
@@ -285,11 +287,43 @@ fn a_live_hold_on_any_root_refuses_the_move() {
 }
 
 #[test]
+fn a_hold_attempted_during_the_move_is_refused_and_the_root_is_free_after() {
+    let fixture = fixture();
+    let (area, root) = declared_with_root(&fixture);
+    let outcome: Rc<RefCell<Option<(bool, bool)>>> = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&outcome);
+    let during = area.clone();
+    let id = root.id.clone();
+    let attempt: Box<dyn FnOnce()> = Box::new(move || {
+        // Runs with the root locked and before the rename. A hold that reached the
+        // area lock this thread already holds would block forever, so this test
+        // would hang rather than fail if the root were not locked.
+        let shared = during.try_hold(&id, Mode::Shared).unwrap();
+        let exclusive = during.try_hold(&id, Mode::Exclusive).unwrap();
+        *slot.borrow_mut() = Some((shared.is_none(), exclusive.is_none()));
+    });
+    RELOCATE_HOOK.with(|hook| *hook.borrow_mut() = Some(attempt));
+
+    fixture
+        .barge
+        .relocate_area(&pool_key(), "builds/pool")
+        .unwrap();
+
+    assert_eq!(*outcome.borrow(), Some((true, true)));
+    let moved = fixture.barge.find_area("oxide/pool").unwrap();
+    assert!(
+        moved.try_hold(&root.id, Mode::Exclusive).unwrap().is_some(),
+        "the root takes holds again once the move ends"
+    );
+}
+
+#[test]
 fn a_failed_declaration_write_moves_the_folder_back() {
     let fixture = fixture();
     let (_area, root) = declared_with_root(&fixture);
-    // Replace the declaration file with a non-empty folder after the rename, so
-    // publishing the new declaration fails. Reading the old one already happened.
+    // Replace the declaration file with a non-empty folder before the rename, so
+    // publishing the new declaration fails after the rename. Reading the old one
+    // already happened.
     let record_path = fixture.barge.state_dir().join("areas/oxide.pool.json");
     let blocker = record_path.clone();
     let swap: Box<dyn FnOnce()> = Box::new(move || {
