@@ -494,6 +494,81 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_deletion_keeps_the_marker_so_the_next_sweep_finishes_it() {
+        let (_temp, area) = fixture("trash-marker-last");
+        let entry = trashed(&area, "old");
+        let build = entry.join("build");
+        fs::create_dir(&build).unwrap();
+        fs::write(build.join("artifact.bin"), b"artifact").unwrap();
+        let marker = entry.join(MARKER_NAME);
+
+        // A nested-mount stand-in from the seam stops the walk partway, as an
+        // I/O error, a racing writer or a crash would.
+        let removed = Tree::open(&entry)
+            .unwrap()
+            .remove_with(&|path, device| {
+                if path.ends_with("build") {
+                    device + 1
+                } else {
+                    device
+                }
+            })
+            .unwrap();
+
+        assert!(!removed.removed);
+        assert!(
+            marker.exists(),
+            "the marker goes last, so it is still there"
+        );
+        assert!(build.join("artifact.bin").exists());
+
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, entry);
+        assert!(!entry.exists(), "the next sweep finishes the tree");
+    }
+
+    #[test]
+    fn a_claimed_tree_left_part_way_is_finished_by_the_next_sweep() {
+        let (_temp, area) = fixture("trash-claim-marker-last");
+        let entry = trashed(&area, "old");
+        let build = entry.join("build");
+        fs::create_dir(&build).unwrap();
+        fs::write(build.join("artifact.bin"), b"artifact").unwrap();
+        // A sweep claims under the area lock and deletes after it, so a deletion
+        // that stops leaves the claim name behind.
+        let mut claim_name = std::ffi::OsString::from(CLAIM_PREFIX);
+        claim_name.push(entry.file_name().unwrap());
+        let leftover = entry.parent().unwrap().join(claim_name);
+        fs::rename(&entry, &leftover).unwrap();
+
+        let removed = Tree::open(&leftover)
+            .unwrap()
+            .remove_with(&|path, device| {
+                if path.ends_with("build") {
+                    device + 1
+                } else {
+                    device
+                }
+            })
+            .unwrap();
+        assert!(!removed.removed);
+        assert!(
+            leftover.join(MARKER_NAME).exists(),
+            "the claim keeps its marker"
+        );
+
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, leftover);
+        assert!(!leftover.exists(), "the next sweep finishes the claim");
+    }
+
+    #[test]
     fn a_claim_left_by_an_interrupted_sweep_is_swept() {
         let (_temp, area) = fixture("trash-leftover");
         let entry = trashed(&area, "old");
