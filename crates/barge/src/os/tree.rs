@@ -9,16 +9,16 @@
 //! mount for a plain folder, between a check and the step that acts on it.
 //!
 //! A root's marker is removed last, after every other entry and only once
-//! nothing else is left, and it is put back if the empty folder cannot be
-//! removed: everything a walk survives leaves a folder that is still owned trash
-//! the next pass can finish. Only a crash between those last two steps leaves an
-//! empty folder behind.
+//! nothing else is left, so a walk that stops partway leaves a folder that is
+//! still owned trash the next pass can finish. The marker has to go before the
+//! folder can be removed, so a walk stopped at that last step leaves an empty
+//! folder with no marker: [`Tree::remove_if_empty`] reaps exactly that residue,
+//! and never a folder holding an entry.
 
 #![allow(unsafe_code)]
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
-use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -52,6 +52,17 @@ pub(crate) struct TreeSize {
     pub bytes: u64,
     /// True when part of the tree was not counted, so `bytes` is a lower bound.
     pub approximate: bool,
+}
+
+/// What reaping an unmarked, possibly empty folder did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reaped {
+    /// The folder is gone: this call removed it, or another sweep already did.
+    Removed,
+    /// The path no longer names the folder that was opened.
+    Replaced,
+    /// The folder holds an entry, so it is not the residue a deletion leaves.
+    HoldsEntry,
 }
 
 /// A folder opened once, so its ownership, its filesystem and its tree are the
@@ -98,8 +109,33 @@ impl Tree {
         self
     }
 
-    /// Remove this folder and its tree, with the root marker last and put back
-    /// if the empty folder cannot be removed.
+    /// Reap this folder if it holds nothing, and only while the path still names
+    /// the folder that was opened.
+    ///
+    /// `rmdir` is the emptiness test, so the decision and the removal are one
+    /// atomic step: an entry a writer adds, before this call or between it and
+    /// the removal, makes it refuse rather than be deleted.
+    pub(crate) fn remove_if_empty(self) -> Result<Reaped> {
+        let Tree { directory, path } = self;
+        if !names_opened(&directory, &path) {
+            return Ok(Reaped::Replaced);
+        }
+        match std::fs::remove_dir(&path) {
+            Ok(()) => Ok(Reaped::Removed),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Reaped::Removed),
+            // An entry is inside it, so it is not the empty residue a deletion
+            // leaves: it is refused, never emptied.
+            Err(source) if source.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                Ok(Reaped::HoldsEntry)
+            }
+            Err(source) => Err(Error::io("cannot remove", &path, &source)),
+        }
+    }
+
+    /// Remove this folder and its tree, with the root marker last. An
+    /// interruption leaves a folder that still carries the marker, apart from one
+    /// stopped at its last step, which leaves an empty folder for the trash sweep
+    /// to reap.
     pub(crate) fn remove(self) -> Result<Removed> {
         remove_opened(self, &same_device)
     }
@@ -230,8 +266,7 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
     // Every entry but the root's marker goes first: a nested mount, an over-deep
     // tree or a failed step then leaves the marker in place, so the folder is
     // still owned trash rather than a markerless straggler Barge refuses. The
-    // marker itself goes last, and if the empty folder cannot be removed it is
-    // put back.
+    // marker goes last; only the empty folder is left after it.
     let entries =
         read_names(&directory).map_err(|source| Error::io("cannot list", &path, &source))?;
     let mut empty = true;
@@ -252,14 +287,13 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
         removed.skipped.push(path);
         return Ok(removed);
     }
-    // The folder holds nothing but its marker. Read the marker through this
-    // descriptor before unlinking it, so the last step can put it back.
-    let marker_path = path.join(marker);
-    let restore = read_marker(&directory);
+    // The folder holds nothing but its marker, and the marker has to go before
+    // the folder can: what is left if this step stops is an empty folder, which
+    // the trash sweep reaps.
     if !remove_child(
         &directory,
         marker,
-        &marker_path,
+        &path.join(marker),
         root_device,
         0,
         device,
@@ -269,66 +303,14 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
         return Ok(removed);
     }
     // Remove the empty folder only while the path still names the folder this
-    // walk was opened on, checked immediately before the removal. A folder that
-    // moved or was replaced gets its marker back and stays owned trash.
+    // walk was opened on, checked immediately before the removal.
     if !names_opened(&directory, &path) {
-        put_back(&directory, restore.as_deref());
         removed.skipped.push(path);
         return Ok(removed);
     }
-    match std::fs::remove_dir(&path) {
-        Ok(()) => {
-            removed.removed = true;
-            Ok(removed)
-        }
-        Err(source) => {
-            // A racing writer's entry, a read-only parent or an I/O failure: the
-            // folder stays, so the marker goes back and it is still owned trash.
-            put_back(&directory, restore.as_deref());
-            Err(Error::io("cannot remove", &path, &source))
-        }
-    }
-}
-
-/// The marker's bytes, read through the opened folder, so the last step can put
-/// it back. `None` when there is no readable regular marker to restore.
-fn read_marker(directory: &File) -> Option<Vec<u8>> {
-    let mut file = super::open_marker_at(directory, MARKER_NAME).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    Some(bytes)
-}
-
-/// Put the marker back into the opened folder, so a folder whose empty removal
-/// failed is still owned trash rather than a markerless straggler. Best effort:
-/// the caller reports the failure it did see, and a marker a racing writer has
-/// already published is left alone.
-fn put_back(directory: &File, marker: Option<&[u8]>) {
-    let Some(bytes) = marker else {
-        return;
-    };
-    let Ok(name) = CString::new(MARKER_NAME) else {
-        return;
-    };
-    // SAFETY: `openat` takes a descriptor this process holds and a
-    // NUL-terminated name; a successful call returns a new descriptor.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o644,
-        )
-    };
-    if fd < 0 {
-        return;
-    }
-    // SAFETY: `openat` returned a descriptor nothing else owns.
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let _ = file.write_all(bytes);
+    std::fs::remove_dir(&path).map_err(|source| Error::io("cannot remove", &path, &source))?;
+    removed.removed = true;
+    Ok(removed)
 }
 
 /// Whether the path still names the folder this walk was opened on.
@@ -825,10 +807,9 @@ mod tests {
             "the replacement was never walked"
         );
         assert!(!held.join("owned.bin").exists(), "the opened tree was");
-        assert_eq!(
-            crate::root::read_marker(&held),
-            crate::root::MarkerRead::Valid(marker("0123456789abcdef")),
-            "a folder that moved gets its marker back, so it is still owned trash"
+        assert!(
+            held.is_dir() && std::fs::read_dir(&held).unwrap().next().is_none(),
+            "the folder that moved is left empty and is reaped by the trash sweep"
         );
     }
 
@@ -845,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn a_final_removal_that_fails_puts_the_marker_back() {
+    fn a_final_step_that_cannot_remove_the_folder_leaves_an_empty_folder() {
         if crate::os::running_as_root() {
             // Root ignores the mode that makes the last step fail.
             return;
@@ -865,17 +846,64 @@ mod tests {
         allow_writes(&trash);
         assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
         assert!(!root.join("build").exists(), "the tree was walked");
-        assert_eq!(
-            crate::root::read_marker(&root),
-            crate::root::MarkerRead::Valid(marker("0123456789abcdef")),
-            "the marker is put back, so the folder is still owned trash"
+        assert!(
+            !root.join(crate::root::MARKER_NAME).exists(),
+            "the marker went before the folder, so the last step leaves no marker"
+        );
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "and nothing else: the residue is only ever an empty folder"
         );
 
-        // The next pass finishes what the failure left.
-        let removed = Tree::open(&root).unwrap().remove().unwrap();
-        assert!(removed.removed);
-        assert!(!removed.skipped.contains(&root));
+        // That residue is exactly what the trash sweep reaps.
+        assert_eq!(
+            Tree::open(&root).unwrap().remove_if_empty().unwrap(),
+            Reaped::Removed
+        );
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn an_empty_folder_is_reaped_but_a_filled_one_is_never_emptied() {
+        let temp = crate::testing::TempDir::new("tree-reap").unwrap();
+        let empty = temp.folder("empty-leftover").unwrap();
+        assert_eq!(
+            Tree::open(&empty).unwrap().remove_if_empty().unwrap(),
+            Reaped::Removed
+        );
+        assert!(!empty.exists());
+
+        let filled = temp.folder("filled-leftover").unwrap();
+        std::fs::write(filled.join("keep.txt"), b"keep").unwrap();
+        assert_eq!(
+            Tree::open(&filled).unwrap().remove_if_empty().unwrap(),
+            Reaped::HoldsEntry,
+            "a folder holding an entry is not the residue"
+        );
+        assert!(filled.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn a_reaped_folder_is_the_one_that_was_opened() {
+        let temp = crate::testing::TempDir::new("tree-reap-moved").unwrap();
+        let path = temp.folder("leftover").unwrap();
+        let tree = Tree::open(&path).unwrap();
+        // A replacement at the path after the open, as a racing writer does.
+        let held = temp.path().join("held");
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("replacement.bin"), b"keep me").unwrap();
+
+        assert_eq!(
+            tree.remove_if_empty().unwrap(),
+            Reaped::Replaced,
+            "another folder is at the path now"
+        );
+        assert!(path.join("replacement.bin").exists());
+        assert!(
+            held.is_dir(),
+            "the folder that moved was not removed by path"
+        );
     }
 
     #[test]

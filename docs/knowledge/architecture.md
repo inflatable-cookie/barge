@@ -51,16 +51,18 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   the path after it is opened is never walked. Measuring a root uses the same
   walk, holds the same boundary and stops at the same depth. A trash entry is
   deleted only when its marker still matches the area; being inside `.trash/`
-  is not enough.
+  is not enough. The one folder without a marker a sweep removes is the empty
+  one a deletion's own last step can leave, and the `rmdir` that removes it is
+  also the test that it is empty, so a folder holding any entry is kept.
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
   the next prune or sweep removes. A deletion removes the root's marker last,
-  after every other entry, and puts it back if the empty folder cannot be
-  removed, so what it leaves behind is still owned trash the next pass finishes;
-  only a crash between those last two steps leaves an empty folder. The area
-  lock is released after the rename, before deletion, so holds and other area
-  operations can continue. A sweep does the same: under that lock it lists the
-  trash and claims what it will delete, renaming the entry to
+  after every other entry, so one that stops partway leaves a folder that still
+  carries it; stopped at its last step it leaves an empty folder, which a sweep
+  reaps. A folder a writer puts an entry back into is kept and reported, never
+  emptied. The area lock is released after the rename, before deletion, so holds
+  and other area operations can continue. A sweep does the same: under that lock
+  it lists the trash and claims what it will delete, renaming the entry to
   `.barge-claim-<name>` and locking the folder it opened, then releases the lock
   to walk the tree. A claim a crash leaves behind is finished by a later sweep; a
   claim locked by a live deletion is left alone, so no tree is deleted or counted
