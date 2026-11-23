@@ -9,11 +9,12 @@
 //! mount for a plain folder, between a check and the step that acts on it.
 //!
 //! A root's marker is removed last, after every other entry and only once
-//! nothing else is left, so a walk that stops partway leaves a folder that is
+//! nothing else is left, so a walk that stops before that leaves a folder that is
 //! still owned trash the next pass can finish. The marker has to go before the
 //! folder can be removed, so a walk stopped at that last step leaves an empty
 //! folder with no marker: [`Tree::remove_if_empty`] reaps exactly that residue,
-//! and never a folder holding an entry.
+//! and never a folder holding an entry — a writer that refills it leaves
+//! markerless trash, which the sweep refuses and reports.
 
 #![allow(unsafe_code)]
 
@@ -133,9 +134,9 @@ impl Tree {
     }
 
     /// Remove this folder and its tree, with the root marker last. An
-    /// interruption leaves a folder that still carries the marker, apart from one
-    /// stopped at its last step, which leaves an empty folder for the trash sweep
-    /// to reap.
+    /// interruption before its last step leaves a folder that still carries the
+    /// marker; stopped at its last step it leaves an empty folder, for the trash
+    /// sweep to reap.
     pub(crate) fn remove(self) -> Result<Removed> {
         remove_opened(self, &same_device)
     }

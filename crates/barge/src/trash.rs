@@ -18,8 +18,9 @@
 //! A deletion removes a root's marker last, so the only folder it can leave with
 //! no marker is the empty one its own last step could not remove. A sweep reaps
 //! exactly that residue — the `rmdir` that removes it is also the test that it is
-//! empty — and keeps every other folder without a marker, so nothing Barge did
-//! not write is ever emptied.
+//! empty — and keeps every other folder without a marker. A writer that ignores
+//! the hold and refills an emptied folder therefore leaves markerless trash, which
+//! Barge refuses and reports rather than empties.
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -39,18 +40,10 @@ enum Opened {
     /// The marker names this area (and root ID, when one was required).
     Owned(Tree),
     /// The folder holds no marker at all: Barge did not write it, so only the
-    /// empty residue an interrupted deletion leaves may be reaped from it.
+    /// empty residue a deletion leaves may be reaped from it.
     Unmarked(Tree),
     /// The folder is not Barge's to delete, with the reason to report.
     Refused(String),
-}
-
-/// The reason a folder carrying no marker is not deleted.
-fn no_marker(path: &Path) -> String {
-    format!(
-        "refusing to delete {}: it has no {MARKER_NAME}",
-        path.display()
-    )
 }
 
 /// Open a folder and read its marker through the descriptor the removal then
@@ -112,8 +105,14 @@ pub(crate) fn remove_evicted_tree(path: &Path, area: &str, id: &str) -> Result<R
 fn remove_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Removed> {
     match open_owned(path, area, id)? {
         Opened::Owned(tree) => tree.remove(),
-        // An eviction deletes the root it evicted, and that root had a marker.
-        Opened::Unmarked(_) => Err(Error::refused(no_marker(path))),
+        // An eviction deletes the root it evicted, which carried a marker, so a
+        // folder without one is not the entry it renamed: it is refused here and
+        // the next sweep decides. An eviction that stopped leaves its entry in
+        // the trash with its marker, and a sweep covers all of the trash.
+        Opened::Unmarked(_) => Err(Error::refused(format!(
+            "refusing to delete {}: it has no {MARKER_NAME}",
+            path.display()
+        ))),
         Opened::Refused(reason) => Err(Error::refused(reason)),
     }
 }
@@ -182,6 +181,10 @@ impl Area {
     /// lock is released before any tree is deleted, so holds and other area
     /// operations continue while a large tree goes; the only removal under the
     /// lock is an empty leftover's single `rmdir`.
+    ///
+    /// A sweep covers the whole trash, so an eviction that stopped after its
+    /// rename is finished here too: its entry still carries the marker, which is
+    /// what a claim needs.
     pub fn sweep_trash(&self) -> Result<SweepReport> {
         self.core.ensure_writable()?;
         let key = self.key().label();
@@ -291,21 +294,8 @@ fn claim_trash(
             }
             // Deletion removes a root's marker last, so a deletion interrupted at
             // its last step leaves an empty folder with none. That residue is the
-            // only folder without a marker a sweep touches, and `rmdir` is the
-            // emptiness test, so nothing a writer puts inside it is deleted.
-            Opened::Unmarked(tree) => match tree.remove_if_empty() {
-                Ok(Reaped::Removed) => report.deleted.push(SweptRoot { path, bytes: 0 }),
-                Ok(Reaped::Replaced) => {
-                    kept(report, reported_kept, path, "another folder is at its path")
-                }
-                Ok(Reaped::HoldsEntry) => kept(
-                    report,
-                    reported_kept,
-                    path,
-                    &format!("it has no {MARKER_NAME} and is not empty"),
-                ),
-                Err(error) => kept(report, reported_kept, path, error.message()),
-            },
+            // only folder without a marker a sweep touches.
+            Opened::Unmarked(tree) => reap_unmarked(tree, path, report, reported_kept),
             Opened::Refused(reason) => kept(report, reported_kept, path, &reason),
         }
     }
@@ -324,6 +314,29 @@ fn kept(
             path,
             reason: reason.to_string(),
         });
+    }
+}
+
+/// Reap a trash entry that carries no marker: `rmdir` is the emptiness test, so
+/// the folder goes only while it is empty, and everything else is kept. A writer
+/// that refills an emptied folder leaves markerless trash, which is refused here
+/// and reported rather than emptied.
+fn reap_unmarked(
+    tree: Tree,
+    path: PathBuf,
+    report: &mut SweepReport,
+    reported_kept: &mut HashSet<PathBuf>,
+) {
+    match tree.remove_if_empty() {
+        Ok(Reaped::Removed) => report.deleted.push(SweptRoot { path, bytes: 0 }),
+        Ok(Reaped::Replaced) => kept(report, reported_kept, path, "another folder is at its path"),
+        Ok(Reaped::HoldsEntry) => kept(
+            report,
+            reported_kept,
+            path,
+            &format!("it has no {MARKER_NAME} and is not empty"),
+        ),
+        Err(error) => kept(report, reported_kept, path, error.message()),
     }
 }
 
@@ -779,6 +792,41 @@ mod tests {
         assert_eq!(report.kept[0].path, foreign);
         assert!(foreign.is_dir());
         assert_eq!(fs::read_dir(&trash).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_interrupted_eviction_leaves_an_entry_the_next_sweep_finishes() {
+        let (_temp, area) = fixture("trash-interrupted-eviction");
+        let root = area.create_root("old").unwrap();
+        fs::write(root.path.join("artifact.bin"), b"artifact").unwrap();
+        // The delete the eviction runs fails, as an I/O error or a process that
+        // exits would leave it: the entry is already renamed into the trash, with
+        // its marker and everything else it held.
+        FAIL_DELETE.with(|flag| flag.set(true));
+
+        let error = area.evict(&root.id).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
+        let entry = root
+            .path
+            .parent()
+            .unwrap()
+            .join(TRASH_DIR)
+            .join(&root.folder);
+        assert!(
+            entry.join(MARKER_NAME).exists(),
+            "the entry keeps its marker"
+        );
+        assert!(entry.join("artifact.bin").exists());
+
+        // A sweep covers the whole trash, so it finishes what the eviction left,
+        // without the eviction path needing a markerless case of its own.
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, entry);
+        assert!(!entry.exists());
     }
 
     #[test]

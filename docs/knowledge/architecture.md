@@ -57,12 +57,13 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
   the next prune or sweep removes. A deletion removes the root's marker last,
-  after every other entry, so one that stops partway leaves a folder that still
-  carries it; stopped at its last step it leaves an empty folder, which a sweep
-  reaps. A folder a writer puts an entry back into is kept and reported, never
-  emptied. The area lock is released after the rename, before deletion, so holds
-  and other area operations can continue. A sweep does the same: under that lock
-  it lists the trash and claims what it will delete, renaming the entry to
+  after every other entry, so one that stops before that leaves a folder that
+  still carries it; stopped at its last step it leaves an empty folder, which a
+  sweep reaps. A writer that ignores the hold and refills an emptied folder
+  leaves markerless trash, which Barge refuses and reports rather than empties.
+  The area lock is released after the rename, before deletion, so holds and other
+  area operations can continue. A sweep does the same: under that lock it lists
+  the trash and claims what it will delete, renaming the entry to
   `.barge-claim-<name>` and locking the folder it opened, then releases the lock
   to walk the tree. A claim a crash leaves behind is finished by a later sweep; a
   claim locked by a live deletion is left alone, so no tree is deleted or counted
