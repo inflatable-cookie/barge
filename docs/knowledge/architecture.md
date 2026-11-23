@@ -51,17 +51,26 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   the path after it is opened is never walked. Measuring a root uses the same
   walk, holds the same boundary and stops at the same depth. A trash entry is
   deleted only when its marker still matches the area; being inside `.trash/`
-  is not enough.
+  is not enough. The one folder without a marker a sweep removes is the empty
+  one a deletion's own last step can leave, and only while no deletion holds it:
+  the `rmdir` that removes it is also the test that it is empty, so a folder
+  holding any entry is kept.
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
-  the next prune or sweep removes. The area lock is released after the rename,
-  before deletion, so holds and other area operations can continue. A sweep does
-  the same: under that lock it lists the trash and claims what it will delete,
-  renaming the entry to `.barge-claim-<name>` and locking the folder it opened,
-  then releases the lock to walk the tree. A claim a crash leaves behind is
-  finished by a later sweep; a claim locked by a live deletion is left alone, so
-  no tree is deleted or counted twice and a large delete never stalls a hold. No
-  journal is needed.
+  the next prune or sweep removes. A deletion removes the root's marker last,
+  after every other entry, so one that stops before that leaves a folder that
+  still carries it; stopped at its last step it leaves an empty folder, which a
+  sweep reaps. A writer that ignores the hold and refills an emptied folder
+  leaves markerless trash, which Barge refuses and reports rather than empties.
+  The area lock is released after the rename, before deletion, so holds and other
+  area operations can continue. A sweep does the same: under that lock it lists
+  the trash and claims what it will delete, renaming the entry to
+  `.barge-claim-<name>` and locking the folder it opened, then releases the lock
+  to walk the tree; an eviction takes that folder's exclusive lock at its rename,
+  under the same area lock, so a sweep treats a live eviction like a live claim.
+  A claim a crash leaves behind is finished by a later sweep; a claim locked by a
+  live deletion is left alone, so no tree is deleted or counted twice and a large
+  delete never stalls a hold. No journal is needed.
 - **Unknown is never safe.** A volume whose identity can't be read, a marker
   that can't be parsed, a lock that can't be tested, or a pin that can't be
   inspected all count as "keep".

@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::hold::Mode;
 
 pub use fake::FakeOs;
-pub(crate) use tree::{measure_tree, Removed, Tree, TreeSize};
+pub(crate) use tree::{measure_tree, Reaped, Removed, Tree, TreeSize};
 
 /// The filesystem and inode an open descriptor names.
 pub(crate) fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {

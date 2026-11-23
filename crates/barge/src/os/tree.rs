@@ -7,6 +7,14 @@
 //! was opened — never from a path or an entry seen a moment earlier. A process
 //! racing inside the tree therefore cannot swap a folder for a symlink, or a
 //! mount for a plain folder, between a check and the step that acts on it.
+//!
+//! A root's marker is removed last, after every other entry and only once
+//! nothing else is left, so a walk that stops before that leaves a folder that is
+//! still owned trash the next pass can finish. The marker has to go before the
+//! folder can be removed, so a walk stopped at that last step leaves an empty
+//! folder with no marker: [`Tree::remove_if_empty`] reaps exactly that residue,
+//! and never a folder holding an entry — a writer that refills it leaves
+//! markerless trash, which the sweep refuses and reports.
 
 #![allow(unsafe_code)]
 
@@ -18,6 +26,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::root::MARKER_NAME;
 
 use super::open_directory;
 
@@ -44,6 +53,17 @@ pub(crate) struct TreeSize {
     pub bytes: u64,
     /// True when part of the tree was not counted, so `bytes` is a lower bound.
     pub approximate: bool,
+}
+
+/// What reaping an unmarked, possibly empty folder did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reaped {
+    /// The folder is gone: this call removed it, or another sweep already did.
+    Removed,
+    /// The path no longer names the folder that was opened.
+    Replaced,
+    /// The folder holds an entry, so it is not the residue a deletion leaves.
+    HoldsEntry,
 }
 
 /// A folder opened once, so its ownership, its filesystem and its tree are the
@@ -90,7 +110,33 @@ impl Tree {
         self
     }
 
-    /// Remove this folder and its tree.
+    /// Reap this folder if it holds nothing, and only while the path still names
+    /// the folder that was opened.
+    ///
+    /// `rmdir` is the emptiness test, so the decision and the removal are one
+    /// atomic step: an entry a writer adds, before this call or between it and
+    /// the removal, makes it refuse rather than be deleted.
+    pub(crate) fn remove_if_empty(self) -> Result<Reaped> {
+        let Tree { directory, path } = self;
+        if !names_opened(&directory, &path) {
+            return Ok(Reaped::Replaced);
+        }
+        match std::fs::remove_dir(&path) {
+            Ok(()) => Ok(Reaped::Removed),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Reaped::Removed),
+            // An entry is inside it, so it is not the empty residue a deletion
+            // leaves: it is refused, never emptied.
+            Err(source) if source.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                Ok(Reaped::HoldsEntry)
+            }
+            Err(source) => Err(Error::io("cannot remove", &path, &source)),
+        }
+    }
+
+    /// Remove this folder and its tree, with the root marker last. An
+    /// interruption before its last step leaves a folder that still carries the
+    /// marker; stopped at its last step it leaves an empty folder, for the trash
+    /// sweep to reap.
     pub(crate) fn remove(self) -> Result<Removed> {
         remove_opened(self, &same_device)
     }
@@ -216,25 +262,64 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
     let Tree { directory, path } = tree;
     let root_device =
         device_of(&directory).map_err(|source| Error::io("cannot inspect", &path, &source))?;
+    let marker = OsStr::new(MARKER_NAME);
     let mut removed = Removed::default();
-    if !remove_contents(&directory, &path, root_device, 0, device, &mut removed)? {
-        // A nested mount or an over-deep tree stays: Barge never reaches across.
+    // Every entry but the root's marker goes first: a nested mount, an over-deep
+    // tree or a failed step then leaves the marker in place, so the folder is
+    // still owned trash rather than a markerless straggler Barge refuses. The
+    // marker goes last; only the empty folder is left after it.
+    let entries =
+        read_names(&directory).map_err(|source| Error::io("cannot list", &path, &source))?;
+    let mut empty = true;
+    for name in entries.iter().filter(|name| name.as_os_str() != marker) {
+        empty &= remove_child(
+            &directory,
+            name,
+            &path.join(name),
+            root_device,
+            0,
+            device,
+            &mut removed,
+        )?;
+    }
+    // Something stayed, so the marker must stay too: the folder is still owned
+    // trash that the next pass can finish.
+    if !empty {
         removed.skipped.push(path);
         return Ok(removed);
     }
-    // The folder is empty. Remove it only while the path still names the folder
-    // this walk was opened on.
-    let current = super::file_identity(&directory)
-        .ok()
-        .zip(super::path_identity(&path).ok().flatten())
-        .is_some_and(|(opened, named)| opened == named);
-    if current {
-        std::fs::remove_dir(&path).map_err(|source| Error::io("cannot remove", &path, &source))?;
-        removed.removed = true;
-    } else {
+    // The folder holds nothing but its marker, and the marker has to go before
+    // the folder can: what is left if this step stops is an empty folder, which
+    // the trash sweep reaps.
+    if !remove_child(
+        &directory,
+        marker,
+        &path.join(marker),
+        root_device,
+        0,
+        device,
+        &mut removed,
+    )? {
         removed.skipped.push(path);
+        return Ok(removed);
     }
+    // Remove the empty folder only while the path still names the folder this
+    // walk was opened on, checked immediately before the removal.
+    if !names_opened(&directory, &path) {
+        removed.skipped.push(path);
+        return Ok(removed);
+    }
+    std::fs::remove_dir(&path).map_err(|source| Error::io("cannot remove", &path, &source))?;
+    removed.removed = true;
     Ok(removed)
+}
+
+/// Whether the path still names the folder this walk was opened on.
+fn names_opened(directory: &File, path: &Path) -> bool {
+    super::file_identity(directory)
+        .ok()
+        .zip(super::path_identity(path).ok().flatten())
+        .is_some_and(|(opened, named)| opened == named)
 }
 
 fn remove_contents(
@@ -620,6 +705,43 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_named_file_below_the_root_is_removed_in_ordinary_order() {
+        let temp = crate::testing::TempDir::new("tree-nested-marker").unwrap();
+        let root = temp.path().join("slot-0123456789abcdef");
+        std::fs::create_dir_all(root.join("build/deep")).unwrap();
+        std::fs::create_dir_all(root.join("mount")).unwrap();
+        crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
+        // A consumer's own files that carry the marker's name are not the root's
+        // marker: only the top-level entry is held back.
+        std::fs::write(root.join("build").join(MARKER_NAME), b"not ours").unwrap();
+        std::fs::write(root.join("build/deep").join(MARKER_NAME), b"nor this one").unwrap();
+
+        // The seam reports a top-level folder as another filesystem, so the walk
+        // stops with the root's marker in place and the rest of the tree walked.
+        let removed = remove_tree_with(&root, &|path, device| {
+            if path.ends_with("mount") {
+                device + 1
+            } else {
+                device
+            }
+        })
+        .unwrap();
+
+        assert!(!removed.removed);
+        assert!(
+            root.join(MARKER_NAME).exists(),
+            "the root's marker is held back"
+        );
+        assert!(
+            !root.join("build").join(MARKER_NAME).exists(),
+            "a deeper file of the same name goes in listing order"
+        );
+        assert!(!root.join("build/deep").join(MARKER_NAME).exists());
+        assert!(!root.join("build").exists());
+        assert!(root.join("mount").is_dir(), "the skipped folder stays");
+    }
+
+    #[test]
     fn a_nested_filesystem_is_skipped_by_the_opened_descriptor() {
         let temp = crate::testing::TempDir::new("tree-device").unwrap();
         let root = temp.path().join("slot-0123456789abcdef");
@@ -628,7 +750,6 @@ mod tests {
         crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
         std::fs::write(nested.join("keep.txt"), b"keep").unwrap();
         std::fs::write(root.join("counted.bin"), vec![b'x'; 8]).unwrap();
-        let marker_bytes = charged(&root.join(crate::root::MARKER_NAME));
         let counted_bytes = charged(&root.join("counted.bin"));
 
         // The fixture cannot mount a second filesystem, so the seam reports one
@@ -652,11 +773,14 @@ mod tests {
         assert!(removed.skipped.contains(&root));
         assert!(!removed.removed);
         assert_eq!(
-            removed.bytes,
-            counted_bytes + marker_bytes,
-            "the counted files were removed"
+            removed.bytes, counted_bytes,
+            "only the file that was removed is counted"
         );
         assert!(!root.join("counted.bin").exists());
+        assert!(
+            root.join(crate::root::MARKER_NAME).exists(),
+            "the marker goes last, so a walk that stopped keeps it"
+        );
     }
 
     #[test]
@@ -684,7 +808,103 @@ mod tests {
             "the replacement was never walked"
         );
         assert!(!held.join("owned.bin").exists(), "the opened tree was");
-        assert!(held.is_dir(), "the folder that moved is left empty");
+        assert!(
+            held.is_dir() && std::fs::read_dir(&held).unwrap().next().is_none(),
+            "the folder that moved is left empty and is reaped by the trash sweep"
+        );
+    }
+
+    /// Deny a folder's own removal, which is decided by the mode of its parent,
+    /// while leaving its entries removable.
+    fn deny_parent_writes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    fn allow_writes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_final_step_that_cannot_remove_the_folder_leaves_an_empty_folder() {
+        if crate::os::running_as_root() {
+            // Root ignores the mode that makes the last step fail.
+            return;
+        }
+        let temp = crate::testing::TempDir::new("tree-final-failure").unwrap();
+        let trash = temp.folder("trash").unwrap();
+        let root = trash.join("slot-0123456789abcdef");
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
+        std::fs::write(root.join("build/artifact.bin"), b"artifact").unwrap();
+        // The walk can empty the folder, but its parent refuses the folder's own
+        // removal, so it fails at its very last step.
+        deny_parent_writes(&trash);
+
+        let error = Tree::open(&root).unwrap().remove().unwrap_err();
+
+        allow_writes(&trash);
+        assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
+        assert!(!root.join("build").exists(), "the tree was walked");
+        assert!(
+            !root.join(crate::root::MARKER_NAME).exists(),
+            "the marker went before the folder, so the last step leaves no marker"
+        );
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "and nothing else: the residue is only ever an empty folder"
+        );
+
+        // That residue is exactly what the trash sweep reaps.
+        assert_eq!(
+            Tree::open(&root).unwrap().remove_if_empty().unwrap(),
+            Reaped::Removed
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn an_empty_folder_is_reaped_but_a_filled_one_is_never_emptied() {
+        let temp = crate::testing::TempDir::new("tree-reap").unwrap();
+        let empty = temp.folder("empty-leftover").unwrap();
+        assert_eq!(
+            Tree::open(&empty).unwrap().remove_if_empty().unwrap(),
+            Reaped::Removed
+        );
+        assert!(!empty.exists());
+
+        let filled = temp.folder("filled-leftover").unwrap();
+        std::fs::write(filled.join("keep.txt"), b"keep").unwrap();
+        assert_eq!(
+            Tree::open(&filled).unwrap().remove_if_empty().unwrap(),
+            Reaped::HoldsEntry,
+            "a folder holding an entry is not the residue"
+        );
+        assert!(filled.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn a_reaped_folder_is_the_one_that_was_opened() {
+        let temp = crate::testing::TempDir::new("tree-reap-moved").unwrap();
+        let path = temp.folder("leftover").unwrap();
+        let tree = Tree::open(&path).unwrap();
+        // A replacement at the path after the open, as a racing writer does.
+        let held = temp.path().join("held");
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("replacement.bin"), b"keep me").unwrap();
+
+        assert_eq!(
+            tree.remove_if_empty().unwrap(),
+            Reaped::Replaced,
+            "another folder is at the path now"
+        );
+        assert!(path.join("replacement.bin").exists());
+        assert!(
+            held.is_dir(),
+            "the folder that moved was not removed by path"
+        );
     }
 
     #[test]
@@ -720,6 +940,10 @@ mod tests {
         let error = tree.remove().unwrap_err();
         assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
         assert!(root.join("nested/other.bin").exists());
+        assert!(
+            root.join(crate::root::MARKER_NAME).exists(),
+            "a walk that failed keeps the marker"
+        );
     }
 
     #[test]
@@ -737,15 +961,20 @@ mod tests {
         assert!(!removed.skipped.is_empty(), "the deep tree stays in place");
         assert!(!removed.removed);
         assert!(deepest.is_dir());
+        assert!(
+            root.join(crate::root::MARKER_NAME).exists(),
+            "the folder past the cap keeps the marker that still owns it"
+        );
 
         // Measuring stops at the same cap, so a size never counts a tree the
-        // deletion would refuse to reach.
+        // deletion would refuse to reach: only the marker above the cap, which
+        // the walk kept, is charged.
         let measured = measure_tree(&root);
         assert!(measured.approximate, "an uncounted tree is never exact");
-        assert!(
-            measured.bytes < 32,
-            "the buried file is past the cap: {}",
-            measured.bytes
+        assert_eq!(
+            measured.bytes,
+            charged(&root.join(crate::root::MARKER_NAME)),
+            "the tree past the cap is past the cap for measuring too"
         );
     }
 }

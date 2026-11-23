@@ -13,7 +13,17 @@
 //! releasing the lock, so a large deletion never stalls holds. A claim renames
 //! the entry to [`CLAIM_PREFIX`] plus its name and keeps the exclusive lock on
 //! the folder it opened, so a later sweep finishes a claim an interrupted sweep
-//! left behind and never walks a tree another deletion is walking.
+//! left behind and never walks a tree another deletion is walking. An eviction
+//! takes that same lock on its entry at the rename, under the same area lock, so a
+//! sweep treats a live eviction exactly like a live claim.
+//!
+//! A deletion removes a root's marker last, so the only folder it can leave with
+//! no marker is the empty one its own last step could not remove. A sweep reaps
+//! exactly that residue, under the same exclusive lock a deletion holds, and the
+//! `rmdir` that removes it is also the test that it is empty; every other folder
+//! without a marker is kept. A writer that ignores the hold and refills an emptied
+//! folder therefore leaves markerless trash, which Barge refuses and reports
+//! rather than empties.
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -23,7 +33,7 @@ use std::path::{Path, PathBuf};
 use crate::area::{Area, AreaLock, TRASH_DIR};
 use crate::error::{Error, Result};
 use crate::hold::Mode;
-use crate::os::{Removed, Tree};
+use crate::os::{Reaped, Removed, Tree};
 use crate::root::{read_marker_in, MarkerRead, MARKER_NAME};
 use crate::space::{SkippedRoot, SweepReport, SweptRoot};
 
@@ -32,15 +42,24 @@ use crate::space::{SkippedRoot, SweepReport, SweptRoot};
 enum Opened {
     /// The marker names this area (and root ID, when one was required).
     Owned(Tree),
+    /// The folder holds no marker at all: Barge did not write it, so only the
+    /// empty residue a deletion leaves may be reaped from it.
+    Unmarked(Tree),
     /// The folder is not Barge's to delete, with the reason to report.
     Refused(String),
 }
 
-/// Open a folder and read its marker through the descriptor the removal then
-/// walks, so one read decides ownership and a replacement at the path between the
-/// check and the removal is never walked.
+/// Open a folder and classify it from the marker read through the descriptor the
+/// removal then walks, so one read decides ownership and a replacement at the path
+/// between the check and the removal is never walked.
 fn open_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Opened> {
-    let tree = Tree::open(path)?;
+    Ok(classify(Tree::open(path)?, area, id))
+}
+
+/// Whether a folder already opened for deletion is Barge's, from the marker read
+/// through that same descriptor.
+fn classify(tree: Tree, area: &str, id: Option<&str>) -> Opened {
+    let path = tree.path().to_path_buf();
     // A racing writer may put a different folder at the path now; the walk below
     // still sees the one that was opened.
     #[cfg(test)]
@@ -50,7 +69,7 @@ fn open_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Opened> {
             hook();
         }
     });
-    Ok(match read_marker_in(tree.directory(), tree.path()) {
+    match read_marker_in(tree.directory(), &path) {
         MarkerRead::Valid(marker) if marker.area == area && id.is_none_or(|id| marker.id == id) => {
             Opened::Owned(tree)
         }
@@ -59,19 +78,20 @@ fn open_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Opened> {
             path.display(),
             marker.area
         )),
-        MarkerRead::Missing => Opened::Refused(format!(
-            "refusing to delete {}: it has no {MARKER_NAME}",
-            path.display()
-        )),
+        MarkerRead::Missing => Opened::Unmarked(tree),
         MarkerRead::Invalid(reason) => {
             Opened::Refused(format!("refusing to delete {}: {reason}", path.display()))
         }
-    })
+    }
 }
 
-/// Delete an evicted root's trash entry, which must still name the area and the
-/// root ID.
-pub(crate) fn remove_evicted_tree(path: &Path, area: &str, id: &str) -> Result<Removed> {
+/// Delete an evicted root's trash entry through the folder the eviction opened and
+/// locked at its rename, which must still name the area and the root ID.
+///
+/// The eviction holds that folder's exclusive lock, so the lock, the marker the
+/// ownership is decided from and the walk are all one folder: a sweep treats this
+/// eviction as a live deletion and leaves its entry alone.
+pub(crate) fn remove_evicted_tree(tree: Tree, area: &str, id: &str) -> Result<Removed> {
     #[cfg(test)]
     if FAIL_DELETE.with(|flag| flag.replace(false)) {
         return Err(Error::io_message("injected deletion failure"));
@@ -82,8 +102,9 @@ pub(crate) fn remove_evicted_tree(path: &Path, area: &str, id: &str) -> Result<R
             hook();
         }
     });
-    match remove_owned(path, area, Some(id)) {
-        Err(error) if matches!(fs::symlink_metadata(path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) =>
+    let path = tree.path().to_path_buf();
+    match remove_owned(tree, area, Some(id)) {
+        Err(error) if matches!(fs::symlink_metadata(&path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) =>
         {
             let _ = error;
             Ok(Removed {
@@ -95,9 +116,17 @@ pub(crate) fn remove_evicted_tree(path: &Path, area: &str, id: &str) -> Result<R
     }
 }
 
-fn remove_owned(path: &Path, area: &str, id: Option<&str>) -> Result<Removed> {
-    match open_owned(path, area, id)? {
+fn remove_owned(tree: Tree, area: &str, id: Option<&str>) -> Result<Removed> {
+    match classify(tree, area, id) {
         Opened::Owned(tree) => tree.remove(),
+        // An eviction deletes the root it evicted, which carried a marker, so a
+        // folder without one is not the entry it renamed: it is refused here and
+        // the next sweep decides. An eviction that stopped leaves its entry in
+        // the trash with its marker, and a sweep covers all of the trash.
+        Opened::Unmarked(tree) => Err(Error::refused(format!(
+            "refusing to delete {}: it has no {MARKER_NAME}",
+            tree.path().display()
+        ))),
         Opened::Refused(reason) => Err(Error::refused(reason)),
     }
 }
@@ -157,13 +186,20 @@ thread_local! {
 }
 
 impl Area {
-    /// Delete every owned trash entry of this area.
+    /// Delete every owned trash entry of this area, and reap the empty folder an
+    /// interrupted deletion can leave in its place.
     ///
     /// The area lock is taken to list the trash and to claim what this pass will
-    /// delete: an eviction renames its root into the trash under that same lock,
-    /// so a sweep never deletes an entry whose rename it has not seen finish. The
-    /// lock is released before any tree is deleted, so holds and other area
-    /// operations continue while a large tree goes.
+    /// delete: an eviction renames its root into the trash under that same lock
+    /// and keeps the entry's exclusive lock from then on, so a sweep neither
+    /// deletes an entry whose rename it has not seen finish nor touches one a live
+    /// eviction is still walking. The lock is released before any tree is deleted,
+    /// so holds and other area operations continue while a large tree goes; the
+    /// only removal under the lock is an empty leftover's single `rmdir`.
+    ///
+    /// A sweep covers the whole trash, so an eviction that stopped after its
+    /// rename is finished here too: its entry still carries the marker, which is
+    /// what a claim needs.
     pub fn sweep_trash(&self) -> Result<SweepReport> {
         self.core.ensure_writable()?;
         let key = self.key().label();
@@ -271,6 +307,18 @@ fn claim_trash(
                     path,
                 });
             }
+            // Deletion removes a root's marker last, so a deletion interrupted at
+            // its last step leaves an empty folder with none. That residue is the
+            // only folder without a marker a sweep touches, and it is reaped only
+            // while no deletion holds it: a live one holds this same exclusive
+            // lock between removing its marker and removing the folder.
+            Opened::Unmarked(tree) => {
+                if !crate::os::flock(tree.directory(), Mode::Exclusive, false)? {
+                    kept(report, reported_kept, path, "another sweep is deleting it");
+                    continue;
+                }
+                reap_unmarked(tree, path, report, reported_kept);
+            }
             Opened::Refused(reason) => kept(report, reported_kept, path, &reason),
         }
     }
@@ -289,6 +337,30 @@ fn kept(
             path,
             reason: reason.to_string(),
         });
+    }
+}
+
+/// Reap a trash entry that carries no marker: `rmdir` is the emptiness test, so
+/// the folder goes only while it is empty, and everything else is kept. The
+/// caller holds the entry's exclusive lock, so a deletion walking the same folder
+/// is never reaped underneath it. A writer that refills an emptied folder leaves
+/// markerless trash, which is refused here and reported rather than emptied.
+fn reap_unmarked(
+    tree: Tree,
+    path: PathBuf,
+    report: &mut SweepReport,
+    reported_kept: &mut HashSet<PathBuf>,
+) {
+    match tree.remove_if_empty() {
+        Ok(Reaped::Removed) => report.deleted.push(SweptRoot { path, bytes: 0 }),
+        Ok(Reaped::Replaced) => kept(report, reported_kept, path, "another folder is at its path"),
+        Ok(Reaped::HoldsEntry) => kept(
+            report,
+            reported_kept,
+            path,
+            &format!("it has no {MARKER_NAME} and is not empty"),
+        ),
+        Err(error) => kept(report, reported_kept, path, error.message()),
     }
 }
 
@@ -493,6 +565,292 @@ mod tests {
         assert!(leaves.iter().all(|path| !path.exists()));
     }
 
+    /// Deny a folder's own removal, decided by the mode of its parent, while
+    /// leaving its entries removable.
+    fn deny_parent_writes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    fn allow_writes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_sweep_leaves_a_live_eviction_to_finish_its_own_entry() {
+        let (_temp, area) = fixture("trash-live-eviction");
+        let root = area.create_root("old").unwrap();
+        fs::write(root.path.join("artifact.bin"), b"artifact").unwrap();
+        let trash = root.path.parent().unwrap().join(TRASH_DIR);
+        let entry = trash.join(&root.folder);
+        // The sweep runs while the eviction is inside its deletion: the entry is
+        // renamed into the trash and the eviction holds its exclusive lock, which
+        // it took under the area lock at the rename.
+        let sweep_area = area.clone();
+        let swept = Rc::new(RefCell::new(None));
+        let record = swept.clone();
+        DELETE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                record
+                    .borrow_mut()
+                    .replace(sweep_area.sweep_trash().unwrap());
+            }))
+        });
+
+        let eviction = area.evict(&root.id).unwrap();
+
+        assert!(eviction.deleted, "the eviction finished its own entry");
+        assert!(!entry.exists());
+        assert_eq!(
+            fs::read_dir(&trash).unwrap().count(),
+            0,
+            "the trash holds no claim or leftover"
+        );
+        let swept = swept.borrow_mut().take().expect("the sweep ran");
+        assert!(swept.deleted.is_empty(), "{:#?}", swept.deleted);
+        assert_eq!(swept.kept.len(), 1, "{:#?}", swept.kept);
+        assert_eq!(swept.kept[0].path, entry);
+        assert!(
+            swept.kept[0]
+                .reason
+                .contains("another sweep is deleting it"),
+            "{}",
+            swept.kept[0].reason
+        );
+    }
+
+    #[test]
+    fn a_final_step_that_cannot_remove_the_entry_leaves_it_for_the_next_sweep() {
+        if crate::os::running_as_root() {
+            // Root ignores the mode that makes the last step fail.
+            return;
+        }
+        let (_temp, area) = fixture("trash-final-failure");
+        let entry = trashed(&area, "old");
+        let trash = entry.parent().unwrap().to_path_buf();
+        fs::write(entry.join("artifact.bin"), b"artifact").unwrap();
+        let marker = match crate::root::read_marker(&entry) {
+            crate::root::MarkerRead::Valid(marker) => marker,
+            other => panic!("the fixture has an owned marker: {other:?}"),
+        };
+        // The entry's own contents can go, but the trash refuses the entry's own
+        // removal, so the deletion fails at its last step with the marker gone.
+        deny_parent_writes(&trash);
+
+        let error =
+            remove_evicted_tree(Tree::open(&entry).unwrap(), "test/area", &marker.id).unwrap_err();
+
+        allow_writes(&trash);
+        assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
+        assert!(!entry.join("artifact.bin").exists(), "the tree was walked");
+        assert!(
+            !entry.join(MARKER_NAME).exists() && fs::read_dir(&entry).unwrap().next().is_none(),
+            "the last step leaves an empty folder with no marker"
+        );
+
+        // That empty residue is what the next sweep reaps, so it does not stay in
+        // the trash as a folder no pass can claim.
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, entry);
+        assert_eq!(report.deleted[0].bytes, 0);
+        assert!(!entry.exists(), "the next sweep reaps the residue");
+    }
+
+    /// A trash folder with nothing in it, for the leftovers a deletion can leave.
+    fn empty_trash(area: &Area) -> PathBuf {
+        let trash = trashed(area, "old").parent().unwrap().to_path_buf();
+        // The fixture's own entry is not part of the case.
+        for entry in fs::read_dir(&trash).unwrap() {
+            fs::remove_dir_all(entry.unwrap().path()).unwrap();
+        }
+        trash
+    }
+
+    #[test]
+    fn an_empty_leftover_is_reaped_but_a_filled_one_is_kept() {
+        let (_temp, area) = fixture("trash-reap");
+        let trash = empty_trash(&area);
+        // The residue of an interrupted deletion, including a claim an
+        // interrupted sweep left: both are empty and carry no marker.
+        let plain = trash.join("slot-0123456789abcdef");
+        fs::create_dir(&plain).unwrap();
+        let mut claim_name = OsString::from(CLAIM_PREFIX);
+        claim_name.push("slot-fedcba9876543210");
+        let claimed = trash.join(claim_name);
+        fs::create_dir(&claimed).unwrap();
+        // A folder Barge did not write, holding an entry: never emptied.
+        let filled = trash.join("slot-1111111111111111");
+        fs::create_dir(&filled).unwrap();
+        fs::write(filled.join("consumer.bin"), b"consumer").unwrap();
+
+        let report = area.sweep_trash().unwrap();
+
+        let mut reaped: Vec<PathBuf> = report.deleted.iter().map(|s| s.path.clone()).collect();
+        reaped.sort();
+        assert_eq!(reaped, vec![claimed, plain]);
+        assert!(report.deleted.iter().all(|swept| swept.bytes == 0));
+        assert_eq!(report.kept.len(), 1, "{:#?}", report.kept);
+        assert_eq!(report.kept[0].path, filled);
+        assert!(
+            report.kept[0].reason.contains("is not empty"),
+            "{}",
+            report.kept[0].reason
+        );
+        assert!(filled.join("consumer.bin").exists(), "its entry survives");
+    }
+
+    #[test]
+    fn a_leftover_is_reaped_only_once_no_deletion_holds_it() {
+        let (_temp, area) = fixture("trash-reap-locked");
+        let trash = empty_trash(&area);
+        let leftover = trash.join("slot-0123456789abcdef");
+        fs::create_dir(&leftover).unwrap();
+        // A live deletion holds the entry's exclusive lock between removing its
+        // marker and removing the folder, so another sweep must not reap from
+        // under it.
+        let held = crate::os::open_directory(&leftover).unwrap();
+        assert!(crate::os::flock(&held, Mode::Exclusive, false).unwrap());
+
+        let busy = area.sweep_trash().unwrap();
+
+        assert!(leftover.is_dir(), "the held folder is left alone");
+        assert!(busy.deleted.is_empty(), "{:#?}", busy.deleted);
+        assert_eq!(busy.kept.len(), 1, "{:#?}", busy.kept);
+        assert!(
+            busy.kept[0].reason.contains("another sweep is deleting it"),
+            "{}",
+            busy.kept[0].reason
+        );
+
+        // That deletion released it without finishing, so the next sweep reaps it.
+        drop(held);
+
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, leftover);
+        assert_eq!(report.deleted[0].bytes, 0);
+        assert!(!leftover.exists(), "the released leftover is reaped");
+    }
+
+    #[test]
+    fn a_leftover_whose_path_changed_is_not_reaped() {
+        let (_temp, area) = fixture("trash-reap-moved");
+        let trash = empty_trash(&area);
+        let leftover = trash.join("slot-0123456789abcdef");
+        fs::create_dir(&leftover).unwrap();
+        let moved = trash.join("moved");
+        // Between opening the entry and reaping it, a racing writer moves it and
+        // leaves a folder of its own, with an entry, at the path.
+        let hook_leftover = leftover.clone();
+        let hook_moved = moved.clone();
+        OPEN_TREE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&hook_leftover, &hook_moved).unwrap();
+                fs::create_dir(&hook_leftover).unwrap();
+                fs::write(hook_leftover.join("replacement.bin"), b"keep me").unwrap();
+            }))
+        });
+
+        let report = area.sweep_trash().unwrap();
+
+        assert!(
+            leftover.join("replacement.bin").exists(),
+            "the folder at the path was never reaped"
+        );
+        assert!(moved.is_dir(), "the entry that was opened stays put");
+        assert!(report.deleted.is_empty(), "{:#?}", report.deleted);
+        assert_eq!(report.kept.len(), 1, "{:#?}", report.kept);
+        assert_eq!(report.kept[0].path, leftover);
+        assert!(
+            report.kept[0]
+                .reason
+                .contains("another folder is at its path"),
+            "{}",
+            report.kept[0].reason
+        );
+    }
+
+    #[test]
+    fn an_interrupted_deletion_keeps_the_marker_so_the_next_sweep_finishes_it() {
+        let (_temp, area) = fixture("trash-marker-last");
+        let entry = trashed(&area, "old");
+        let build = entry.join("build");
+        fs::create_dir(&build).unwrap();
+        fs::write(build.join("artifact.bin"), b"artifact").unwrap();
+        let marker = entry.join(MARKER_NAME);
+
+        // A nested-mount stand-in from the seam stops the walk partway, as an
+        // I/O error, a racing writer or a crash would.
+        let removed = Tree::open(&entry)
+            .unwrap()
+            .remove_with(&|path, device| {
+                if path.ends_with("build") {
+                    device + 1
+                } else {
+                    device
+                }
+            })
+            .unwrap();
+
+        assert!(!removed.removed);
+        assert!(
+            marker.exists(),
+            "the marker goes last, so it is still there"
+        );
+        assert!(build.join("artifact.bin").exists());
+
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, entry);
+        assert!(!entry.exists(), "the next sweep finishes the tree");
+    }
+
+    #[test]
+    fn a_claimed_tree_left_part_way_is_finished_by_the_next_sweep() {
+        let (_temp, area) = fixture("trash-claim-marker-last");
+        let entry = trashed(&area, "old");
+        let build = entry.join("build");
+        fs::create_dir(&build).unwrap();
+        fs::write(build.join("artifact.bin"), b"artifact").unwrap();
+        // A sweep claims under the area lock and deletes after it, so a deletion
+        // that stops leaves the claim name behind.
+        let mut claim_name = std::ffi::OsString::from(CLAIM_PREFIX);
+        claim_name.push(entry.file_name().unwrap());
+        let leftover = entry.parent().unwrap().join(claim_name);
+        fs::rename(&entry, &leftover).unwrap();
+
+        let removed = Tree::open(&leftover)
+            .unwrap()
+            .remove_with(&|path, device| {
+                if path.ends_with("build") {
+                    device + 1
+                } else {
+                    device
+                }
+            })
+            .unwrap();
+        assert!(!removed.removed);
+        assert!(
+            leftover.join(MARKER_NAME).exists(),
+            "the claim keeps its marker"
+        );
+
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, leftover);
+        assert!(!leftover.exists(), "the next sweep finishes the claim");
+    }
+
     #[test]
     fn a_claim_left_by_an_interrupted_sweep_is_swept() {
         let (_temp, area) = fixture("trash-leftover");
@@ -540,6 +898,41 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_eviction_leaves_an_entry_the_next_sweep_finishes() {
+        let (_temp, area) = fixture("trash-interrupted-eviction");
+        let root = area.create_root("old").unwrap();
+        fs::write(root.path.join("artifact.bin"), b"artifact").unwrap();
+        // The delete the eviction runs fails, as an I/O error or a process that
+        // exits would leave it: the entry is already renamed into the trash, with
+        // its marker and everything else it held.
+        FAIL_DELETE.with(|flag| flag.set(true));
+
+        let error = area.evict(&root.id).unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
+        let entry = root
+            .path
+            .parent()
+            .unwrap()
+            .join(TRASH_DIR)
+            .join(&root.folder);
+        assert!(
+            entry.join(MARKER_NAME).exists(),
+            "the entry keeps its marker"
+        );
+        assert!(entry.join("artifact.bin").exists());
+
+        // A sweep covers the whole trash, so it finishes what the eviction left,
+        // without the eviction path needing a markerless case of its own.
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, entry);
+        assert!(!entry.exists());
+    }
+
+    #[test]
     fn readdir_failure_is_reported() {
         use std::sync::Arc;
         let temp = crate::testing::TempDir::new("trash-read").unwrap();
@@ -579,7 +972,9 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         fs::write(root.join("file.txt"), b"data").unwrap();
 
-        let deletion = remove_evicted_tree(&root, "test/area", "0123456789abcdef").unwrap();
+        let deletion =
+            remove_evicted_tree(Tree::open(&root).unwrap(), "test/area", "0123456789abcdef")
+                .unwrap();
 
         assert!(deletion.bytes >= 4, "the file's bytes are counted");
         assert!(deletion.skipped.is_empty());
@@ -610,7 +1005,9 @@ mod tests {
             }))
         });
 
-        let deletion = remove_evicted_tree(&entry, "test/area", "0123456789abcdef").unwrap();
+        let deletion =
+            remove_evicted_tree(Tree::open(&entry).unwrap(), "test/area", "0123456789abcdef")
+                .unwrap();
 
         assert!(
             entry.join("replacement.bin").exists(),
@@ -632,7 +1029,7 @@ mod tests {
         let root = temp.path().join("root");
         fs::create_dir(&root).unwrap();
         crate::root::write_marker(&root, &marker("replacement")).unwrap();
-        assert!(remove_evicted_tree(&root, "test/area", "original").is_err());
+        assert!(remove_evicted_tree(Tree::open(&root).unwrap(), "test/area", "original").is_err());
         assert!(root.exists());
     }
 
@@ -655,7 +1052,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = remove_evicted_tree(&root, "test/area", "0123456789abcdef").unwrap_err();
+        let error =
+            remove_evicted_tree(Tree::open(&root).unwrap(), "test/area", "0123456789abcdef")
+                .unwrap_err();
 
         assert_eq!(error.kind(), crate::error::ErrorKind::Refused);
         assert!(root.exists());
