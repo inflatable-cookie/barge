@@ -17,10 +17,11 @@
 //!
 //! A deletion removes a root's marker last, so the only folder it can leave with
 //! no marker is the empty one its own last step could not remove. A sweep reaps
-//! exactly that residue — the `rmdir` that removes it is also the test that it is
-//! empty — and keeps every other folder without a marker. A writer that ignores
-//! the hold and refills an emptied folder therefore leaves markerless trash, which
-//! Barge refuses and reports rather than empties.
+//! exactly that residue, under the same exclusive lock a deletion holds, and the
+//! `rmdir` that removes it is also the test that it is empty; every other folder
+//! without a marker is kept. A writer that ignores the hold and refills an emptied
+//! folder therefore leaves markerless trash, which Barge refuses and reports
+//! rather than empties.
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -294,8 +295,16 @@ fn claim_trash(
             }
             // Deletion removes a root's marker last, so a deletion interrupted at
             // its last step leaves an empty folder with none. That residue is the
-            // only folder without a marker a sweep touches.
-            Opened::Unmarked(tree) => reap_unmarked(tree, path, report, reported_kept),
+            // only folder without a marker a sweep touches, and it is reaped only
+            // while no deletion holds it: a live one holds this same exclusive
+            // lock between removing its marker and removing the folder.
+            Opened::Unmarked(tree) => {
+                if !crate::os::flock(tree.directory(), Mode::Exclusive, false)? {
+                    kept(report, reported_kept, path, "another sweep is deleting it");
+                    continue;
+                }
+                reap_unmarked(tree, path, report, reported_kept);
+            }
             Opened::Refused(reason) => kept(report, reported_kept, path, &reason),
         }
     }
@@ -318,9 +327,10 @@ fn kept(
 }
 
 /// Reap a trash entry that carries no marker: `rmdir` is the emptiness test, so
-/// the folder goes only while it is empty, and everything else is kept. A writer
-/// that refills an emptied folder leaves markerless trash, which is refused here
-/// and reported rather than emptied.
+/// the folder goes only while it is empty, and everything else is kept. The
+/// caller holds the entry's exclusive lock, so a deletion walking the same folder
+/// is never reaped underneath it. A writer that refills an emptied folder leaves
+/// markerless trash, which is refused here and reported rather than emptied.
 fn reap_unmarked(
     tree: Tree,
     path: PathBuf,
@@ -633,6 +643,41 @@ mod tests {
             report.kept[0].reason
         );
         assert!(filled.join("consumer.bin").exists(), "its entry survives");
+    }
+
+    #[test]
+    fn a_leftover_is_reaped_only_once_no_deletion_holds_it() {
+        let (_temp, area) = fixture("trash-reap-locked");
+        let trash = empty_trash(&area);
+        let leftover = trash.join("slot-0123456789abcdef");
+        fs::create_dir(&leftover).unwrap();
+        // A live deletion holds the entry's exclusive lock between removing its
+        // marker and removing the folder, so another sweep must not reap from
+        // under it.
+        let held = crate::os::open_directory(&leftover).unwrap();
+        assert!(crate::os::flock(&held, Mode::Exclusive, false).unwrap());
+
+        let busy = area.sweep_trash().unwrap();
+
+        assert!(leftover.is_dir(), "the held folder is left alone");
+        assert!(busy.deleted.is_empty(), "{:#?}", busy.deleted);
+        assert_eq!(busy.kept.len(), 1, "{:#?}", busy.kept);
+        assert!(
+            busy.kept[0].reason.contains("another sweep is deleting it"),
+            "{}",
+            busy.kept[0].reason
+        );
+
+        // That deletion released it without finishing, so the next sweep reaps it.
+        drop(held);
+
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, leftover);
+        assert_eq!(report.deleted[0].bytes, 0);
+        assert!(!leftover.exists(), "the released leftover is reaped");
     }
 
     #[test]

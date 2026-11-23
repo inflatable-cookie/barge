@@ -52,8 +52,9 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   walk, holds the same boundary and stops at the same depth. A trash entry is
   deleted only when its marker still matches the area; being inside `.trash/`
   is not enough. The one folder without a marker a sweep removes is the empty
-  one a deletion's own last step can leave, and the `rmdir` that removes it is
-  also the test that it is empty, so a folder holding any entry is kept.
+  one a deletion's own last step can leave, and only while no deletion holds it:
+  the `rmdir` that removes it is also the test that it is empty, so a folder
+  holding any entry is kept.
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
   the next prune or sweep removes. A deletion removes the root's marker last,
