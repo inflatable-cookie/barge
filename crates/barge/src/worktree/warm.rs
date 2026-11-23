@@ -40,9 +40,14 @@ pub(super) fn record_return(root: &Path, tree: &Path, pool: &Pool) -> Result<()>
     {
         return Ok(());
     }
+    let recorded = hashes(tree, pool)?;
+    let present = real_warm_paths(tree, pool)?;
     let record = Record {
         schema: SCHEMA.to_string(),
-        hashes: hashes(tree, pool)?,
+        hashes: recorded
+            .into_iter()
+            .filter(|(path, _)| present.contains(path))
+            .collect(),
     };
     write_record(root, &record)
 }
@@ -51,8 +56,8 @@ pub(super) fn record_return(root: &Path, tree: &Path, pool: &Pool) -> Result<()>
 /// Whether the root carries a warm-path snapshot from a previous return.
 /// Lease prefers such roots: their dependency folders are likeliest to still
 /// match the current lockfiles. A missing file simply reads as cold.
-pub(super) fn has_record(root: &Path) -> bool {
-    root.join(RECORD).is_file()
+pub(super) fn has_record(root: &Path) -> Result<bool> {
+    Ok(!read_record(root)?.hashes.is_empty())
 }
 
 pub(super) fn candidates(tree: &Path, pool: &Pool) -> Result<BTreeSet<String>> {
@@ -175,6 +180,67 @@ fn hashes(tree: &Path, pool: &Pool) -> Result<BTreeMap<String, String>> {
         .into_iter()
         .map(|(path, hash)| (path, format!("{:x}", hash.finalize())))
         .collect())
+}
+
+/// Return declared warm paths that exist as real directories, without following
+/// symlinks.
+fn real_warm_paths(tree: &Path, pool: &Pool) -> Result<BTreeSet<String>> {
+    let mut present = BTreeSet::new();
+
+    for warm in &pool.warm_paths {
+        let mut paths = vec![Path::new("").to_path_buf()];
+        for segment in warm.path.split('/') {
+            let mut next = Vec::new();
+            for path in paths {
+                if segment.contains('*') {
+                    let directory = tree.join(&path);
+                    let entries = match std::fs::read_dir(&directory) {
+                        Ok(entries) => entries,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(source) => {
+                            return Err(Error::io("cannot inspect warm path", &directory, &source))
+                        }
+                    };
+                    for entry in entries {
+                        let entry = entry.map_err(|source| {
+                            Error::io("cannot inspect warm path", &directory, &source)
+                        })?;
+                        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                            continue;
+                        };
+                        if cleanup::segment_matches(segment, &name) {
+                            next.push(path.join(name));
+                        }
+                    }
+                } else {
+                    next.push(path.join(segment));
+                }
+            }
+
+            paths = Vec::new();
+            for path in next {
+                let full_path = tree.join(&path);
+                let metadata = match std::fs::symlink_metadata(&full_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(source) => {
+                        return Err(Error::io("cannot inspect warm path", &full_path, &source))
+                    }
+                };
+                if metadata.file_type().is_dir() {
+                    paths.push(path);
+                }
+            }
+            if paths.is_empty() {
+                break;
+            }
+        }
+        if !paths.is_empty() {
+            present.insert(warm.path.clone());
+        }
+    }
+
+    Ok(present)
 }
 
 fn write_record(root: &Path, record: &Record) -> Result<()> {

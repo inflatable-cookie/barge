@@ -51,8 +51,8 @@ barge worktree lease --repo <origin> --base <sha> [--base-name main]
   the same payload returns the same lease; repeating it with a changed payload
   is refused. A branch name that already exists in the pool's clone is
   refused, not reused. A different request can never get a leased root.
-- Barge prefers a free root with a warm-path record, most recently used first,
-  since its dependency folders are likeliest to match the current lockfiles.
+- Barge prefers a free root with a nonempty warm-path record, most recently used
+  first, since its dependency folders are likeliest to match the current lockfiles.
   With no recorded root it takes the least recently used free root (or makes
   one if the pool is below its size), then fetches, checks out a new branch
   `<name>` at `<sha>`, and verifies the tree is clean. Eviction and `prune`
@@ -140,10 +140,12 @@ What makes a pooled tree worth having is what survives between leases.
 - A pool declares its **warm paths**: ignored dependency folders, such as
   `node_modules` or `apps/*/node_modules`, each with the **key files** that
   decide whether it is still valid, such as `bun.lock` or `package-lock.json`.
-- After return preflight passes, Barge stores a SHA-256 hash for each warm
-  path from the outgoing checkout's key files, in declared order. Missing
-  files contribute to the hash and differ from empty files. The snapshot is
-  saved before reset, so it reflects a task's committed lockfile changes.
+- After return preflight passes, Barge stores a SHA-256 hash for each declared
+  warm path that exists as a real directory in the outgoing checkout. Missing
+  paths and symlinks are omitted, dropping any older hash for that path. For a
+  recorded path, missing key files contribute to the hash and differ from empty
+  files. The snapshot is saved before reset, so it reflects a task's committed
+  lockfile changes. A snapshot with no entries counts as cold for lease choice.
 - At lease, Barge checks out the requested base and compares fresh hashes
   with the snapshot. Ignored entries with matching hashes stay. Entries with
   changed or missing hashes are removed before handover, including on roots

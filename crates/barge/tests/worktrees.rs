@@ -445,6 +445,64 @@ fn a_return_records_the_tasks_keys_before_resetting_to_base() {
 }
 
 #[test]
+fn a_return_records_only_existing_real_warm_directories() {
+    let warm = json!([{ "path": "node_modules", "keys": ["bun.lock"] }]);
+    let (fixture, origin) = setup("origin-warm-present", 1, warm, &[]);
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let checkout = tree(&leased);
+    fs::create_dir(checkout.join("node_modules")).unwrap();
+    fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+
+    let record_path = checkout.parent().unwrap().join(".barge-warm-paths.json");
+    let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert!(record["hashes"]["node_modules"].is_string());
+
+    let leased = lease(&fixture, &origin, "req-2", "task/two");
+    fs::remove_dir_all(checkout.join("node_modules")).unwrap();
+    fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+    let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["hashes"], json!({}));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_return_does_not_record_a_symlink_as_a_warm_directory() {
+    let warm = json!([{ "path": "node_modules", "keys": ["bun.lock"] }]);
+    let (fixture, mut origin) = setup("origin-warm-symlink", 1, warm, &[]);
+    fs::write(
+        origin.path.join(".gitignore"),
+        "dist/\nnode_modules/\nnode_modules\n*.local\n",
+    )
+    .unwrap();
+    origin.base = commit(&origin.path, "ignore node_modules symlinks");
+    let leased = lease(&fixture, &origin, "req-1", "task/one");
+    let outside = fixture.temp.folder("outside-node-modules").unwrap();
+    std::os::unix::fs::symlink(&outside, tree(&leased).join("node_modules")).unwrap();
+    fixture
+        .barge
+        .worktree_return(&leased.lease_id, None, false)
+        .unwrap();
+
+    let record: Value = serde_json::from_slice(
+        &fs::read(
+            tree(&leased)
+                .parent()
+                .unwrap()
+                .join(".barge-warm-paths.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["hashes"], json!({}));
+}
+
+#[test]
 fn a_legacy_root_without_a_hash_is_cold() {
     let warm = json!([{ "path": "node_modules", "keys": ["bun.lock"] }]);
     let (fixture, origin) = setup("origin-warm-legacy", 1, warm, &[]);
@@ -499,6 +557,29 @@ fn a_lease_prefers_the_recorded_root_over_a_cold_one() {
         fs::read_to_string(deps.join("installed")).unwrap(),
         "dependencies\n"
     );
+}
+
+#[test]
+fn a_lease_prefers_a_warm_folder_over_a_more_recent_empty_record() {
+    let warm = json!([{ "path": "node_modules", "keys": ["bun.lock"] }]);
+    let (fixture, origin) = setup("origin-lease-existing-warm", 2, warm, &[]);
+    let warm_root = lease(&fixture, &origin, "req-1", "task/one");
+    let cold_root = lease(&fixture, &origin, "req-2", "task/two");
+
+    fs::create_dir(tree(&warm_root).join("node_modules")).unwrap();
+    fixture
+        .barge
+        .worktree_return(&warm_root.lease_id, None, false)
+        .unwrap();
+    fixture.clock.advance(10);
+    fixture
+        .barge
+        .worktree_return(&cold_root.lease_id, None, false)
+        .unwrap();
+
+    let next = lease(&fixture, &origin, "req-3", "task/three");
+    assert_eq!(next.root_id, warm_root.root_id);
+    assert_eq!(next.warm_kept, ["node_modules"]);
 }
 
 #[test]
