@@ -54,7 +54,7 @@ pub(crate) fn covers(pattern: &str, entry: &str) -> bool {
 }
 
 /// Match one path segment against a pattern whose only wildcard is `*`.
-fn segment_matches(pattern: &str, text: &str) -> bool {
+pub(crate) fn segment_matches(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
     let (mut p, mut t) = (0, 0);

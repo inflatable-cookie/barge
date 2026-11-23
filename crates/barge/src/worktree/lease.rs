@@ -129,10 +129,16 @@ fn take_root(
         });
         lru
     } else {
-        let (mut warm, mut cold): (Vec<&RootInfo>, Vec<&RootInfo>) = free
-            .into_iter()
-            .partition(|root| warm::has_record(&root.path));
-        warm.sort_by(|left, right| {
+        let mut warm_roots = Vec::new();
+        let mut cold = Vec::new();
+        for root in free {
+            if warm::has_record(&root.path)? {
+                warm_roots.push(root);
+            } else {
+                cold.push(root);
+            }
+        }
+        warm_roots.sort_by(|left, right| {
             (right.last_used_unix_ms, left.id.as_str())
                 .cmp(&(left.last_used_unix_ms, right.id.as_str()))
         });
@@ -140,8 +146,8 @@ fn take_root(
             (left.last_used_unix_ms, left.id.as_str())
                 .cmp(&(right.last_used_unix_ms, right.id.as_str()))
         });
-        warm.extend(cold);
-        warm
+        warm_roots.extend(cold);
+        warm_roots
     };
     let (root_id, root_path) = match ordered.first() {
         Some(root) => (root.id.clone(), root.path.clone()),
