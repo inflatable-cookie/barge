@@ -9,13 +9,16 @@
 //! mount for a plain folder, between a check and the step that acts on it.
 //!
 //! A root's marker is removed last, after every other entry and only once
-//! nothing else is left, so a walk that stops partway leaves a folder that is
-//! still owned trash the next pass can finish.
+//! nothing else is left, and it is put back if the empty folder cannot be
+//! removed: everything a walk survives leaves a folder that is still owned trash
+//! the next pass can finish. Only a crash between those last two steps leaves an
+//! empty folder behind.
 
 #![allow(unsafe_code)]
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -95,7 +98,8 @@ impl Tree {
         self
     }
 
-    /// Remove this folder and its tree, with the root marker last.
+    /// Remove this folder and its tree, with the root marker last and put back
+    /// if the empty folder cannot be removed.
     pub(crate) fn remove(self) -> Result<Removed> {
         remove_opened(self, &same_device)
     }
@@ -225,7 +229,9 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
     let mut removed = Removed::default();
     // Every entry but the root's marker goes first: a nested mount, an over-deep
     // tree or a failed step then leaves the marker in place, so the folder is
-    // still owned trash rather than a markerless straggler Barge refuses.
+    // still owned trash rather than a markerless straggler Barge refuses. The
+    // marker itself goes last, and if the empty folder cannot be removed it is
+    // put back.
     let entries =
         read_names(&directory).map_err(|source| Error::io("cannot list", &path, &source))?;
     let mut empty = true;
@@ -240,17 +246,20 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
             &mut removed,
         )?;
     }
-    // The marker goes last, and the empty folder after it, but only while the
-    // path still names the folder this walk was opened on: a folder that moved
-    // or was replaced keeps its marker, so the next pass can finish it.
-    if !empty || !names_opened(&directory, &path) {
+    // Something stayed, so the marker must stay too: the folder is still owned
+    // trash that the next pass can finish.
+    if !empty {
         removed.skipped.push(path);
         return Ok(removed);
     }
+    // The folder holds nothing but its marker. Read the marker through this
+    // descriptor before unlinking it, so the last step can put it back.
+    let marker_path = path.join(marker);
+    let restore = read_marker(&directory);
     if !remove_child(
         &directory,
         marker,
-        &path.join(marker),
+        &marker_path,
         root_device,
         0,
         device,
@@ -259,9 +268,67 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
         removed.skipped.push(path);
         return Ok(removed);
     }
-    std::fs::remove_dir(&path).map_err(|source| Error::io("cannot remove", &path, &source))?;
-    removed.removed = true;
-    Ok(removed)
+    // Remove the empty folder only while the path still names the folder this
+    // walk was opened on, checked immediately before the removal. A folder that
+    // moved or was replaced gets its marker back and stays owned trash.
+    if !names_opened(&directory, &path) {
+        put_back(&directory, restore.as_deref());
+        removed.skipped.push(path);
+        return Ok(removed);
+    }
+    match std::fs::remove_dir(&path) {
+        Ok(()) => {
+            removed.removed = true;
+            Ok(removed)
+        }
+        Err(source) => {
+            // A racing writer's entry, a read-only parent or an I/O failure: the
+            // folder stays, so the marker goes back and it is still owned trash.
+            put_back(&directory, restore.as_deref());
+            Err(Error::io("cannot remove", &path, &source))
+        }
+    }
+}
+
+/// The marker's bytes, read through the opened folder, so the last step can put
+/// it back. `None` when there is no readable regular marker to restore.
+fn read_marker(directory: &File) -> Option<Vec<u8>> {
+    let mut file = super::open_marker_at(directory, MARKER_NAME).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Put the marker back into the opened folder, so a folder whose empty removal
+/// failed is still owned trash rather than a markerless straggler. Best effort:
+/// the caller reports the failure it did see, and a marker a racing writer has
+/// already published is left alone.
+fn put_back(directory: &File, marker: Option<&[u8]>) {
+    let Some(bytes) = marker else {
+        return;
+    };
+    let Ok(name) = CString::new(MARKER_NAME) else {
+        return;
+    };
+    // SAFETY: `openat` takes a descriptor this process holds and a
+    // NUL-terminated name; a successful call returns a new descriptor.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: `openat` returned a descriptor nothing else owns.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let _ = file.write_all(bytes);
 }
 
 /// Whether the path still names the folder this walk was opened on.
@@ -758,10 +825,57 @@ mod tests {
             "the replacement was never walked"
         );
         assert!(!held.join("owned.bin").exists(), "the opened tree was");
-        assert!(
-            held.join(crate::root::MARKER_NAME).exists(),
-            "the folder that moved keeps its marker, so it is still owned trash"
+        assert_eq!(
+            crate::root::read_marker(&held),
+            crate::root::MarkerRead::Valid(marker("0123456789abcdef")),
+            "a folder that moved gets its marker back, so it is still owned trash"
         );
+    }
+
+    /// Deny a folder's own removal, which is decided by the mode of its parent,
+    /// while leaving its entries removable.
+    fn deny_parent_writes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    fn allow_writes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_final_removal_that_fails_puts_the_marker_back() {
+        if crate::os::running_as_root() {
+            // Root ignores the mode that makes the last step fail.
+            return;
+        }
+        let temp = crate::testing::TempDir::new("tree-final-failure").unwrap();
+        let trash = temp.folder("trash").unwrap();
+        let root = trash.join("slot-0123456789abcdef");
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
+        std::fs::write(root.join("build/artifact.bin"), b"artifact").unwrap();
+        // The walk can empty the folder, but its parent refuses the folder's own
+        // removal, so it fails at its very last step.
+        deny_parent_writes(&trash);
+
+        let error = Tree::open(&root).unwrap().remove().unwrap_err();
+
+        allow_writes(&trash);
+        assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
+        assert!(!root.join("build").exists(), "the tree was walked");
+        assert_eq!(
+            crate::root::read_marker(&root),
+            crate::root::MarkerRead::Valid(marker("0123456789abcdef")),
+            "the marker is put back, so the folder is still owned trash"
+        );
+
+        // The next pass finishes what the failure left.
+        let removed = Tree::open(&root).unwrap().remove().unwrap();
+        assert!(removed.removed);
+        assert!(!removed.skipped.contains(&root));
+        assert!(!root.exists());
     }
 
     #[test]

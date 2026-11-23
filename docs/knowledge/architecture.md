@@ -55,15 +55,16 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
 - **A crash leaves trash, not ambiguity.** A rename is atomic. A crash before
   the rename leaves the root intact; a crash after it leaves owned trash, which
   the next prune or sweep removes. A deletion removes the root's marker last,
-  after every other entry, so a deletion interrupted partway leaves a folder
-  that still carries it and the next pass finishes it. The area lock is released
-  after the rename, before deletion, so holds and other area operations can
-  continue. A sweep does the same: under that lock it lists the trash and claims
-  what it will delete, renaming the entry to `.barge-claim-<name>` and locking
-  the folder it opened, then releases the lock to walk the tree. A claim a crash
-  leaves behind is finished by a later sweep; a claim locked by a live deletion
-  is left alone, so no tree is deleted or counted twice and a large delete never
-  stalls a hold. No journal is needed.
+  after every other entry, and puts it back if the empty folder cannot be
+  removed, so what it leaves behind is still owned trash the next pass finishes;
+  only a crash between those last two steps leaves an empty folder. The area
+  lock is released after the rename, before deletion, so holds and other area
+  operations can continue. A sweep does the same: under that lock it lists the
+  trash and claims what it will delete, renaming the entry to
+  `.barge-claim-<name>` and locking the folder it opened, then releases the lock
+  to walk the tree. A claim a crash leaves behind is finished by a later sweep; a
+  claim locked by a live deletion is left alone, so no tree is deleted or counted
+  twice and a large delete never stalls a hold. No journal is needed.
 - **Unknown is never safe.** A volume whose identity can't be read, a marker
   that can't be parsed, a lock that can't be tested, or a pin that can't be
   inspected all count as "keep".

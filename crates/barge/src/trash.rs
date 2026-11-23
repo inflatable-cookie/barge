@@ -493,6 +493,55 @@ mod tests {
         assert!(leaves.iter().all(|path| !path.exists()));
     }
 
+    /// Deny a folder's own removal, decided by the mode of its parent, while
+    /// leaving its entries removable.
+    fn deny_parent_writes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    fn allow_writes(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_final_removal_failure_keeps_the_entry_owned_for_the_next_sweep() {
+        if crate::os::running_as_root() {
+            // Root ignores the mode that makes the last step fail.
+            return;
+        }
+        let (_temp, area) = fixture("trash-final-failure");
+        let entry = trashed(&area, "old");
+        let trash = entry.parent().unwrap().to_path_buf();
+        fs::write(entry.join("artifact.bin"), b"artifact").unwrap();
+        let marker = match crate::root::read_marker(&entry) {
+            crate::root::MarkerRead::Valid(marker) => marker,
+            other => panic!("the fixture has an owned marker: {other:?}"),
+        };
+        // The entry's own contents can go, but the trash refuses the entry's own
+        // removal, so the deletion fails at its last step with the marker gone.
+        deny_parent_writes(&trash);
+
+        let error = remove_evicted_tree(&entry, "test/area", &marker.id).unwrap_err();
+
+        allow_writes(&trash);
+        assert_eq!(error.kind(), crate::error::ErrorKind::Io, "{error}");
+        assert!(!entry.join("artifact.bin").exists(), "the tree was walked");
+        assert_eq!(
+            crate::root::read_marker(&entry),
+            crate::root::MarkerRead::Valid(marker),
+            "the marker is put back, so the entry is still owned trash"
+        );
+
+        let report = area.sweep_trash().unwrap();
+
+        assert!(report.kept.is_empty(), "{:#?}", report.kept);
+        assert_eq!(report.deleted.len(), 1);
+        assert_eq!(report.deleted[0].path, entry);
+        assert!(!entry.exists(), "the next sweep finishes the entry");
+    }
+
     #[test]
     fn an_interrupted_deletion_keeps_the_marker_so_the_next_sweep_finishes_it() {
         let (_temp, area) = fixture("trash-marker-last");
