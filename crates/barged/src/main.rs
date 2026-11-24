@@ -122,6 +122,20 @@ fn interface_warning(lookup: &dyn NetworkLookup, address: IpAddr) -> Option<Stri
     }
 
     let info = lookup.interface_for(address);
+    if let Some(error) = info.lookup_error {
+        return Some(format!(
+            "barged: warning: cannot read interface details for bound address {address}: {error}; a sandboxed unit needs AF_NETLINK to read interface details"
+        ));
+    }
+    if !info.interface_found {
+        return Some(format!(
+            "barged: warning: cannot find an interface for bound address {address}"
+        ));
+    }
+    if !address.is_ipv4() || !info.broadcast_capable {
+        return None;
+    }
+
     let missing = [
         (info.mac.is_none(), "MAC"),
         (info.broadcast.is_none(), "broadcast"),
@@ -129,20 +143,14 @@ fn interface_warning(lookup: &dyn NetworkLookup, address: IpAddr) -> Option<Stri
     .into_iter()
     .filter_map(|(is_missing, label)| is_missing.then_some(label))
     .collect::<Vec<_>>();
-
     if missing.is_empty() {
         return None;
     }
 
-    let mut warning = format!(
-        "barged: warning: cannot determine {} for bound address {address}",
+    Some(format!(
+        "barged: warning: cannot determine {} for bound address {address}; a sandboxed unit needs AF_NETLINK to read interface details",
         missing.join(" or ")
-    );
-    if let Some(error) = info.lookup_error {
-        warning.push_str(&format!(": {error}"));
-    }
-    warning.push_str("; a sandboxed unit needs AF_NETLINK to read interface details");
-    Some(warning)
+    ))
 }
 
 fn parse_config_only(arguments: &[String]) -> Result<PathBuf> {
@@ -458,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_warning_names_missing_metadata_and_lookup_error() {
+    fn startup_warning_names_lookup_error_and_af_netlink_hint() {
         let lookup = FixedNetworkLookup(InterfaceInfo {
             lookup_error: Some("Permission denied (os error 13)".to_string()),
             ..InterfaceInfo::default()
@@ -466,7 +474,10 @@ mod tests {
 
         let warning = interface_warning(&lookup, "192.0.2.10".parse().unwrap()).unwrap();
         assert!(warning.contains("192.0.2.10"), "{warning}");
-        assert!(warning.contains("MAC or broadcast"), "{warning}");
+        assert!(
+            warning.contains("cannot read interface details"),
+            "{warning}"
+        );
         assert!(
             warning.contains("Permission denied (os error 13)"),
             "{warning}"
@@ -477,6 +488,8 @@ mod tests {
     #[test]
     fn startup_warning_names_missing_mac_without_an_os_error() {
         let lookup = FixedNetworkLookup(InterfaceInfo {
+            interface_found: true,
+            broadcast_capable: true,
             broadcast: Some(Ipv4Addr::BROADCAST),
             ..InterfaceInfo::default()
         });
@@ -487,8 +500,57 @@ mod tests {
     }
 
     #[test]
+    fn startup_warning_names_missing_broadcast_on_broadcast_interface() {
+        let lookup = FixedNetworkLookup(InterfaceInfo {
+            interface_found: true,
+            broadcast_capable: true,
+            mac: Some("02:00:00:00:00:01".to_string()),
+            ..InterfaceInfo::default()
+        });
+
+        let warning = interface_warning(&lookup, "192.0.2.10".parse().unwrap()).unwrap();
+        assert!(warning.contains("cannot determine broadcast"), "{warning}");
+        assert!(warning.contains("AF_NETLINK"), "{warning}");
+    }
+
+    #[test]
+    fn startup_warning_names_missing_interface_without_netlink_hint() {
+        let lookup = FixedNetworkLookup(InterfaceInfo::default());
+
+        let warning = interface_warning(&lookup, "192.0.2.10".parse().unwrap()).unwrap();
+        assert!(warning.contains("cannot find an interface"), "{warning}");
+        assert!(!warning.contains("AF_NETLINK"), "{warning}");
+    }
+
+    #[test]
+    fn startup_warning_skips_non_broadcast_interfaces_and_ipv6() {
+        let point_to_point = FixedNetworkLookup(InterfaceInfo {
+            interface_found: true,
+            mac: None,
+            broadcast: None,
+            ..InterfaceInfo::default()
+        });
+        assert_eq!(
+            interface_warning(&point_to_point, "192.0.2.10".parse().unwrap()),
+            None
+        );
+
+        let broadcast_interface = FixedNetworkLookup(InterfaceInfo {
+            interface_found: true,
+            broadcast_capable: true,
+            ..InterfaceInfo::default()
+        });
+        assert_eq!(
+            interface_warning(&broadcast_interface, "2001:db8::10".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
     fn startup_warning_skips_loopback_and_complete_interface() {
         let lookup = FixedNetworkLookup(InterfaceInfo {
+            interface_found: true,
+            broadcast_capable: true,
             mac: Some("02:00:00:00:00:01".to_string()),
             broadcast: Some(Ipv4Addr::BROADCAST),
             ..InterfaceInfo::default()
