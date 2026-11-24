@@ -820,6 +820,62 @@ fn machine_pair_writes_owner_only_credentials_and_unpair_removes_them() {
 }
 
 #[test]
+fn help_ignores_options_and_never_runs_the_command() {
+    let fixture = Fixture::new();
+    // Options before --help select by command words only: the lease lines,
+    // not the generic worktree list.
+    let lease = fixture.run(&["worktree", "lease", "--repo", "R", "--help"]);
+    assert_eq!(lease.status.code(), Some(0), "{}", stderr(&lease));
+    let text = stdout(&lease);
+    assert!(text.contains("worktree lease --repo"), "{text}");
+    assert!(text.contains("worktree lease get"), "{text}");
+    for other in [
+        "worktree return",
+        "worktree run",
+        "worktree status",
+        "worktree prune",
+    ] {
+        assert!(!text.contains(other), "{text} names {other}");
+    }
+    assert!(stderr(&lease).is_empty(), "{}", stderr(&lease));
+
+    let get = fixture.run(&["worktree", "lease", "get", "--help"]);
+    assert_eq!(get.status.code(), Some(0), "{}", stderr(&get));
+    let text = stdout(&get);
+    assert!(text.contains("usage: barge worktree lease get"), "{text}");
+    assert!(text.contains("worktree lease get"), "{text}");
+    assert!(
+        !text.contains("worktree lease --repo"),
+        "{text} names the creation line"
+    );
+    assert!(stderr(&get).is_empty(), "{}", stderr(&get));
+
+    let status = fixture.run(&["worktree", "status", "--repo", "R", "--help"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let text = stdout(&status);
+    assert!(text.contains("usage: barge worktree status"), "{text}");
+    assert!(!text.contains("worktree lease"), "{text}");
+    assert!(stderr(&status).is_empty(), "{}", stderr(&status));
+
+    // An extra positional does not run status: exit 0 with usage, and a
+    // missing account stays missing.
+    let missing = fixture.temp.child("missing-state");
+    let output = Command::new(env!("CARGO_BIN_EXE_barge"))
+        .args(["status", "anything", "--help"])
+        .env("BARGE_STATE_DIR", &missing)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("usage: barge status"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    assert!(!missing.exists(), "status ran");
+}
+
+#[test]
 fn init_checks_and_doctor_report_the_local_scratch_file() {
     let fixture = Fixture::new();
     assert!(register(&fixture).status.success());
