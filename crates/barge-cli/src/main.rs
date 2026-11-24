@@ -32,32 +32,41 @@ mod volume;
 mod worktree;
 
 use crate::output::report_error;
-use crate::usage::usage_text;
+use crate::usage::{help_for, usage_text};
 
 fn main() -> ExitCode {
-    let mut arguments: Vec<String> = std::env::args().skip(1).collect();
-    let json_flag = if arguments
-        .first()
-        .is_some_and(|argument| argument == "--json")
-    {
-        Some(0)
-    } else if arguments
-        .first()
-        .is_some_and(|argument| argument == "worktree")
-        && arguments.get(1).is_some_and(|argument| argument == "prune")
-        && arguments
-            .last()
-            .is_some_and(|argument| argument == "--json")
-    {
-        Some(arguments.len() - 1)
-    } else {
-        None
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // Everything after the first `--` belongs to the child process of
+    // `worktree run`: a `--json` or `--help` there is passed to the command
+    // untouched and never read by barge. Only the arguments before it can
+    // carry barge's own flags, at any position in the command line.
+    let separator = arguments.iter().position(|argument| argument == "--");
+    let (before, after) = match separator {
+        Some(index) => (arguments[..index].to_vec(), arguments[index..].to_vec()),
+        None => (arguments, Vec::new()),
     };
-    if let Some(index) = json_flag {
-        arguments.remove(index);
+    let mut cleaned: Vec<String> = Vec::with_capacity(before.len());
+    let mut json = false;
+    let mut help = false;
+    for argument in &before {
+        if argument == "--json" {
+            json = true;
+        } else if argument == "--help" || argument == "-h" {
+            help = true;
+        } else {
+            cleaned.push(argument.clone());
+        }
     }
-    let json = json_flag.is_some();
-    match run(&arguments, json) {
+    if help {
+        if let Some(text) = help_for(&cleaned) {
+            print!("{text}");
+            return ExitCode::SUCCESS;
+        }
+        // An unknown command keeps today's usage error, with the help flag
+        // left out of the reported command line.
+    }
+    cleaned.extend(after);
+    match run(&cleaned, json) {
         Ok(code) => code,
         Err(error) => {
             report_error(&error, json);
@@ -81,7 +90,18 @@ fn run(arguments: &[String], json: bool) -> Result<ExitCode> {
 
 fn dispatch(command: &str, rest: &[String], json: bool) -> Result<ExitCode> {
     Ok(match command {
-        "help" | "--help" | "-h" => {
+        "help" => {
+            match help_for(rest) {
+                Some(text) if !rest.is_empty() => {
+                    print!("{text}");
+                }
+                _ => {
+                    println!("{}", usage_text());
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        "--help" | "-h" => {
             println!("{}", usage_text());
             ExitCode::SUCCESS
         }

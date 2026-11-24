@@ -746,9 +746,17 @@ fn usage_and_passive_commands_do_not_create_state() {
     );
     let value = run(&["path", "caches", "--project", "--json"]);
     assert_eq!(value.status.code(), Some(2));
-    assert_eq!(stderr(&value), "barge: project \"--json\" must be 1-64 characters of lowercase letters, digits, '-', '_' or '.'\n");
-    let misplaced = run(&["status", "--json"]);
-    assert_eq!(stderr(&misplaced), "barge: unknown option --json\n");
+    assert_eq!(
+        stderr(&value),
+        "{\"error\":{\"kind\":\"usage\",\"message\":\"--project needs a value\"},\"schema\":\"barge.error/1\"}\n"
+    );
+    let trailing = run(&["status", "--json"]);
+    assert_eq!(trailing.status.code(), Some(0), "{}", stderr(&trailing));
+    assert!(
+        stdout(&trailing).contains("barge.status/1"),
+        "a trailing --json prints the document: {}",
+        stdout(&trailing)
+    );
 }
 
 #[cfg(unix)]
@@ -943,4 +951,151 @@ fn init_checks_and_doctor_report_the_local_scratch_file() {
         .unwrap();
     assert_eq!(check.status.code(), Some(1), "{}", stderr(&check));
     assert!(!missing_state.exists(), "check created account state");
+}
+
+#[test]
+fn json_may_trail_a_command_and_matches_the_leading_form() {
+    let fixture = Fixture::new();
+    assert!(register(&fixture).status.success());
+
+    for command in [&["doctor"][..], &["worktree", "status"][..]] {
+        let mut leading = vec!["--json"];
+        leading.extend_from_slice(command);
+        let mut trailing: Vec<&str> = command.to_vec();
+        trailing.push("--json");
+        let leading_output = fixture.run(&leading);
+        let trailing_output = fixture.run(&trailing);
+        assert_eq!(
+            leading_output.status.code(),
+            trailing_output.status.code(),
+            "{command:?}: {} vs {}",
+            stderr(&leading_output),
+            stderr(&trailing_output)
+        );
+        assert!(
+            leading_output.status.success(),
+            "{command:?}: {}",
+            stderr(&leading_output)
+        );
+        assert_eq!(
+            stdout(&leading_output),
+            stdout(&trailing_output),
+            "{command:?}: a trailing --json prints byte-identical output"
+        );
+        parse_document(&trailing_output);
+    }
+}
+
+#[test]
+fn every_command_answers_help_without_doing_anything() {
+    let fixture = Fixture::new();
+    for command in [
+        vec!["worktree", "--help"],
+        vec!["worktree", "-h"],
+        vec!["worktree", "lease", "--help"],
+        vec!["scratch", "--help"],
+        vec!["doctor", "--help"],
+        vec!["machine", "--help"],
+        vec!["--help"],
+        vec!["help", "worktree"],
+    ] {
+        let output = fixture.run(&command);
+        assert_eq!(output.status.code(), Some(0), "{command:?}");
+        assert!(
+            stdout(&output).contains("usage:"),
+            "{command:?} prints usage: {}",
+            stdout(&output)
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "{command:?} writes nothing to stderr: {}",
+            stderr(&output)
+        );
+    }
+    let lease = fixture.run(&["worktree", "lease", "--help"]);
+    assert!(
+        stdout(&lease).contains("worktree lease"),
+        "lease help names the lease verbs: {}",
+        stdout(&lease)
+    );
+    let machine = fixture.run(&["machine", "--help"]);
+    assert!(
+        stdout(&machine).contains("machine status"),
+        "machine help names the machine verbs: {}",
+        stdout(&machine)
+    );
+
+    // Every other known command answers with its own usage, not the whole
+    // text: its head names the command and its lines name its own verbs.
+    for (command, head, own) in [
+        (
+            vec!["volume", "--help"],
+            "usage: barge volume",
+            "volume register",
+        ),
+        (
+            vec!["layout", "--help"],
+            "usage: barge layout",
+            "layout show|set",
+        ),
+        (vec!["area", "--help"], "usage: barge area", "area declare"),
+        (vec!["root", "--help"], "usage: barge root", "root evict"),
+        (vec!["bind", "--help"], "usage: barge bind", "bind undo"),
+        (vec!["move", "--help"], "usage: barge move", "move --apply"),
+        (
+            vec!["prune", "--help"],
+            "usage: barge prune",
+            "prune --volume",
+        ),
+        (
+            vec!["init", "--help"],
+            "usage: barge init",
+            "AGENTS.local.md",
+        ),
+        (
+            vec!["status", "--help"],
+            "usage: barge status",
+            "free space",
+        ),
+        (
+            vec!["path", "--help"],
+            "usage: barge path",
+            "resolve a resource",
+        ),
+        (
+            vec!["survey", "--help"],
+            "usage: barge survey",
+            "inspect top-level",
+        ),
+        (
+            vec!["env", "--help"],
+            "usage: barge env",
+            "shell assignments",
+        ),
+    ] {
+        let output = fixture.run(&command);
+        assert_eq!(output.status.code(), Some(0), "{command:?}");
+        let text = stdout(&output);
+        assert!(
+            text.contains(head),
+            "{command:?} heads its own usage: {text}"
+        );
+        assert!(
+            text.contains(own),
+            "{command:?} names its own verbs: {text}"
+        );
+        assert!(
+            !text.contains("usage: barge [--json] <command>"),
+            "{command:?} does not print the whole usage text: {text}"
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "{command:?} writes nothing to stderr: {}",
+            stderr(&output)
+        );
+    }
+
+    let unknown = fixture.run(&["doctor", "--bogus"]);
+    assert_eq!(unknown.status.code(), Some(2), "{}", stderr(&unknown));
+    assert_eq!(stderr(&unknown), "barge: unknown option --bogus\n");
 }
