@@ -170,7 +170,7 @@ usage: barge scratch <command>
 "
             .to_string(),
         ),
-        ["doctor"] => Some(
+        ["doctor", ..] => Some(
             "\
 usage: barge doctor [--json]
 
@@ -197,28 +197,124 @@ usage: barge machine <command>
 "
             .to_string(),
         ),
-        // Any other known top-level command answers with the whole usage text,
-        // which lists its own lines; an unknown command keeps today's error.
-        [command] | [command, ..]
-            if matches!(
-                *command,
-                "help"
-                    | "init"
-                    | "status"
-                    | "layout"
-                    | "path"
-                    | "env"
-                    | "survey"
-                    | "volume"
-                    | "area"
-                    | "root"
-                    | "bind"
-                    | "move"
-                    | "prune"
-            ) =>
-        {
-            Some(usage_text())
-        }
+        ["layout", ..] => Some(
+            "\
+usage: barge layout <command>
+
+  layout show|set                          inspect or change placements
+"
+            .to_string(),
+        ),
+        ["path", ..] => Some(
+            "\
+usage: barge path [--json] <class> [--project P]
+
+  path <class> [--project P]              resolve a resource path
+"
+            .to_string(),
+        ),
+        ["env", ..] => Some(
+            "\
+usage: barge env [--shell zsh|bash|fish]
+
+  env [--shell zsh|bash|fish]             shell assignments
+"
+            .to_string(),
+        ),
+        ["survey", ..] => Some(
+            "\
+usage: barge survey [--json] <volume> [--no-bytes]
+
+  survey <volume> [--no-bytes]            inspect top-level items
+"
+            .to_string(),
+        ),
+        ["status"] => Some(
+            "\
+usage: barge status [--json]
+
+  status                                  every volume, area and free space
+"
+            .to_string(),
+        ),
+        ["volume", ..] => Some(
+            "\
+usage: barge volume [--json] <command>
+
+  volume register --name N --mount PATH   register a volume (reads its UUID)
+    [--uuid U] [--root-dir DIR] [--availability permanent|ephemeral]
+    [--durability expendable|kept] [--reserve SIZE] [--floor SIZE] [--import-layout]
+  volume list                             registered volumes and their state
+  volume status <name>                    one volume's identity and space
+"
+            .to_string(),
+        ),
+        ["area", ..] => Some(
+            "\
+usage: barge area [--json] <command>
+
+  area declare --namespace NS --name A --volume V
+    [--folder DIR] [--absent fail|fallback:PATH] [--soft-cap SIZE]
+    [--counts-toward-reserve true|false]
+  area list [--volume V]                  declared areas and their location
+"
+            .to_string(),
+        ),
+        ["root", ..] => Some(
+            "\
+usage: barge root [--json] <command>
+
+  root list <namespace>/<area> [--bytes]   roots, holds, pins and stragglers
+  root pin <namespace>/<area> <id> [--reason TEXT]
+  root unpin <namespace>/<area> <id>
+  root evict <namespace>/<area> <id>      rename into trash, then delete
+"
+            .to_string(),
+        ),
+        ["bind", ..] => Some(
+            "\
+usage: barge bind [--json] <command>
+
+  bind list                               recorded bindings
+  bind plan --consumer C --class K --link PATH --to DEST
+                                          the exact before and after; print it
+  bind apply --plan FILE|- [--replace]    apply exactly that reviewed plan
+  bind adopt --consumer C --class K --link PATH
+  bind undo <consumer>                    restore what was there before
+"
+            .to_string(),
+        ),
+        ["move", ..] => Some(
+            "\
+usage: barge move [--json] <options>
+
+  move <class> <new-path> --plan           review a class move
+  move --item PATH --into CLASS[/SUB] --plan
+  move --apply --plan FILE|- [--confirm-stopped] [--retarget-unrecorded]
+"
+            .to_string(),
+        ),
+        ["init", ..] => Some(
+            "\
+usage: barge init [--json] [--project P] [--path DIR] [--check]
+
+  init [--project P] [--path DIR] [--check]
+                                          write AGENTS.local.md, the uncommitted scratch
+                                          file; --check reports it and writes nothing
+"
+            .to_string(),
+        ),
+        ["prune", ..] => Some(
+            "\
+usage: barge prune [--json] --volume V [--dry-run]
+
+  prune --volume V [--dry-run]            evict idle roots to meet policy
+"
+            .to_string(),
+        ),
+        // `help` lists everything, so the whole text is its usage. An
+        // unknown command keeps today's usage error.
+        ["help", ..] => Some(usage_text()),
         _ => None,
     }
 }

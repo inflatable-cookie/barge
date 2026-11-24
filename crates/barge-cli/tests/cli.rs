@@ -1025,6 +1025,76 @@ fn every_command_answers_help_without_doing_anything() {
         stdout(&machine)
     );
 
+    // Every other known command answers with its own usage, not the whole
+    // text: its head names the command and its lines name its own verbs.
+    for (command, head, own) in [
+        (
+            vec!["volume", "--help"],
+            "usage: barge volume",
+            "volume register",
+        ),
+        (
+            vec!["layout", "--help"],
+            "usage: barge layout",
+            "layout show|set",
+        ),
+        (vec!["area", "--help"], "usage: barge area", "area declare"),
+        (vec!["root", "--help"], "usage: barge root", "root evict"),
+        (vec!["bind", "--help"], "usage: barge bind", "bind undo"),
+        (vec!["move", "--help"], "usage: barge move", "move --apply"),
+        (
+            vec!["prune", "--help"],
+            "usage: barge prune",
+            "prune --volume",
+        ),
+        (
+            vec!["init", "--help"],
+            "usage: barge init",
+            "AGENTS.local.md",
+        ),
+        (
+            vec!["status", "--help"],
+            "usage: barge status",
+            "free space",
+        ),
+        (
+            vec!["path", "--help"],
+            "usage: barge path",
+            "resolve a resource",
+        ),
+        (
+            vec!["survey", "--help"],
+            "usage: barge survey",
+            "inspect top-level",
+        ),
+        (
+            vec!["env", "--help"],
+            "usage: barge env",
+            "shell assignments",
+        ),
+    ] {
+        let output = fixture.run(&command);
+        assert_eq!(output.status.code(), Some(0), "{command:?}");
+        let text = stdout(&output);
+        assert!(
+            text.contains(head),
+            "{command:?} heads its own usage: {text}"
+        );
+        assert!(
+            text.contains(own),
+            "{command:?} names its own verbs: {text}"
+        );
+        assert!(
+            !text.contains("usage: barge [--json] <command>"),
+            "{command:?} does not print the whole usage text: {text}"
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "{command:?} writes nothing to stderr: {}",
+            stderr(&output)
+        );
+    }
+
     let unknown = fixture.run(&["doctor", "--bogus"]);
     assert_eq!(unknown.status.code(), Some(2), "{}", stderr(&unknown));
     assert_eq!(stderr(&unknown), "barge: unknown option --bogus\n");
