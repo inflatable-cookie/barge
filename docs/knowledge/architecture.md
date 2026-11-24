@@ -130,9 +130,11 @@ one `lock` file there and publish by atomic rename. The account layout is the
 authority for class placement; each volume also carries `<mount>/.barge/layout.json`,
 which lists the classes that volume holds ([resources](resources.md#layout)).
 
-Today's External layout (`scratch/`, `caches/`, `oxide-pool/`, `oxide-outputs/`
-at the drive root) is expressed as `root_dir = ""` with Oxide's two areas
-overridden to their existing folder names, so adoption moves nothing.
+Stash uses `root_dir = ""`. Its six class folders are `archives/`, `builds/`,
+`caches/`, `scratch/`, `vms/` and `worktrees/`, alongside `.barge/` at the
+volume root. Oxide's pool and outputs are areas under `builds/oxide/pool` and
+`builds/oxide/outputs`; Nucleus's former `queue/` is gone. The class layout is
+defined in [resources](resources.md#layout).
 
 ## Library surface
 
