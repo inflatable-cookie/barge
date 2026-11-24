@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use barge_machine::DaemonClient;
 use barged::{
-    Clock, Config, Daemon, DaemonState, Error, PowerController, Result, Serving, SystemClock,
+    Clock, Config, Daemon, DaemonState, Error, NetworkLookup, PowerController, Result, Serving,
+    SystemClock, SystemNetworkLookup,
 };
 
 /// Cleared by the SIGTERM handler; `serve` returns once it reads false.
@@ -64,12 +65,17 @@ fn run(arguments: &[String]) -> Result<()> {
     let clock = Arc::new(SystemClock);
     let controller = PowerController::new(Arc::new(platform_power()), clock.clone());
     let peers = Arc::new(platform_lookup(&config));
-    let daemon = Daemon::new(&config, controller.clone(), peers, clock)?;
+    let network = Arc::new(SystemNetworkLookup);
+    let daemon =
+        Daemon::new(&config, controller.clone(), peers, clock)?.with_network(network.clone());
     let listeners = daemon.bind_all()?;
     let bound_addr = listeners
         .first()
         .and_then(|l| l.local_addr().ok())
         .unwrap_or_else(|| daemon.listen());
+    if let Some(warning) = interface_warning(&*network, bound_addr.ip()) {
+        eprintln!("{warning}");
+    }
     let countdown = controller
         .start()
         .map_err(|error| Error::new(format!("cannot start the countdown thread: {error}")))?;
@@ -108,6 +114,35 @@ fn run(arguments: &[String]) -> Result<()> {
         eprintln!("barged: the countdown thread panicked");
     }
     outcome
+}
+
+fn interface_warning(lookup: &dyn NetworkLookup, address: IpAddr) -> Option<String> {
+    if address.is_loopback() || address.is_unspecified() {
+        return None;
+    }
+
+    let info = lookup.interface_for(address);
+    let missing = [
+        (info.mac.is_none(), "MAC"),
+        (info.broadcast.is_none(), "broadcast"),
+    ]
+    .into_iter()
+    .filter_map(|(is_missing, label)| is_missing.then_some(label))
+    .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return None;
+    }
+
+    let mut warning = format!(
+        "barged: warning: cannot determine {} for bound address {address}",
+        missing.join(" or ")
+    );
+    if let Some(error) = info.lookup_error {
+        warning.push_str(&format!(": {error}"));
+    }
+    warning.push_str("; a sandboxed unit needs AF_NETLINK to read interface details");
+    Some(warning)
 }
 
 fn parse_config_only(arguments: &[String]) -> Result<PathBuf> {
@@ -410,8 +445,64 @@ fn platform_lookup(config: &Config) -> barged::TailscaleLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use barged::InterfaceInfo;
     use std::io::Cursor;
     use std::thread;
+
+    struct FixedNetworkLookup(InterfaceInfo);
+
+    impl NetworkLookup for FixedNetworkLookup {
+        fn interface_for(&self, _ip: IpAddr) -> InterfaceInfo {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn startup_warning_names_missing_metadata_and_lookup_error() {
+        let lookup = FixedNetworkLookup(InterfaceInfo {
+            lookup_error: Some("Permission denied (os error 13)".to_string()),
+            ..InterfaceInfo::default()
+        });
+
+        let warning = interface_warning(&lookup, "192.0.2.10".parse().unwrap()).unwrap();
+        assert!(warning.contains("192.0.2.10"), "{warning}");
+        assert!(warning.contains("MAC or broadcast"), "{warning}");
+        assert!(
+            warning.contains("Permission denied (os error 13)"),
+            "{warning}"
+        );
+        assert!(warning.contains("AF_NETLINK"), "{warning}");
+    }
+
+    #[test]
+    fn startup_warning_names_missing_mac_without_an_os_error() {
+        let lookup = FixedNetworkLookup(InterfaceInfo {
+            broadcast: Some(Ipv4Addr::BROADCAST),
+            ..InterfaceInfo::default()
+        });
+
+        let warning = interface_warning(&lookup, "192.0.2.10".parse().unwrap()).unwrap();
+        assert!(warning.contains("cannot determine MAC"), "{warning}");
+        assert!(!warning.contains("os error"), "{warning}");
+    }
+
+    #[test]
+    fn startup_warning_skips_loopback_and_complete_interface() {
+        let lookup = FixedNetworkLookup(InterfaceInfo {
+            mac: Some("02:00:00:00:00:01".to_string()),
+            broadcast: Some(Ipv4Addr::BROADCAST),
+            ..InterfaceInfo::default()
+        });
+
+        assert_eq!(
+            interface_warning(&lookup, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None
+        );
+        assert_eq!(
+            interface_warning(&lookup, "192.0.2.10".parse().unwrap()),
+            None
+        );
+    }
 
     #[test]
     fn pair_approve_lists_codes_and_approves_selected_request() {
