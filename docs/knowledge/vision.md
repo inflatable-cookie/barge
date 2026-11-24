@@ -59,10 +59,10 @@ Oxide depend on a running Barge.
 
 Tom's rulings of 2026-11-18 set the next steps:
 
-- **One policy surface for storage.** Barge owns the External layout at a general
-  level. Other tools subscribe to it rather than each carrying its own drive
-  handling, and the drive is tidied through Barge rather than piecemeal. See
-  [resources](resources.md).
+- **One policy surface for storage.** Barge owns the registered external-volume
+  layout at a general level. Other tools subscribe to it rather than each
+  carrying its own drive handling, and the drive is tidied through Barge rather
+  than piecemeal. See [resources](resources.md).
 - **Worktrees are Barge's domain.** Warm, reusable worktree pools are built
   into Barge, in the style of Treehouse. Oxide stays standalone because it is a
   drop-in Cargo replacement that only lightly touches Barge's domain.

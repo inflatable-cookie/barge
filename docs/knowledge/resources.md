@@ -7,8 +7,8 @@ not change.
 
 ## The problem
 
-Moving data onto External was never one move. Each one changed something that
-matters in a different place:
+Moving data to a registered external volume was never one move. Each placement
+changed something that matters in a different place:
 
 - Paseo's worktree root in `~/.paseo/config.json`;
 - Nucleus's `workRoot` in `~/.nucleus/settings.json`;
@@ -58,8 +58,8 @@ volume's availability says whether it can currently be used; its stored
 `durability` field is descriptive metadata and does not set class policy. A
 volume can hold classes of either durability. Each class is placed on one
 registered volume, and different classes can live on different volumes. One
-drive can hold both expendable and kept classes, as External does today. A second
-drive can take some classes over by moving them (see [Moving a class](#moving-a-class)).
+drive can hold both expendable and kept classes. A second drive can take some
+classes over by moving them (see [Moving a class](#moving-a-class)).
 Kept classes sit outside every expendable area (Q-006), so pruning can never
 reach them.
 
@@ -72,7 +72,8 @@ It has two copies, with one authority:
 - **The account layout** (`layout.json` in account state, `barge.layout/1`) is
   the authority on this machine. It covers every volume, so Barge still knows
   where each class belongs while a drive is absent: `barge path scratch` with
-  External unplugged applies that class's absent policy rather than guessing
+  its registered volume unplugged applies that class's absent policy rather than
+  guessing
   (Tom, 2026-11-18).
 - **The volume record** (`<mount>/.barge/layout.json`) lists the classes that
   volume holds and their folders. Barge rewrites it whenever the account layout
@@ -85,21 +86,22 @@ It has two copies, with one authority:
 {
   "schema": "barge.layout/1",
   "classes": {
-    "scratch":   { "volume": "External", "path": "scratch" },
-    "worktrees": { "volume": "External", "path": "worktrees" },
-    "builds":    { "volume": "External", "path": "builds" },
-    "caches":    { "volume": "External", "path": "caches" },
-    "vms":       { "volume": "External", "path": "vms" },
-    "archives":  { "volume": "External", "path": "archives" }
+    "scratch":   { "volume": "<volume>", "path": "scratch" },
+    "worktrees": { "volume": "<volume>", "path": "worktrees" },
+    "builds":    { "volume": "<volume>", "path": "builds" },
+    "caches":    { "volume": "<volume>", "path": "caches" },
+    "vms":       { "volume": "<volume>", "path": "vms" },
+    "archives":  { "volume": "<volume>", "path": "archives" }
   }
 }
 ```
 
 A consumer area (`oxide/pool`) sits inside its class folder by default
-(`builds/oxide/pool`). Oxide's pool and outputs now use
-`builds/oxide/pool` and `builds/oxide/outputs` on Stash
+(`builds/oxide/pool`). Oxide's pool and outputs use `builds/oxide/pool` and
+`builds/oxide/outputs` within the registered external volume
 ([architecture](architecture.md#layout-on-a-volume)). The class folder names
-above describe the current Stash layout.
+above describe the conventional layout; the account layout names the registered
+volume for each class.
 
 ### Bindings
 
@@ -192,7 +194,7 @@ since it would not work for anyone else checking out the code):
 data:
 
 - A **cache placement** moves a tool's cache onto the class folder and points
-  the tool there, for example `~/.cargo/registry → <External>/caches/cargo/registry`.
+  the tool there, for example `~/.cargo/registry → <volume>/caches/cargo/registry`.
   Its contents are expendable: Barge may prune whole cache roots, and the tool
   rebuilds them.
 - A **kept placement** does the same for data that must never be pruned, such
@@ -287,8 +289,8 @@ account.
 
 ## Moving a class
 
-Changing where a class lives is the operation the External tidy needs, so it is
-one command with a plan:
+Changing where a class lives is the operation a volume-layout tidy needs, so it
+is one command with a plan:
 
 ```
 barge move <class> <new-path> --plan > plan.json
@@ -354,8 +356,8 @@ that stopped being real between plan and apply is refused as a changed plan.
 `barge survey <volume>` is read-only. It lists every top-level item with its
 size and classifies it: inside a declared class, a known consumer path not yet
 under a class, or unknown. System items are classified without measuring them;
-unreadable or incomplete trees have approximate sizes. It's the input to the External layout lane's migration
-plan.
+unreadable or incomplete trees have approximate sizes. It's the input to the
+volume-layout migration plan.
 
 ## Library and CLI
 
@@ -384,7 +386,7 @@ Each step is its own brief, reviewed as usual.
 3. **Built:** `init` with the local scratch file. Adopting this repository, then
    Effigy's, is the operator's step after merge.
 4. Adapters: Paseo, Nucleus, Effigy, Colima, shell environment.
-5. **Built:** `move --plan|--apply`; the External layout lane then uses it item by item.
+5. **Built:** `move --plan|--apply`; the volume-layout migration then uses it item by item.
 
 ## Questions
 

@@ -3,10 +3,11 @@
 Barge supports lease, return, run, status and prune, with key-file validation
 for warm dependency folders. Tom approved this design on 2026-11-20.
 
-Barge keeps a warm pool of git worktrees per repository on External and leases
-them to agents. An agent starts in a checkout that already has its dependencies
-installed, instead of cloning and installing from cold. Worktrees are Barge's
-domain ([vision](vision.md#direction)); the reference design is
+Barge keeps a warm pool of git worktrees per repository on a registered
+external volume and leases them to agents. An agent starts in a checkout that
+already has its dependencies installed, instead of cloning and installing from
+cold. Worktrees are Barge's domain ([vision](vision.md#direction)); the
+reference design is
 [Treehouse](https://github.com/kunchenguid/treehouse).
 
 ## Model
@@ -66,6 +67,8 @@ barge worktree lease --repo <origin> --base <sha> [--base-name main]
   `barge worktree lease get --request <id>` or `--lease <id>`.
 - The durable lease, not a process, reserves the root. It stays reserved
   between runs, when nothing holds it, until it is returned.
+- Nucleus keeps one live lease per allocation through revisions, review and
+  restarts, and returns it only at closeout.
 
 ### Return
 
@@ -195,19 +198,18 @@ state directory:
 
 ## Nucleus and Paseo
 
-Barge's Nucleus integration now targets the Rust Nucleus engine (Spec 070).
-The old engine no longer takes new Barge work; the pool integration is being
-built in the Rust engine's worktree crate. Paseo and T3 register the checkout
-provided by Nucleus. Leasing from Barge remains an operator-enabled option, so
-Nucleus can continue using its own worktrees without Barge.
+Barge's Nucleus integration targets the Rust Nucleus engine (Spec 070). The old
+engine no longer takes new Barge work. The pool integration is in progress in
+the Rust engine's worktree crate; the Barge planner reviewed and approved its
+design on 2026-11-24. The pool setting stays off until the engine pins Barge and
+has the quiescence census in place. Paseo and T3 register the checkout provided
+by Nucleus. Leasing from Barge remains an operator-enabled option, so Nucleus
+can continue using its own worktrees without Barge. The return hold ruling is
+recorded in [Rulings](#rulings).
 
-Nucleus proves a checkout quiet before calling `worktree return`, using the
-same check it uses before retiring its own worktrees: a synchronized T3 thread
-snapshot with no pending command, tool or subagent items, plus a working-
-directory and open-file census of the checkout. Barge's return preflight still
-refuses dirty or unproven trees and leaves them with Nucleus. The inherited
-hold is an optional upgrade, not a requirement; `barge worktree run` can keep a
-checkout held while a host command and its children run.
+Barge's return preflight refuses dirty or unproven trees and leaves them with
+Nucleus. `barge worktree run` can keep a checkout held while a host command and
+its children run.
 
 ## Out of scope
 
@@ -220,7 +222,8 @@ whole surface; holds do the coordination), and running installs.
    with tests against real temporary repositories. See
    [on disk and CLI](#on-disk-and-cli).
 2. Built: warm paths with key-file validation, and `prune`.
-3. Nucleus pool integration: built in the Rust Nucleus engine's worktree crate.
+3. **In progress:** Nucleus pool integration in the Rust engine; see
+   [Nucleus and Paseo](#nucleus-and-paseo) for its current state.
 4. Later: pairing a leased worktree with a warm Oxide slot.
 
 ## On disk and CLI
@@ -272,6 +275,11 @@ Implementation details and differences from the approved design:
   finishes the reset.
 
 ## Rulings
+
+The Nucleus planner and Barge planner ruled on 2026-11-24 that an inherited
+hold is optional, and Nucleus proves quiescence before `worktree return` with a
+synchronized T3 thread snapshot plus a working-directory and open-file census
+of the checkout.
 
 Tom, 2026-11-20, approving this design:
 
