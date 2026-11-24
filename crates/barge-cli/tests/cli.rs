@@ -839,6 +839,17 @@ fn help_ignores_options_and_never_runs_the_command() {
     }
     assert!(stderr(&lease).is_empty(), "{}", stderr(&lease));
 
+    let get = fixture.run(&["worktree", "lease", "get", "--help"]);
+    assert_eq!(get.status.code(), Some(0), "{}", stderr(&get));
+    let text = stdout(&get);
+    assert!(text.contains("usage: barge worktree lease get"), "{text}");
+    assert!(text.contains("worktree lease get"), "{text}");
+    assert!(
+        !text.contains("worktree lease --repo"),
+        "{text} names the creation line"
+    );
+    assert!(stderr(&get).is_empty(), "{}", stderr(&get));
+
     let status = fixture.run(&["worktree", "status", "--repo", "R", "--help"]);
     assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
     let text = stdout(&status);

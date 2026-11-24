@@ -178,6 +178,10 @@ fn help_for_words(words: &[&str]) -> String {
     let usage = usage_text();
     let (head, prefix) = match words {
         [] | ["help", ..] => return usage,
+        ["worktree", "lease", "get", ..] => (
+            "usage: barge worktree lease get [--json] <options>",
+            "worktree lease get",
+        ),
         ["worktree", "lease", ..] => (
             "usage: barge worktree lease [--json] <options>",
             "worktree lease",
@@ -319,6 +323,14 @@ mod tests {
         let lease = help_for(&as_strings(&["worktree", "lease", "--repo", "R"])).unwrap();
         assert!(lease.contains("worktree lease --repo"));
         assert!(!lease.contains("worktree return"));
+
+        let get = help_for(&as_strings(&["worktree", "lease", "get"])).unwrap();
+        assert!(get.contains("usage: barge worktree lease get"));
+        assert!(get.contains("worktree lease get"));
+        assert!(
+            !get.contains("worktree lease --repo"),
+            "the get leaf excludes the creation line: {get}"
+        );
 
         let status = help_for(&as_strings(&["worktree", "status", "--repo", "R"])).unwrap();
         assert!(status.contains("worktree status [--repo R]"));
