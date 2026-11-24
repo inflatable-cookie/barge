@@ -260,6 +260,7 @@ impl Harness {
             mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
             broadcast: Some(Ipv4Addr::new(192, 0, 2, 255)),
             interface_index: Some(2),
+            lookup_error: None,
         }));
         let mut built = Daemon::new(&config, controller.clone(), peers, clock.clone())
             .unwrap()

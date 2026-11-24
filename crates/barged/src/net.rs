@@ -11,6 +11,8 @@ pub struct InterfaceInfo {
     pub mac: Option<String>,
     pub broadcast: Option<Ipv4Addr>,
     pub interface_index: Option<i32>,
+    /// The OS error from reading interface metadata, when the lookup failed.
+    pub lookup_error: Option<String>,
 }
 
 /// Resolves interface metadata for the address `barged` binds.
@@ -35,7 +37,13 @@ fn lookup_via_getifaddrs(target: IpAddr) -> InterfaceInfo {
     let mut head: *mut libc::ifaddrs = ptr::null_mut();
     // SAFETY: `getifaddrs` initializes `head` on success (return 0) and is freed
     // via `freeifaddrs` before returning.
-    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return InterfaceInfo {
+            lookup_error: Some(std::io::Error::last_os_error().to_string()),
+            ..InterfaceInfo::default()
+        };
+    }
+    if head.is_null() {
         return InterfaceInfo::default();
     }
 
@@ -118,6 +126,7 @@ fn lookup_via_getifaddrs(target: IpAddr) -> InterfaceInfo {
         mac,
         broadcast,
         interface_index,
+        lookup_error: None,
     }
 }
 

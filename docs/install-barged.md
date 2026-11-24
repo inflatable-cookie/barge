@@ -214,10 +214,10 @@ curl http://pc.example.ts.net:9777/v1/state
   carries no paired client's signature. The daemon could also not ask tailscaled
   who the caller is. `journalctl --user -u barged` names which. Re-check
   `tailscale status --json` and `tailscale set --operator`.
-- **State has no `mac` or `broadcast`, so clients can't wake the PC.** The
-  unit predates `AF_NETLINK` in `RestrictAddressFamilies`, which `barged`
-  needs to read the interface's MAC. Copy the unit again, run
-  `systemctl --user daemon-reload` and restart `barged`.
+- **`barged` warns that the bound interface has no `mac` or `broadcast`.** A
+  sandboxed unit needs `AF_NETLINK` in `RestrictAddressFamilies` to read the
+  interface's MAC. Copy the unit again, run `systemctl --user daemon-reload`
+  and restart `barged`.
 - **`sleep` accepted but nothing happens.** polkit denied the logind call; the
   journal shows `logind refused Suspend`. Check the rule's account name and
   whether a second active session needs the `-multiple-sessions` variant, or an
