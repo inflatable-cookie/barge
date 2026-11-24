@@ -37,7 +37,7 @@ A **class** is one kind of heavy developer data. It declares:
   VM disks);
 - **absent policy:** `Fail` or `Fallback(path)`, as for areas today.
 
-The starting set:
+The six resource classes:
 
 | Class | Durability | Contents owned by | Examples |
 |---|---|---|---|
@@ -96,10 +96,10 @@ It has two copies, with one authority:
 ```
 
 A consumer area (`oxide/pool`) sits inside its class folder by default
-(`builds/oxide/pool`) and can be overridden to an existing path, as Oxide's two
-areas are today ([architecture](architecture.md#layout-on-a-volume)), until a
-move puts them under the class folder. The External layout lane settles the actual
-target layout. The folder names above are a first proposal.
+(`builds/oxide/pool`). Oxide's pool and outputs now use
+`builds/oxide/pool` and `builds/oxide/outputs` on Stash
+([architecture](architecture.md#layout-on-a-volume)). The class folder names
+above describe the current Stash layout.
 
 ### Bindings
 

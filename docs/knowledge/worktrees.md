@@ -195,44 +195,19 @@ state directory:
 
 ## Nucleus and Paseo
 
-Nucleus creates and owns task worktrees today, under its `workRoot`
-(`<workRoot>/<hash>/ns-<task>`); Paseo and T3 only
-register the directory Nucleus made. The Nucleus planner confirmed
-(2026-11-20) there is no seam for an outside provider: a Paseo plugin runs too
-late. Taking workspaces from Barge needs a host-independent change to Nucleus's
-workspace allocator and retirement. That is Nucleus's change, briefed and owned
-by the Nucleus planner, built after Barge's CLI exists.
+Barge's Nucleus integration now targets the Rust Nucleus engine (Spec 070).
+The old engine no longer takes new Barge work; the pool integration is being
+built in the Rust engine's worktree crate. Paseo and T3 register the checkout
+provided by Nucleus. Leasing from Barge remains an operator-enabled option, so
+Nucleus can continue using its own worktrees without Barge.
 
-Barge stays optional for Nucleus (Tom, 2026-11-21). Leasing from a Barge pool
-is a setting the operator turns on; without it, Nucleus makes its own
-worktrees under `workRoot` as it does today, and works with Barge not
-installed. If Nucleus is later written in Rust, it may link the `barge`
-library directly, as Oxide does, instead of calling the CLI. The lease state
-on disk is then the contract both share, so a linked Nucleus and a standalone
-`barge` must agree on its format.
-
-What Nucleus needs from Barge, and this contract gives it:
-
-- a lease keyed by allocation, with the task ID as a label, bound to the
-  repository identity, the exact base commit and the task branch;
-- a canonical path, a stable lease ID and the verified branch and head;
-- durable recording before the reply, and read-back by request or lease ID for
-  a reply that was lost, on both lease and return, with the lease's state
-  (`leased`, `returning`, `returned`, `interrupted`);
-- a return fenced to its lease ID and against new holds, whose replay never
-  touches a root that has been leased again;
-- one live lease per allocation, kept through revisions, review, restart and
-  unsettled effects. A task has one allocation at a time; replacing a lost
-  checkout or moving hosts ends that allocation and takes a new request ID.
-  Nucleus returns the last lease only at closeout;
-- a return that refuses dirty or unproven work and leaves it with Nucleus,
-  with `--disposable` carrying Nucleus's own publication evidence.
-
-- a hold seam: `barge worktree run` keeps a checkout held for as long as a
-  host's command and its children run, and a return is refused meanwhile;
-
-Nucleus still proves a clean tree at admission and an idle, tool-free tree at
-closeout, and removes only its own registration.
+Nucleus proves a checkout quiet before calling `worktree return`, using the
+same check it uses before retiring its own worktrees: a synchronized T3 thread
+snapshot with no pending command, tool or subagent items, plus a working-
+directory and open-file census of the checkout. Barge's return preflight still
+refuses dirty or unproven trees and leaves them with Nucleus. The inherited
+hold is an optional upgrade, not a requirement; `barge worktree run` can keep a
+checkout held while a host command and its children run.
 
 ## Out of scope
 
@@ -245,8 +220,7 @@ whole surface; holds do the coordination), and running installs.
    with tests against real temporary repositories. See
    [on disk and CLI](#on-disk-and-cli).
 2. Built: warm paths with key-file validation, and `prune`.
-3. Nucleus integration: the Nucleus planner briefs its allocator change
-   against this contract.
+3. Nucleus pool integration: built in the Rust Nucleus engine's worktree crate.
 4. Later: pairing a leased worktree with a warm Oxide slot.
 
 ## On disk and CLI
