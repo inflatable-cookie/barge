@@ -96,7 +96,7 @@ Only clickable items, plus a disabled header per machine. Items appear and
 disappear as state changes; the countdown text updates every second.
 
 ```
-External · 2,284 GiB free        → opens the Storage view
+<volume> · 2,284 GiB free        → opens the Storage view
 ─────────
 linux-pc — Awake               (disabled header)
   Sleep
