@@ -8,6 +8,11 @@ use std::ptr;
 /// Hardware MAC, IPv4 broadcast address and OS interface index for a bound IP.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct InterfaceInfo {
+    /// Whether an interface had the bound address.
+    pub interface_found: bool,
+    /// Whether the matched interface supports IPv4 broadcast (and is not
+    /// point-to-point or loopback).
+    pub broadcast_capable: bool,
     pub mac: Option<String>,
     pub broadcast: Option<Ipv4Addr>,
     pub interface_index: Option<i32>,
@@ -48,6 +53,8 @@ fn lookup_via_getifaddrs(target: IpAddr) -> InterfaceInfo {
     }
 
     let mut matched_ifname: Option<String> = None;
+    let mut interface_found = false;
+    let mut broadcast_capable = false;
     let mut broadcast: Option<Ipv4Addr> = None;
     let mut mac: Option<String> = None;
     let mut interface_index: Option<i32> = None;
@@ -74,6 +81,11 @@ fn lookup_via_getifaddrs(target: IpAddr) -> InterfaceInfo {
                         let idx = unsafe { libc::if_nametoindex(ifa.ifa_name) };
                         interface_index = i32::try_from(idx).ok().filter(|v| *v > 0);
                         broadcast = extract_broadcast(ifa, addr);
+                        interface_found = true;
+                        broadcast_capable = (ifa.ifa_flags & libc::IFF_BROADCAST as u32) != 0
+                            && (ifa.ifa_flags
+                                & (libc::IFF_POINTOPOINT | libc::IFF_LOOPBACK) as u32)
+                                == 0;
                         matched_ifname = Some(name);
                         break;
                     }
@@ -89,6 +101,7 @@ fn lookup_via_getifaddrs(target: IpAddr) -> InterfaceInfo {
                         // SAFETY: `ifa_name` is a NUL-terminated C string.
                         let idx = unsafe { libc::if_nametoindex(ifa.ifa_name) };
                         interface_index = i32::try_from(idx).ok().filter(|v| *v > 0);
+                        interface_found = true;
                         matched_ifname = Some(name);
                         break;
                     }
@@ -123,6 +136,8 @@ fn lookup_via_getifaddrs(target: IpAddr) -> InterfaceInfo {
     unsafe { libc::freeifaddrs(head) };
 
     InterfaceInfo {
+        interface_found,
+        broadcast_capable,
         mac,
         broadcast,
         interface_index,

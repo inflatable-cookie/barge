@@ -257,6 +257,8 @@ impl Harness {
         });
         let notifier = Arc::new(FakeNotifier::default());
         let network = Arc::new(FakeNetwork(InterfaceInfo {
+            interface_found: true,
+            broadcast_capable: true,
             mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
             broadcast: Some(Ipv4Addr::new(192, 0, 2, 255)),
             interface_index: Some(2),
