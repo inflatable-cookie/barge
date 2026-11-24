@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use support::{parse_document, stderr, Fixture};
+use support::{parse_document, stderr, stdout, Fixture};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -310,5 +310,33 @@ fn usage_errors_name_the_problem_and_a_command_that_cannot_start_releases_the_ho
     assert_eq!(document["error"]["kind"], "usage");
 
     // Nothing was started, so the failed exec must have released its hold.
+    return_when_free(&fixture, &lease_id);
+}
+
+#[test]
+fn flags_after_the_separator_belong_to_the_command() {
+    let (fixture, lease_id, _checkout) = setup();
+    let output = fixture
+        .barge(&[
+            "worktree",
+            "run",
+            "--lease",
+            &lease_id,
+            "--",
+            "sh",
+            "-c",
+            "echo \"$@\"",
+            "_",
+            "--json",
+            "--help",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output).trim(),
+        "--json --help",
+        "a --json or --help after -- reaches the child untouched"
+    );
     return_when_free(&fixture, &lease_id);
 }
