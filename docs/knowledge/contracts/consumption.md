@@ -95,8 +95,10 @@ A failing command writes `{"schema": "barge.error/1", "error": {"kind": "...",
 "message": "..."}}` to **stderr** in `--json` mode, and nothing to stdout. Human mode prints a plain error to stderr. `kind`
 is one of `refused`, `not_found`, `usage`, `io`, `unknown_state`,
 `unsupported`. [Architecture](../architecture.md#cli) owns the exit codes each
-kind maps to. `--json` precedes the command and selects the document form.
-`worktree prune` also accepts `--json` at the end. `env` emits
+kind maps to. `--json` may appear anywhere before `--` and selects the
+document form. `--help` (or `-h`) before `--` prints the deepest matching
+command's usage, or the top-level usage when nothing matches, and exits 0
+without running anything. `env` emits
 shell assignments and refuses `--json`. A move or bind plan is read from a file
 or from standard input (`-`). Input that cannot be read is `usage`.
 

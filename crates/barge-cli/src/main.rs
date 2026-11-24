@@ -58,12 +58,12 @@ fn main() -> ExitCode {
         }
     }
     if help {
+        // `help_for` falls back to the top-level usage for an unknown
+        // command, so `--help` always prints and never runs anything.
         if let Some(text) = help_for(&cleaned) {
             print!("{text}");
             return ExitCode::SUCCESS;
         }
-        // An unknown command keeps today's usage error, with the help flag
-        // left out of the reported command line.
     }
     cleaned.extend(after);
     match run(&cleaned, json) {
