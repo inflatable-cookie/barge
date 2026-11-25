@@ -6,9 +6,9 @@ use crate::human::describe_size;
 use crate::output::document;
 
 pub(crate) fn survey(arguments: &[String], json: bool) -> Result<()> {
-    let options = Options::parse(arguments, &[], &["no-bytes"])?;
+    let options = Options::parse(arguments, &[], &["bytes", "no-bytes"])?;
     let name = options.single("survey", "volume")?;
-    let items = Barge::open_read_only()?.survey(&name, !options.flag("no-bytes"))?;
+    let items = Barge::open_read_only()?.survey(&name, options.flag("bytes"))?;
     if json {
         document(
             "barge.survey/1",

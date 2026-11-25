@@ -954,7 +954,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         crate::root::write_marker(&root, &marker("0123456789abcdef")).unwrap();
         for _ in 0..MAX_DEPTH + 2 {
-            deepest = deepest.join("nested");
+            deepest = deepest.join("n");
             std::fs::create_dir(&deepest).unwrap();
         }
         let removed = Tree::open(&root).unwrap().remove().unwrap();

@@ -680,6 +680,59 @@ fn remaining_json_contracts_and_read_only_commands() {
 }
 
 #[test]
+fn survey_classifies_by_default_and_sizes_only_with_bytes() {
+    let fixture = Fixture::new();
+    let registration = fixture.json(&[
+        "volume",
+        "register",
+        "--name",
+        "Builds",
+        "--mount",
+        fixture.mount(),
+    ]);
+    assert!(registration.status.success(), "{}", stderr(&registration));
+
+    let bulk = fixture.mount.join("bulk");
+    std::fs::create_dir(&bulk).unwrap();
+    std::fs::write(bulk.join("payload"), vec![42_u8; 4096]).unwrap();
+    std::fs::write(fixture.mount.join(".DS_Store"), b"system metadata").unwrap();
+
+    let bare = fixture.json(&["survey", "Builds"]);
+    assert!(bare.status.success(), "{}", stderr(&bare));
+    let bare = parse_document(&bare);
+    let bare_items = bare["data"]["items"].as_array().unwrap();
+    assert!(!bare_items.is_empty());
+    assert!(bare_items.iter().all(|item| item["bytes"].is_null()));
+
+    let sized = fixture.json(&["survey", "Builds", "--bytes"]);
+    assert!(sized.status.success(), "{}", stderr(&sized));
+    let sized = parse_document(&sized);
+    assert!(sized["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| { item["classification"] == "system" || item["bytes"].as_u64().is_some() }));
+    let bulk_item = sized["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["path"].as_str().unwrap().ends_with("/bulk"))
+        .unwrap();
+    assert!(bulk_item["bytes"].as_u64().unwrap() > 0);
+    let system_item = sized["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["classification"] == "system")
+        .unwrap();
+    assert!(system_item["bytes"].is_null());
+
+    let no_bytes = fixture.json(&["survey", "Builds", "--no-bytes"]);
+    assert!(no_bytes.status.success(), "{}", stderr(&no_bytes));
+    assert_eq!(parse_document(&no_bytes), bare);
+}
+
+#[test]
 fn usage_and_passive_commands_do_not_create_state() {
     let fixture = Fixture::new();
     let missing = fixture.temp.child("missing-state");
@@ -1121,7 +1174,7 @@ fn every_command_answers_help_without_doing_anything() {
         (
             vec!["survey", "--help"],
             "usage: barge survey",
-            "inspect top-level",
+            "classify top-level",
         ),
         (
             vec!["env", "--help"],

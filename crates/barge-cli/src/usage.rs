@@ -16,8 +16,9 @@ usage: barge path [--json] <class> [--project P]
   path <class> [--project P]              resolve a resource path
 usage: barge env [--shell zsh|bash|fish]
   env [--shell zsh|bash|fish]             shell assignments
-usage: barge survey [--json] <volume> [--no-bytes]
-  survey <volume> [--no-bytes]            inspect top-level items
+usage: barge survey [--json] <volume> [--bytes] [--no-bytes]
+  survey <volume> [--bytes] [--no-bytes]  classify top-level items; --no-bytes is deprecated
+                                          --bytes walks every non-system item; it can take minutes on a large drive
 usage: barge status [--json]
   status                                  every volume, area and free space
 usage: barge volume [--json] <command>
@@ -281,6 +282,7 @@ mod tests {
             &["layout", "show"],
             &["path", "caches"],
             &["env"],
+            &["survey", "Builds", "--bytes"],
             &["survey", "Builds", "--no-bytes"],
             &["status"],
             &["status", "anything"],
@@ -354,7 +356,7 @@ mod tests {
             (&["env"], "usage: barge env [--shell zsh|bash|fish]"),
             (
                 &["survey"],
-                "usage: barge survey [--json] <volume> [--no-bytes]",
+                "usage: barge survey [--json] <volume> [--bytes] [--no-bytes]",
             ),
             (&["status"], "usage: barge status [--json]"),
             (&["volume"], "usage: barge volume [--json] <command>"),
