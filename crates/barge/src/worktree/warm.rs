@@ -1,6 +1,7 @@
 //! Hashes describe the outgoing checkout, and survive a return's reset.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -157,6 +158,7 @@ fn tracked_overlap(tracked: &BTreeSet<String>, entry: &str) -> bool {
 fn hashes(tree: &Path, pool: &Pool) -> Result<BTreeMap<String, String>> {
     let checkout = Tree::open(tree)?;
     let mut hashes = BTreeMap::<_, Sha256>::new();
+    let mut buffer = [0; 8192];
     for warm in &pool.warm_paths {
         let hash = hashes.entry(warm.path.clone()).or_default();
         for key in &warm.keys {
@@ -168,8 +170,16 @@ fn hashes(tree: &Path, pool: &Pool) -> Result<BTreeMap<String, String>> {
                 None => hash.update([0]),
                 Some(mut file) => {
                     let mut contents = Sha256::new();
-                    std::io::copy(&mut file, &mut contents)
-                        .map_err(|source| Error::io("cannot hash", &tree.join(key), &source))?;
+                    loop {
+                        match file.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(size) => contents.update(&buffer[..size]),
+                            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                            Err(error) => {
+                                return Err(Error::io("cannot hash", &tree.join(key), &error))
+                            }
+                        }
+                    }
                     hash.update([1]);
                     hash.update(contents.finalize());
                 }
@@ -178,7 +188,14 @@ fn hashes(tree: &Path, pool: &Pool) -> Result<BTreeMap<String, String>> {
     }
     Ok(hashes
         .into_iter()
-        .map(|(path, hash)| (path, format!("{:x}", hash.finalize())))
+        .map(|(path, hash)| {
+            let hex = hash
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            (path, hex)
+        })
         .collect())
 }
 

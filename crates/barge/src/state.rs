@@ -112,6 +112,22 @@ impl StateDir {
         StateLock::acquire(&self.root)
     }
 
+    /// Try the same account lock without waiting for another writer.
+    pub(crate) fn try_lock(&self) -> Result<Option<StateLock>> {
+        let file = StateLock::open(&self.root)?;
+        let acquired = crate::os::flock(&file, Mode::Exclusive, false)?;
+        Ok(acquired.then_some(StateLock { _file: file }))
+    }
+
+    /// Take the account lock for a snapshot without creating any files.
+    pub(crate) fn read_lock(&self) -> Result<StateLock> {
+        let path = self.root.join(LOCK_NAME);
+        let file = File::open(&path)
+            .map_err(|error| Error::io("cannot open the state lock", &path, &error))?;
+        crate::os::flock(&file, Mode::Shared, true)?;
+        Ok(StateLock { _file: file })
+    }
+
     /// Read `volumes.json`. A missing file is an empty account.
     pub(crate) fn read_volumes(&self) -> Result<Vec<VolumeSpec>> {
         let path = self.volumes_path();
@@ -240,10 +256,13 @@ pub(crate) struct StateLock {
 
 impl StateLock {
     fn acquire(root: &Path) -> Result<Self> {
-        let path = root.join(LOCK_NAME);
-        let file = crate::os::open_lock(&path, "cannot open the state lock")?;
+        let file = Self::open(root)?;
         crate::os::flock(&file, Mode::Exclusive, true)?;
         Ok(Self { _file: file })
+    }
+
+    fn open(root: &Path) -> Result<File> {
+        crate::os::open_lock(&root.join(LOCK_NAME), "cannot open the state lock")
     }
 }
 

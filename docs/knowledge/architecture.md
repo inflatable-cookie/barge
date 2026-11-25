@@ -214,6 +214,10 @@ reported as unheld.
 [`WorktreeHold`](worktrees.md#run) supports spawning from a service with
 `spawn` or `spawn_with`, and replacing the caller with `exec`.
 
+The [container module](containers.md) exposes `container_lease`,
+`container_return` and `container_status` for reservations and their endings.
+Consumers use that status to clean up their own stacks.
+
 The stored documents carry their own schema names (`barge.volumes/1`,
 `barge.layout/1`, `barge.bindings/1`, `barge.area/1`, `barge.root/1` and `/2`,
 `barge.pin/1`, `barge.activity/1`
@@ -320,6 +324,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 - `prune --volume v [--dry-run]`;
 - `scratch new | scratch sweep`;
 - `worktree lease | lease get | return | run | status | prune` ([worktrees](worktrees.md#on-disk-and-cli));
+- `container status | return <id>` ([containers](containers.md#cli));
 - `status`;
 - `layout show | layout set`;
 - `path <class> [--project p]`; `env [--shell zsh|bash|fish]`;

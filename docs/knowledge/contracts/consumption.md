@@ -88,6 +88,8 @@ below read `_name`, `_key` and `_state`.
 | `barge.worktree-return/1` | `action: string`, `lease: worktree-lease` | worktree return |
 | `barge.worktree-status/1` | `pools: [worktree-pool]` | worktree status |
 | `barge.worktree-prune/1` | `dry_run: bool`, `worktree_prune: [worktree-prune]` | worktree prune |
+| `barge.container-status/1` | `leases: [container-lease-status]` | container status |
+| `barge.container-return/1` | `id: string` | container return |
 
 Survey items use `bytes: null` by default. The CLI measures non-system items
 only when `barge survey <volume> --bytes` is requested; that walks every
@@ -160,5 +162,13 @@ or from standard input (`-`). Input that cannot be read is `usage`.
 | `worktree-root` | `id: string`, `path: string`, `held: bool`, `state: string`, `lease_id?: string`, `request?: string`, `branch?: string` |
 | `worktree-prune` | `repo: string`, `created: int`, `evicted: [string]`, `finished: [string]` |
 | `worktree-clone-problem` | `repo: string`, `path?: string`, `reason: string` |
+| `container-lease-status` | `id: string`, `profile: string`, `project: string`, `owner: container-owner`, `class: string`, `ended: container-ending?` |
+| `container-owner` | `worktree?: string`, `checkout?: string` |
+| `container-ending` | `reason: string`, `remove_volumes: bool` |
 
 `doctor` and `init --check` can exit 1 while emitting their success document when they detect drift.
+
+A container owner carries exactly one field, `worktree` (a lease ID) or
+`checkout` (an absolute path). Lease class is `worker` or `interactive`.
+An ending has reason `owner_ended` or `hold_released`. See the [container
+lifecycle](../containers.md#lifecycle).

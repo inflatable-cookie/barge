@@ -16,6 +16,7 @@ pub mod area;
 pub mod area_spec;
 pub mod bindings;
 pub mod clock;
+pub mod container;
 pub mod doctor;
 pub mod error;
 pub mod hold;

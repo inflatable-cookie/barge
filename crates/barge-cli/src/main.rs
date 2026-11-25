@@ -15,6 +15,7 @@ use barge::{Error, Result};
 mod area;
 mod args;
 mod bind;
+mod container;
 mod doctor;
 mod human;
 mod init;
@@ -158,6 +159,10 @@ fn dispatch(command: &str, rest: &[String], json: bool) -> Result<ExitCode> {
         }
         "machine" => {
             machine::machine(rest, json)?;
+            ExitCode::SUCCESS
+        }
+        "container" => {
+            container::container(rest, json)?;
             ExitCode::SUCCESS
         }
         "worktree" => {
