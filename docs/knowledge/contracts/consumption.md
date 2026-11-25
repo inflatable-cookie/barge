@@ -89,6 +89,11 @@ below read `_name`, `_key` and `_state`.
 | `barge.worktree-status/1` | `pools: [worktree-pool]` | worktree status |
 | `barge.worktree-prune/1` | `dry_run: bool`, `worktree_prune: [worktree-prune]` | worktree prune |
 
+Survey items use `bytes: null` by default. The CLI measures non-system items
+only when `barge survey <volume> --bytes` is requested; that walks every
+non-system item and can take minutes on a large drive. System items always
+have `bytes: null`.
+
 ## Error documents
 
 A failing command writes `{"schema": "barge.error/1", "error": {"kind": "...",

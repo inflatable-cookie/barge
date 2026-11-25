@@ -323,7 +323,9 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 - `status`;
 - `layout show | layout set`;
 - `path <class> [--project p]`; `env [--shell zsh|bash|fish]`;
-- `survey <volume> [--no-bytes]`;
+- `survey <volume> [--bytes] [--no-bytes]` (classification only by default;
+  `--bytes` walks every non-system item and can take minutes on a large drive;
+  `--no-bytes` is deprecated);
 - `bind list | plan | apply | adopt | undo`;
 - `init [--project p] [--path dir] [--check]`, which writes or reports the
   uncommitted `AGENTS.local.md` scratch file from the layout

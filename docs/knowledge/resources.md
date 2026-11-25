@@ -353,11 +353,14 @@ that stopped being real between plan and apply is refused as a changed plan.
 
 ## Survey
 
-`barge survey <volume>` is read-only. It lists every top-level item with its
-size and classifies it: inside a declared class, a known consumer path not yet
-under a class, or unknown. System items are classified without measuring them;
-unreadable or incomplete trees have approximate sizes. It's the input to the
-volume-layout migration plan.
+`barge survey <volume>` is read-only and classifies every top-level item:
+inside a declared class, a known consumer path not yet under a class, system
+metadata, or unknown. By default it does not measure item sizes, so it gives a
+quick layout view on a large drive. Pass `--bytes` to measure each non-system
+item; it walks all of them and can take minutes on a large drive. Unreadable or
+incomplete trees have approximate sizes when measured. `--no-bytes` remains
+accepted as a deprecated no-op. The survey is the input to the volume-layout
+migration plan.
 
 ## Library and CLI
 
