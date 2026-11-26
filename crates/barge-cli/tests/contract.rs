@@ -397,10 +397,67 @@ fn every_documented_success_document_matches_its_commands_output() {
     assert!(returned.status.success(), "{}", stderr(&returned));
     parse_document(&returned);
 
+    check_container_documents(&fixture);
+
     // The other direction: a documented schema no command produced would let a
     // stale row pass unnoticed.
     let unseen = support::contract().unseen();
     assert!(unseen.is_empty(), "no command produced {unseen:?}");
+}
+
+fn check_container_documents(fixture: &Fixture) {
+    use std::sync::Arc;
+
+    use barge::container::{
+        ContainerClass, ContainerLeaseOutcome, ContainerLeaseRequest, ContainerOwner,
+    };
+    use barge::{Barge, FakeOs, ManualClock};
+
+    std::fs::write(
+        fixture.state.join("container-profiles.json"),
+        r#"{"profiles":[{"name":"test","max":1}]}"#,
+    )
+    .unwrap();
+    let barge = Barge::open_with(
+        &fixture.state,
+        Arc::new(FakeOs::new()),
+        Arc::new(ManualClock::new(0)),
+    )
+    .unwrap();
+    let outcome = barge
+        .container_lease(&ContainerLeaseRequest {
+            profile: "test".to_owned(),
+            project: "recorded".to_owned(),
+            owner: ContainerOwner::Checkout(fixture.home.clone()),
+            class: ContainerClass::Worker,
+            hold: true,
+            wait: None,
+        })
+        .unwrap();
+    let ContainerLeaseOutcome::Leased(lease) = outcome else {
+        panic!("expected a lease, got {outcome:?}");
+    };
+    let id = lease.id().to_owned();
+    let active = parse_document(&fixture.json(&["container", "status"]));
+    assert_eq!(active["data"]["leases"][0]["id"], id);
+    assert!(active["data"]["leases"][0]["ended"].is_null());
+
+    drop(lease);
+    let ended = parse_document(&fixture.json(&["container", "status"]));
+    assert_eq!(
+        ended["data"]["leases"][0]["ended"]["reason"],
+        "hold_released"
+    );
+    assert_eq!(ended["data"]["leases"][0]["ended"]["remove_volumes"], false);
+
+    let returned = parse_document(&fixture.json(&["container", "return", &id]));
+    assert_eq!(returned["data"]["id"], id);
+    assert_eq!(
+        parse_document(&fixture.json(&["container", "return", &id])),
+        returned
+    );
+    let empty = parse_document(&fixture.json(&["container", "status"]));
+    assert_eq!(empty["data"]["leases"], json!([]));
 }
 
 /// A local origin repository with one commit on `main`. Returns the commit.

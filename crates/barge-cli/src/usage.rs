@@ -75,6 +75,11 @@ usage: barge worktree status [--json] [--repo R]
   worktree status [--repo R]              pools, roots and the leases on them
 usage: barge worktree prune [--json] [--repo R] [--dry-run]
   worktree prune [--repo R] [--dry-run]   maintain each pool’s free checkout target
+usage: barge container <command>
+usage: barge container status [--json]
+  container status                      leases and their endings
+usage: barge container return [--json] <id>
+  container return <id>                 release a lease after stopping its stack
 usage: barge scratch <command>
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
@@ -158,8 +163,23 @@ fn command_words(path: &[String]) -> Vec<&str> {
 /// it, so multi-line options stay with their command. `usage:` headers and
 /// unindented lines separate entries instead.
 const VERBS: &[&str] = &[
-    "layout", "path", "env", "survey", "status", "volume", "area", "root", "bind", "move",
-    "doctor", "init", "prune", "worktree", "scratch", "machine",
+    "layout",
+    "path",
+    "env",
+    "survey",
+    "status",
+    "volume",
+    "area",
+    "root",
+    "bind",
+    "move",
+    "doctor",
+    "init",
+    "prune",
+    "worktree",
+    "container",
+    "scratch",
+    "machine",
 ];
 
 fn starts_entry(trimmed: &str) -> bool {
@@ -273,6 +293,9 @@ mod tests {
             &["worktree", "status", "--repo", "R"],
             &["worktree", "prune", "--dry-run"],
             &["worktree", "bogus"],
+            &["container"],
+            &["container", "status"],
+            &["container", "return", "ID"],
             &["scratch"],
             &["scratch", "new"],
             &["doctor"],
@@ -344,6 +367,15 @@ mod tests {
             (
                 &["worktree", "prune"],
                 "usage: barge worktree prune [--json] [--repo R] [--dry-run]",
+            ),
+            (&["container"], "usage: barge container <command>"),
+            (
+                &["container", "status"],
+                "usage: barge container status [--json]",
+            ),
+            (
+                &["container", "return", "ID"],
+                "usage: barge container return [--json] <id>",
             ),
             (&["scratch"], "usage: barge scratch <command>"),
             (&["doctor"], "usage: barge doctor [--json]"),

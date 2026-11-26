@@ -7,6 +7,7 @@ Barge moves heavy, rebuildable developer data (build output, caches, scratch) of
 - [Resources and bindings](knowledge/resources.md)
 - [Machines](knowledge/machines.md)
 - [Worktree pools](knowledge/worktrees.md)
+- [Container leases](knowledge/containers.md)
 - [Barge app](knowledge/app.md)
 - [Consumption contract](knowledge/contracts/consumption.md)
 - [Quality gate](knowledge/contracts/quality.md)

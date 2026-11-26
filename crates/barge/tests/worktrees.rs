@@ -1196,3 +1196,47 @@ fn doctor_reports_missing_and_corrupt_clones() {
         Some(&clone)
     );
 }
+
+#[test]
+fn container_status_recognizes_a_returned_worktree_owner() {
+    use barge::container::{
+        ContainerClass, ContainerEndReason, ContainerEnding, ContainerLeaseOutcome,
+        ContainerLeaseRequest, ContainerOwner,
+    };
+
+    let (fixture, origin) = setup("container-owner", 2, json!([]), &[]);
+    let barge = &fixture.barge;
+    fs::write(
+        barge.state_dir().join("container-profiles.json"),
+        r#"{"profiles":[{"name":"effigy","max":1}]}"#,
+    )
+    .unwrap();
+    let worktree = lease(&fixture, &origin, "owner", "task/owner");
+    let stack = barge
+        .container_lease(&ContainerLeaseRequest {
+            profile: "effigy".to_owned(),
+            project: "project".to_owned(),
+            owner: ContainerOwner::Worktree(worktree.lease_id.clone()),
+            class: ContainerClass::Worker,
+            hold: false,
+            wait: None,
+        })
+        .unwrap();
+    let ContainerLeaseOutcome::Leased(stack) = stack else {
+        panic!("expected a lease, got {stack:?}");
+    };
+    assert!(barge.container_status().unwrap()[0].ended.is_none());
+    barge
+        .worktree_return(&worktree.lease_id, None, false)
+        .unwrap();
+    assert!(tree(&worktree).is_dir(), "the pool retains the checkout");
+    let status = barge.container_status().unwrap();
+    assert_eq!(status[0].id, stack.id());
+    assert_eq!(
+        status[0].ended,
+        Some(ContainerEnding {
+            reason: ContainerEndReason::OwnerEnded,
+            remove_volumes: true,
+        })
+    );
+}
