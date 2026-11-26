@@ -231,7 +231,7 @@ impl Barge {
         }
         // Once eligible for teardown, a lease must be returned before it can
         // serve a new run. Status uses the same account lock as this check.
-        if ending(self, &record)?.is_some() {
+        if ending(self, &record).is_some() {
             return Err(Error::refused(format!(
                 "container lease {} has ended and needs to be returned",
                 record.id
@@ -272,7 +272,7 @@ impl Barge {
         let status = records::all(state)?
             .into_iter()
             .map(|record| {
-                let ended = ending(self, &record).ok().flatten();
+                let ended = ending(self, &record);
                 ContainerLeaseStatus {
                     id: record.id,
                     profile: record.profile,
@@ -287,21 +287,22 @@ impl Barge {
     }
 }
 
-fn ending(barge: &Barge, record: &LeaseRecord) -> Result<Option<ContainerEnding>> {
-    if record.owner.ended(barge)? {
-        return Ok(Some(ContainerEnding {
+fn ending(barge: &Barge, record: &LeaseRecord) -> Option<ContainerEnding> {
+    // An inconclusive owner or lock check keeps the reservation.
+    if record.owner.ended(barge).ok()? {
+        return Some(ContainerEnding {
             reason: ContainerEndReason::OwnerEnded,
             remove_volumes: true,
-        }));
+        });
     }
     if record.class == ContainerClass::Worker
         && record.hold
-        && !record.is_held(barge.state_dir())?
+        && !record.is_held(barge.state_dir()).ok()?
     {
-        return Ok(Some(ContainerEnding {
+        return Some(ContainerEnding {
             reason: ContainerEndReason::HoldReleased,
             remove_volumes: false,
-        }));
+        });
     }
-    Ok(None)
+    None
 }

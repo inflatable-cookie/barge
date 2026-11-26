@@ -38,7 +38,7 @@ produces `OwnerEnded` with `remove_volumes: true`. A worker whose last hold is
 released while its owner is live shows `HoldReleased` with
 `remove_volumes: false`, preserving data for the next run. Interactive leases
 end only with their owner. If Barge cannot determine liveness, it leaves
-`ended` empty.
+`ended` empty, and a repeat request from the same owner keeps the lease ID.
 
 Ended worker leases still count against the limit until returned. The leased
 project stays reserved for cleanup. `container_return(id)` drops the

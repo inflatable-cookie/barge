@@ -206,13 +206,11 @@ fn a_missing_hold_file_leaves_the_lease_reserved() {
     let fixture = Fixture::new();
     let barge = &fixture.barge;
     declare(barge, &[("effigy", 1)]);
-    let held = lease(
-        barge,
-        &ContainerLeaseRequest {
-            hold: true,
-            ..request("held", &fixture.home)
-        },
-    );
+    let requested = ContainerLeaseRequest {
+        hold: true,
+        ..request("held", &fixture.home)
+    };
+    let held = lease(barge, &requested);
     fs::remove_file(
         barge
             .state_dir()
@@ -221,6 +219,9 @@ fn a_missing_hold_file_leaves_the_lease_reserved() {
     )
     .unwrap();
     assert!(barge.container_status().unwrap()[0].ended.is_none());
+    let repeated = lease(barge, &requested);
+    assert_eq!(repeated.id(), held.id());
+    assert!(repeated.is_held());
     assert!(matches!(
         barge
             .container_lease(&request("other", &fixture.home))
