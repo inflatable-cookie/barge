@@ -5,14 +5,14 @@ mod profiles;
 mod records;
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use self::records::LeaseRecord;
 use crate::state::validate_name;
-use crate::{root, Barge, Error, ErrorKind, Result};
+use crate::{root, Barge, Error, ErrorKind, Result, VolumeState};
 
 const POLL: Duration = Duration::from_millis(20);
 
@@ -41,18 +41,36 @@ impl ContainerOwner {
         }
     }
 
-    fn ended(&self, barge: &Barge) -> Result<bool> {
+    fn ended(&self, barge: &Barge) -> Result<Option<bool>> {
         match self {
             Self::Worktree(id) => match barge.worktree_lease_by_id(id) {
-                Ok(lease) => Ok(!lease.state.reserves_root()),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+                Ok(lease) => Ok(Some(!lease.state.reserves_root())),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(Some(true)),
                 Err(error) => Err(error),
             },
-            Self::Checkout(path) => path
-                .try_exists()
-                .map(|exists| !exists)
-                .map_err(|error| Error::io("cannot inspect container owner", path, &error)),
+            Self::Checkout(path) => checkout_ended(barge, path),
         }
+    }
+}
+
+// A missing parent may itself be an unmounted, unregistered volume. Without
+// evidence that the checkout's surroundings are present, keep the lease.
+fn checkout_ended(barge: &Barge, path: &Path) -> Result<Option<bool>> {
+    let exists = |path: &Path| {
+        path.try_exists()
+            .map_err(|error| Error::io("cannot inspect container owner", path, &error))
+    };
+    if exists(path)? {
+        return Ok(Some(false));
+    }
+    for volume in barge.volumes()? {
+        if path.starts_with(&volume.spec().mount) && volume.state()? != VolumeState::Present {
+            return Ok(None);
+        }
+    }
+    match path.parent() {
+        Some(parent) if exists(parent)? => Ok(Some(true)),
+        _ => Ok(None),
     }
 }
 
@@ -190,7 +208,7 @@ impl Barge {
         if let Some(index) = leases.iter().position(|lease| lease.key() == key) {
             return self.repeat_container_lease(request, leases.swap_remove(index));
         }
-        if request.owner.ended(self)? {
+        if request.owner.ended(self)? == Some(true) {
             return Err(Error::refused("container lease owner has ended"));
         }
         if request.class == ContainerClass::Worker {
@@ -289,7 +307,7 @@ impl Barge {
 
 fn ending(barge: &Barge, record: &LeaseRecord) -> Option<ContainerEnding> {
     // An inconclusive owner or lock check keeps the reservation.
-    if record.owner.ended(barge).ok()? {
+    if record.owner.ended(barge).ok()?? {
         return Some(ContainerEnding {
             reason: ContainerEndReason::OwnerEnded,
             remove_volumes: true,

@@ -33,7 +33,9 @@ can be used for a detached stack. Barge keeps each reservation in
 it at `<id>.lock` when needed.
 
 `container_status` lists every reservation. An owner ends when its worktree
-lease is returned or gone, or its absolute checkout path disappears. That
+lease is returned or gone, or its absolute checkout path disappears while its
+parent exists and any registered volume containing it is present. A missing
+parent or an absent or mismatched registered volume leaves liveness unknown. That
 produces `OwnerEnded` with `remove_volumes: true`. A worker whose last hold is
 released while its owner is live shows `HoldReleased` with
 `remove_volumes: false`, preserving data for the next run. Interactive leases

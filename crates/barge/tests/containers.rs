@@ -229,3 +229,55 @@ fn a_missing_hold_file_leaves_the_lease_reserved() {
         ContainerLeaseOutcome::Full { .. }
     ));
 }
+
+#[test]
+fn missing_checkout_requires_its_registered_volume_and_parent() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let barge = &fixture.barge;
+    declare(barge, &[("effigy", 1)]);
+    let checkout = fixture.mount.join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let requested = ContainerLeaseRequest {
+        hold: true,
+        ..request("registered", &checkout)
+    };
+    let held = lease(barge, &requested);
+    drop(held);
+    fs::remove_dir(&checkout).unwrap();
+
+    for identity in [None, Some(common::OTHER_UUID)] {
+        fixture.os.set_uuid(&fixture.mount, identity);
+        assert!(barge.container_status().unwrap()[0].ended.is_none());
+    }
+    fixture.os.set_uuid(&fixture.mount, Some(common::UUID));
+    assert_eq!(
+        barge.container_status().unwrap()[0].ended,
+        Some(ContainerEnding {
+            reason: ContainerEndReason::OwnerEnded,
+            remove_volumes: true,
+        })
+    );
+}
+
+#[test]
+fn missing_unregistered_checkout_parent_is_unknown() {
+    let fixture = Fixture::new();
+    let barge = &fixture.barge;
+    declare(barge, &[("effigy", 1)]);
+    let mount = fixture.temp.folder("unregistered-mount").unwrap();
+    let checkout = mount.join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    lease(barge, &request("unregistered", &checkout));
+    fs::remove_dir(&checkout).unwrap();
+    fs::remove_dir(&mount).unwrap();
+    assert!(barge.container_status().unwrap()[0].ended.is_none());
+    fs::create_dir(&mount).unwrap();
+    assert_eq!(
+        barge.container_status().unwrap()[0].ended,
+        Some(ContainerEnding {
+            reason: ContainerEndReason::OwnerEnded,
+            remove_volumes: true,
+        })
+    );
+}
