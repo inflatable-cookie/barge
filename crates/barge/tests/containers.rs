@@ -3,6 +3,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Barrier;
 use std::time::{Duration, Instant};
@@ -284,14 +285,13 @@ fn missing_unregistered_checkout_parent_is_unknown() {
 
 // Change the recorded device to model a mounted checkout on a different
 // filesystem without mounting or modifying a real volume.
-fn set_recorded_device(barge: &Barge, id: &str, different: bool) {
+fn set_recorded_device(barge: &Barge, id: &str, device: u64) {
     let path = barge
         .state_dir()
         .join("container-leases")
         .join(format!("{id}.json"));
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    let device = record["checkout_location"]["device"].as_u64().unwrap();
-    record["checkout_location"]["device"] = json!(if different { device ^ 1 } else { device });
+    record["checkout_location"]["device"] = json!(device);
     fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
 }
 
@@ -303,11 +303,12 @@ fn lingering_unregistered_mount_is_unknown_when_device_changes() {
     let checkout = fixture.mount.join("checkout");
     fs::create_dir(&checkout).unwrap();
     let held = lease(barge, &request("mount", &checkout));
-    set_recorded_device(barge, held.id(), true);
+    let device = fs::metadata(&checkout).unwrap().dev();
+    set_recorded_device(barge, held.id(), device ^ 1);
     fs::remove_dir(&checkout).unwrap();
     assert!(fixture.mount.is_dir());
     assert!(barge.container_status().unwrap()[0].ended.is_none());
-    set_recorded_device(barge, held.id(), true);
+    set_recorded_device(barge, held.id(), device);
     assert_eq!(
         barge.container_status().unwrap()[0].ended,
         Some(ContainerEnding {
@@ -327,10 +328,11 @@ fn dangling_checkout_symlink_uses_the_resolved_device() {
     let link = fixture.home.join("checkout-link");
     std::os::unix::fs::symlink(&checkout, &link).unwrap();
     let held = lease(barge, &request("link", &link));
-    set_recorded_device(barge, held.id(), true);
+    let device = fs::metadata(&checkout).unwrap().dev();
+    set_recorded_device(barge, held.id(), device ^ 1);
     fs::remove_dir(&checkout).unwrap();
     assert!(barge.container_status().unwrap()[0].ended.is_none());
-    set_recorded_device(barge, held.id(), true);
+    set_recorded_device(barge, held.id(), device);
     assert_eq!(
         barge.container_status().unwrap()[0].ended,
         Some(ContainerEnding {
@@ -338,6 +340,29 @@ fn dangling_checkout_symlink_uses_the_resolved_device() {
             remove_volumes: true,
         })
     );
+}
+
+#[test]
+fn dangling_symlink_to_absent_registered_volume_is_unknown() {
+    let fixture = Fixture::new();
+    fixture.register();
+    let barge = &fixture.barge;
+    declare(barge, &[("effigy", 1)]);
+    let checkout = fixture.mount.join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let link = fixture.home.join("checkout-link");
+    std::os::unix::fs::symlink(&checkout, &link).unwrap();
+    lease(barge, &request("registered-link", &link));
+    fs::remove_dir(&checkout).unwrap();
+    assert_eq!(
+        barge.container_status().unwrap()[0].ended,
+        Some(ContainerEnding {
+            reason: ContainerEndReason::OwnerEnded,
+            remove_volumes: true,
+        })
+    );
+    fixture.os.set_uuid(&fixture.mount, None);
+    assert!(barge.container_status().unwrap()[0].ended.is_none());
 }
 
 #[test]

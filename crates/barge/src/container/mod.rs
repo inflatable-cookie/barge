@@ -109,6 +109,8 @@ fn checkout_state(
     if let Some(location) = location {
         // A mount point can remain after unmounting. Compare the nearest
         // surviving ancestor with the device recorded while the owner lived.
+        // Start at the resolved checkout: its symlink may be gone while the
+        // checkout itself still exists on that filesystem.
         for ancestor in resolved.ancestors() {
             match os::path_device(ancestor) {
                 Ok(device) if device != location.device => return Ok(OwnerState::Unknown),
