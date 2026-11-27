@@ -1225,7 +1225,9 @@ fn container_status_recognizes_a_returned_worktree_owner() {
     let ContainerLeaseOutcome::Leased(stack) = stack else {
         panic!("expected a lease, got {stack:?}");
     };
+    fixture.os.set_uuid(&fixture.mount, None);
     assert!(barge.container_status().unwrap()[0].ended.is_none());
+    fixture.os.set_uuid(&fixture.mount, Some(common::UUID));
     barge
         .worktree_return(&worktree.lease_id, None, false)
         .unwrap();

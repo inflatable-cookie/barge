@@ -5,14 +5,14 @@ mod profiles;
 mod records;
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use self::records::LeaseRecord;
 use crate::state::validate_name;
-use crate::{root, Barge, Error, ErrorKind, Result};
+use crate::{os, root, Barge, Error, ErrorKind, Result, VolumeState};
 
 const POLL: Duration = Duration::from_millis(20);
 
@@ -41,18 +41,94 @@ impl ContainerOwner {
         }
     }
 
-    fn ended(&self, barge: &Barge) -> Result<bool> {
+    fn state(&self, barge: &Barge, location: Option<&CheckoutLocation>) -> Result<OwnerState> {
         match self {
             Self::Worktree(id) => match barge.worktree_lease_by_id(id) {
-                Ok(lease) => Ok(!lease.state.reserves_root()),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+                Ok(lease) if lease.state.reserves_root() => Ok(OwnerState::Live),
+                Ok(_) => Ok(OwnerState::Ended),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(OwnerState::Ended),
                 Err(error) => Err(error),
             },
-            Self::Checkout(path) => path
-                .try_exists()
-                .map(|exists| !exists)
-                .map_err(|error| Error::io("cannot inspect container owner", path, &error)),
+            Self::Checkout(path) => checkout_state(barge, path, location),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerState {
+    Live,
+    Ended,
+    Unknown,
+}
+
+// Resolve symlinks while the checkout exists, so a later dangling link cannot
+// hide the filesystem where the checkout lived.
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckoutLocation {
+    path: PathBuf,
+    device: u64,
+}
+
+impl CheckoutLocation {
+    fn capture(owner: &ContainerOwner) -> Result<Option<Self>> {
+        let ContainerOwner::Checkout(path) = owner else {
+            return Ok(None);
+        };
+        let resolved = path
+            .canonicalize()
+            .map_err(|error| Error::io("cannot resolve container owner", path, &error))?;
+        let device = os::path_device(&resolved)
+            .map_err(|error| Error::io("cannot inspect container owner", &resolved, &error))?;
+        Ok(Some(Self {
+            path: resolved,
+            device,
+        }))
+    }
+}
+
+fn checkout_state(
+    barge: &Barge,
+    path: &Path,
+    location: Option<&CheckoutLocation>,
+) -> Result<OwnerState> {
+    let exists = |path: &Path| {
+        path.try_exists()
+            .map_err(|error| Error::io("cannot inspect container owner", path, &error))
+    };
+    if exists(path)? {
+        return Ok(OwnerState::Live);
+    }
+    let resolved = location.map_or(path, |location| location.path.as_path());
+    for volume in barge.volumes()? {
+        if (path.starts_with(&volume.spec().mount) || resolved.starts_with(&volume.spec().mount))
+            && volume.state()? != VolumeState::Present
+        {
+            return Ok(OwnerState::Unknown);
+        }
+    }
+    if let Some(location) = location {
+        // A mount point can remain after unmounting. Compare the nearest
+        // surviving ancestor with the device recorded while the owner lived.
+        // Start at the resolved checkout: its symlink may be gone while the
+        // checkout itself still exists on that filesystem.
+        for ancestor in resolved.ancestors() {
+            match os::path_device(ancestor) {
+                Ok(device) if device != location.device => return Ok(OwnerState::Unknown),
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(Error::io(
+                        "cannot inspect container owner",
+                        ancestor,
+                        &error,
+                    ))
+                }
+            }
+        }
+    }
+    match resolved.parent() {
+        Some(parent) if exists(parent)? => Ok(OwnerState::Ended),
+        _ => Ok(OwnerState::Unknown),
     }
 }
 
@@ -190,9 +266,12 @@ impl Barge {
         if let Some(index) = leases.iter().position(|lease| lease.key() == key) {
             return self.repeat_container_lease(request, leases.swap_remove(index));
         }
-        if request.owner.ended(self)? {
-            return Err(Error::refused("container lease owner has ended"));
+        match request.owner.state(self, None)? {
+            OwnerState::Live => {}
+            OwnerState::Ended => return Err(Error::refused("container lease owner has ended")),
+            OwnerState::Unknown => return Err(Error::refused("container lease owner is unknown")),
         }
+        let checkout_location = CheckoutLocation::capture(&request.owner)?;
         if request.class == ContainerClass::Worker {
             let workers = leases.iter().filter(|lease| {
                 lease.profile == request.profile && lease.class == ContainerClass::Worker
@@ -206,7 +285,7 @@ impl Barge {
                 });
             }
         }
-        let record = LeaseRecord::new(request)?;
+        let record = LeaseRecord::new(request, checkout_location)?;
         let hold = request.hold.then(|| record.take_hold(state)).transpose()?;
         if let Err(error) = record.write(state) {
             let _ = records::remove(state, &record.id);
@@ -289,11 +368,19 @@ impl Barge {
 
 fn ending(barge: &Barge, record: &LeaseRecord) -> Option<ContainerEnding> {
     // An inconclusive owner or lock check keeps the reservation.
-    if record.owner.ended(barge).ok()? {
-        return Some(ContainerEnding {
-            reason: ContainerEndReason::OwnerEnded,
-            remove_volumes: true,
-        });
+    match record
+        .owner
+        .state(barge, record.checkout_location.as_ref())
+        .ok()?
+    {
+        OwnerState::Ended => {
+            return Some(ContainerEnding {
+                reason: ContainerEndReason::OwnerEnded,
+                remove_volumes: true,
+            })
+        }
+        OwnerState::Unknown => return None,
+        OwnerState::Live => {}
     }
     if record.class == ContainerClass::Worker
         && record.hold
