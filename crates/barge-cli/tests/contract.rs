@@ -14,12 +14,12 @@
 
 mod support;
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::PathBuf;
-use std::process::Output;
 
 use support::{
-    parse_document, register_machine, stderr, stdout, stub_daemon_routes, Contract, Fixture,
+    parse_document, register_machine, run_with_stdin, stderr, stdout, stub_daemon_routes, Contract,
+    Fixture,
 };
 
 use serde_json::{json, Value};
@@ -56,18 +56,7 @@ fn fixture() -> Fixture {
     fixture
 }
 
-fn preview_run(fixture: &Fixture, input: &str) -> Output {
-    let path = fixture.temp.child("run-request.json");
-    fs::write(&path, input).unwrap();
-    fixture
-        .barge(&["run", "resolve", "--json"])
-        .stdin(File::open(path).unwrap())
-        .output()
-        .unwrap()
-}
-
-#[test]
-fn run_resolve_previews_native_container_and_denied_without_writing_state() {
+fn check_run_resolution_documents() {
     let fixture = Fixture::new();
     let mut request = json!({
         "platform": "any",
@@ -78,7 +67,11 @@ fn run_resolve_previews_native_container_and_denied_without_writing_state() {
         "owner": {"checkout": fixture.home}
     });
     let check = |request: &Value, expected| {
-        let output = preview_run(&fixture, &request.to_string());
+        let output = run_with_stdin(
+            &fixture,
+            &["run", "resolve", "--json"],
+            &request.to_string(),
+        );
         assert!(output.status.success(), "{}", stderr(&output));
         let document = parse_document(&output);
         assert_eq!(document["schema"], "barge.run-resolution/1");
@@ -121,7 +114,7 @@ fn run_resolve_previews_native_container_and_denied_without_writing_state() {
 #[test]
 fn run_resolve_rejects_malformed_stdin_as_usage() {
     let fixture = Fixture::new();
-    let output = preview_run(&fixture, "not JSON");
+    let output = run_with_stdin(&fixture, &["run", "resolve", "--json"], "not JSON");
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     let error: Value = serde_json::from_slice(&output.stderr).unwrap();
@@ -473,6 +466,7 @@ fn every_documented_success_document_matches_its_commands_output() {
     parse_document(&returned);
 
     check_container_documents(&fixture);
+    check_run_resolution_documents();
 
     // The other direction: a documented schema no command produced would let a
     // stale row pass unnoticed.
