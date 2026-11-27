@@ -805,3 +805,87 @@ fn eviction_retries_a_transient_lock_probe_but_respects_a_holder() {
     assert!(held_root.path.exists());
     drop(hold);
 }
+
+#[test]
+fn a_hold_lands_only_after_failed_attempts_while_a_spawn_lets_go_of_the_lock() {
+    use std::cell::Cell;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+
+    let (_temp, barge) = fixture();
+    let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+    let root = area.create_root("slot").unwrap();
+    let fence = area
+        .try_hold(&root.id, Mode::Exclusive)
+        .unwrap()
+        .expect("the root is free to fence");
+
+    // Another thread's spawn forks while the fence is open. The child keeps a
+    // copy of the lock descriptor until it execs, and it blocks on `go` until
+    // the test releases it.
+    let (mut forked, forked_writer) = std::io::pipe().unwrap();
+    let (go_reader, go) = std::io::pipe().unwrap();
+    let (spawned_tx, spawned_rx) = mpsc::channel();
+    let spawner = std::thread::spawn(move || {
+        let mut command = std::process::Command::new("true");
+        // SAFETY: the hook calls only `write` and `read` on descriptors it owns,
+        // with pointers to one-byte arrays that live across each call. Both are
+        // async-signal-safe, and the hook allocates nothing.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(move || {
+                let reported = *b"f";
+                libc::write(forked_writer.as_raw_fd(), reported.as_ptr().cast(), 1);
+                let mut released = [0u8];
+                libc::read(go_reader.as_raw_fd(), released.as_mut_ptr().cast(), 1);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let _ = spawned_tx.send(());
+        child.wait().unwrap()
+    });
+    let mut reported = [0u8];
+    forked.read_exact(&mut reported).unwrap();
+    drop(fence);
+
+    // Each attempt opens the lock file, and the open hook runs once per
+    // attempt before its lock is tried. The first two attempts run while the
+    // child still holds its copy. The third releases the child and waits until
+    // its exec has closed that copy, so only the third attempt can land.
+    // try_hold counts its attempts rather than timing them, so this sequence
+    // does not depend on how long the test thread is descheduled.
+    let attempts = Rc::new(Cell::new(0));
+    let release = Rc::new(RefCell::new(Some((go, spawned_rx))));
+    for attempt in (1..=3).rev() {
+        let attempts = attempts.clone();
+        let release = release.clone();
+        push_lock_open_hook(move || {
+            attempts.set(attempts.get() + 1);
+            if attempt == 3 {
+                if let Some((mut go, spawned)) = release.borrow_mut().take() {
+                    go.write_all(b"g").unwrap();
+                    spawned.recv().unwrap();
+                }
+            }
+        });
+    }
+
+    let hold = area.try_hold(&root.id, Mode::Exclusive).unwrap();
+    let attempts_made = attempts.get();
+    // If no attempt released the child, release it now so the spawn finishes
+    // and the failure below is reported rather than hung on. Write a byte rather
+    // than close the pipe: the child holds its own copy of the write end, so
+    // closing ours would never end its read.
+    if let Some((mut go, _spawned)) = release.borrow_mut().take() {
+        let _ = go.write_all(b"g");
+    }
+    assert!(spawner.join().unwrap().success());
+    assert!(hold.is_some(), "the hold must land once the spawn lets go");
+    assert!(
+        attempts_made >= 3,
+        "the hold must land on a retry after two failed attempts, not before: {attempts_made}"
+    );
+}

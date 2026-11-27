@@ -41,6 +41,11 @@ pub(crate) const LOCKS_DIR: &str = "locks";
 pub(crate) const PINS_DIR: &str = "pins";
 pub(crate) const ACTIVITY_DIR: &str = "activity";
 const AREA_LOCK: &str = "area.lock";
+/// How many attempts a non-waiting hold makes at a refusal that may be transient,
+/// and the pause between them. The count is what bounds the retry, not a clock:
+/// a scheduler delay stretches the wait but never cuts the attempts short.
+const HOLD_ATTEMPTS: u32 = 100;
+const HOLD_RETRY_STEP: Duration = Duration::from_millis(2);
 
 /// Where an area's roots live right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,20 +492,28 @@ impl Area {
     }
 
     /// Try to hold a root without waiting. `None` means something else holds it.
+    ///
+    /// A refusal can be transient. A listing probes a lock exclusively for a
+    /// moment, and a child that another thread of this process spawns keeps a
+    /// copy of every descriptor open at its fork until it execs. So a refusal is
+    /// retried up to `HOLD_ATTEMPTS` times, `HOLD_RETRY_STEP` apart, which is
+    /// about 200 ms on an idle machine. The hold lands if contention clears
+    /// within those attempts, including a return that releases early. A holder
+    /// still present after the last attempt gets `None`. The caller waits only
+    /// that long and does not wait for a return to finish. Callers recheck lease
+    /// state under the hold they get.
     pub fn try_hold(&self, id: &str, mode: Mode) -> Result<Option<Hold>> {
         self.core.ensure_writable()?;
-        for _ in 0..2 {
+        for attempt in 1..=HOLD_ATTEMPTS {
             let root = self.resolve(id)?;
             let directory = self.hold_directory(&root)?;
             let lock_path = hold::hold_lock_path(&directory, &root.id);
-            let Some(file) = hold::lock_root_try(&lock_path, mode)? else {
-                // Listing a root probes its lock exclusively to report it as held,
-                // so a probe running right now can make one non-waiting attempt
-                // fail spuriously. The second attempt covers that window; a real
-                // holder still wins.
-                continue;
-            };
-            return self.begin_hold(root, directory, file, mode).map(Some);
+            if let Some(file) = hold::lock_root_try(&lock_path, mode)? {
+                return self.begin_hold(root, directory, file, mode).map(Some);
+            }
+            if attempt < HOLD_ATTEMPTS {
+                std::thread::sleep(HOLD_RETRY_STEP);
+            }
         }
         Ok(None)
     }
