@@ -5,6 +5,16 @@ step 4 remains planned. The lean storage core in
 [architecture](architecture.md) is the mechanism this design builds on and does
 not change.
 
+## Volume registration
+
+On Linux, register a filesystem mounted at its root, with a canonical UUID
+available through `/dev/disk/by-uuid`. Barge refuses subfolder bind mounts and
+mounts whose identity cannot be resolved. It also refuses btrfs subvolume mounts:
+mountinfo alone cannot distinguish one from a bind-mounted subfolder. For
+bazzite's `/var/home`, mount the filesystem root separately and register that
+mount instead; Barge does not configure mounts. Filesystems with noncanonical
+UUIDs, such as short FAT IDs, cannot currently be registered.
+
 ## The problem
 
 Moving data to a registered external volume was never one move. Each placement

@@ -13,6 +13,8 @@ compile_error!("Barge supports unix platforms; macOS is first and Linux follows.
 
 pub mod fake;
 
+#[cfg(any(test, target_os = "linux"))]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 /// Walks that never follow a symlink: `openat`, `fstatat`, `unlinkat`.
@@ -143,7 +145,7 @@ pub trait Os: fmt::Debug + Send + Sync {
     fn free_bytes(&self, path: &Path) -> Result<u64>;
 }
 
-/// The platform implementation: APFS volume identity and `statvfs` free space.
+/// The platform implementation: filesystem identity and `statvfs` free space.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlatformOs;
 
@@ -161,7 +163,11 @@ impl Os for PlatformOs {
         {
             macos::volume_uuid(mount)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            linux::volume_uuid(mount)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = mount;
             unsupported_identity()
@@ -173,7 +179,7 @@ impl Os for PlatformOs {
     }
 }
 
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 fn unsupported_identity() -> Result<Option<String>> {
     Err(Error::unsupported(
         "volume identity is not supported on this platform",
@@ -184,9 +190,8 @@ fn unsupported_identity() -> Result<Option<String>> {
 ///
 /// This is Barge's only test affordance in the shipped binary: the CLI contract
 /// tests register a fixture folder, so they set this to a fixed UUID instead of
-/// depending on the host's own volume. It exists because a platform whose real
-/// identity Barge cannot read yet (Linux) would otherwise have no CLI contract
-/// coverage at all. Nothing in Barge sets it.
+/// depending on the host's own volume. Fixture folders are not real mount
+/// points. Nothing in Barge sets it.
 const TEST_IDENTITY_VAR: &str = "BARGE_TEST_VOLUME_UUID";
 
 /// The fake identity, when the test hook is set and the path is a temporary one.
@@ -388,6 +393,12 @@ pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::canonical_uuid;
+    #[test]
+    fn free_space_is_available_on_a_temporary_directory() {
+        let temp = crate::testing::TempDir::new("free-space").unwrap();
+        assert!(super::free_space(temp.path()).is_ok());
+    }
+
     #[test]
     fn uuid_is_canonical_and_requires_exact_shape() {
         assert_eq!(
