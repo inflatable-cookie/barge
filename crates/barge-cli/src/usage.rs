@@ -80,6 +80,9 @@ usage: barge container status [--json]
   container status                      leases and their endings
 usage: barge container return [--json] <id>
   container return <id>                 release a lease after stopping its stack
+usage: barge run <command>
+usage: barge run resolve [--json]
+  run resolve                           preview placement for a JSON request on stdin
 usage: barge scratch <command>
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
@@ -178,6 +181,7 @@ const VERBS: &[&str] = &[
     "prune",
     "worktree",
     "container",
+    "run",
     "scratch",
     "machine",
 ];
@@ -296,6 +300,8 @@ mod tests {
             &["container"],
             &["container", "status"],
             &["container", "return", "ID"],
+            &["run"],
+            &["run", "resolve"],
             &["scratch"],
             &["scratch", "new"],
             &["doctor"],
@@ -377,6 +383,8 @@ mod tests {
                 &["container", "return", "ID"],
                 "usage: barge container return [--json] <id>",
             ),
+            (&["run"], "usage: barge run <command>"),
+            (&["run", "resolve"], "usage: barge run resolve [--json]"),
             (&["scratch"], "usage: barge scratch <command>"),
             (&["doctor"], "usage: barge doctor [--json]"),
             (&["machine"], "usage: barge machine <command>"),

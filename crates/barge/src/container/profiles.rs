@@ -23,7 +23,7 @@ struct Document {
 }
 
 /// A missing file declares no profiles. An unreadable declaration fails closed.
-pub(super) fn read(state: &Path) -> Result<BTreeMap<String, u32>> {
+pub(crate) fn read(state: &Path) -> Result<BTreeMap<String, u32>> {
     let path = state.join("container-profiles.json");
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,

@@ -32,6 +32,29 @@ use crate::hold::Mode;
 pub use fake::FakeOs;
 pub(crate) use tree::{measure_tree, Reaped, Removed, Tree, TreeSize};
 
+/// Total physical memory, if the host can report it.
+pub(crate) fn memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::memory_bytes()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let total = info
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))?;
+        let mut fields = total.split_whitespace();
+        let kib = fields.next()?.parse::<u64>().ok()?;
+        (fields.next()? == "kB").then_some(())?;
+        kib.checked_mul(1024)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// The filesystem and inode an open descriptor names.
 pub(crate) fn file_identity(file: &File) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;

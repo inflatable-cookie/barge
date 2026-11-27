@@ -14,6 +14,8 @@ use self::records::LeaseRecord;
 use crate::state::validate_name;
 use crate::{os, root, Barge, Error, ErrorKind, Result, VolumeState};
 
+pub(crate) use profiles::read as read_profiles;
+
 const POLL: Duration = Duration::from_millis(20);
 
 /// The worktree reservation or checkout directory that owns a stack.
@@ -226,6 +228,15 @@ impl Barge {
         &self,
         request: &ContainerLeaseRequest,
     ) -> Result<ContainerLeaseOutcome> {
+        self.container_lease_with_progress(request, &mut || {})
+    }
+
+    /// Notify a waiting caller outside the account lock when a profile is full.
+    pub(crate) fn container_lease_with_progress(
+        &self,
+        request: &ContainerLeaseRequest,
+        waiting: &mut dyn FnMut(),
+    ) -> Result<ContainerLeaseOutcome> {
         if !profiles::read(self.state_dir())?.contains_key(&request.profile) {
             return Ok(ContainerLeaseOutcome::NotManaged);
         }
@@ -240,6 +251,10 @@ impl Barge {
         let started = Instant::now();
         let wait = request.wait.unwrap_or_default();
         while matches!(outcome, ContainerLeaseOutcome::Full { .. }) {
+            if started.elapsed() >= wait {
+                break;
+            }
+            waiting();
             let remaining = wait.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 break;

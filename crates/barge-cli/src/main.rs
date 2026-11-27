@@ -25,6 +25,7 @@ mod move_resource;
 mod output;
 mod prune;
 mod root;
+mod run;
 mod scratch;
 mod status;
 mod survey;
@@ -163,6 +164,10 @@ fn dispatch(command: &str, rest: &[String], json: bool) -> Result<ExitCode> {
         }
         "container" => {
             container::container(rest, json)?;
+            ExitCode::SUCCESS
+        }
+        "run" => {
+            run::run(rest, json)?;
             ExitCode::SUCCESS
         }
         "worktree" => {
