@@ -18,6 +18,10 @@
 
 #![allow(unsafe_code)]
 
+mod repair;
+
+use repair::Recovery;
+
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -136,7 +140,8 @@ impl Tree {
     /// Remove this folder and its tree, with the root marker last. An
     /// interruption before its last step leaves a folder that still carries the
     /// marker; stopped at its last step it leaves an empty folder, for the trash
-    /// sweep to reap.
+    /// sweep to reap. Only trash deletion calls this: it may restore owner
+    /// permissions on directories inside the owned trash tree.
     pub(crate) fn remove(self) -> Result<Removed> {
         remove_opened(self, &same_device)
     }
@@ -152,9 +157,12 @@ impl Tree {
                 &directory,
                 name,
                 &path,
-                root_device,
+                &Walk {
+                    root_device,
+                    device: &same_device,
+                    recovery: Recovery::None,
+                },
                 0,
-                &same_device,
                 &mut removed,
             )?;
         } else {
@@ -247,6 +255,12 @@ impl Tree {
 /// and the device of the descriptor that was opened.
 type DeviceFn<'a> = &'a dyn Fn(&Path, u64) -> u64;
 
+struct Walk<'a> {
+    root_device: u64,
+    device: DeviceFn<'a>,
+    recovery: Recovery,
+}
+
 fn same_device(_path: &Path, device: u64) -> u64 {
     device
 }
@@ -262,25 +276,24 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
     let Tree { directory, path } = tree;
     let root_device =
         device_of(&directory).map_err(|source| Error::io("cannot inspect", &path, &source))?;
+    let walk = Walk {
+        root_device,
+        device,
+        recovery: Recovery::Trash,
+    };
     let marker = OsStr::new(MARKER_NAME);
     let mut removed = Removed::default();
     // Every entry but the root's marker goes first: a nested mount, an over-deep
     // tree or a failed step then leaves the marker in place, so the folder is
     // still owned trash rather than a markerless straggler Barge refuses. The
     // marker goes last; only the empty folder is left after it.
-    let entries =
-        read_names(&directory).map_err(|source| Error::io("cannot list", &path, &source))?;
+    let entries = walk
+        .recovery
+        .read_names(&directory, &path)
+        .map_err(|source| Error::io("cannot list", &path, &source))?;
     let mut empty = true;
     for name in entries.iter().filter(|name| name.as_os_str() != marker) {
-        empty &= remove_child(
-            &directory,
-            name,
-            &path.join(name),
-            root_device,
-            0,
-            device,
-            &mut removed,
-        )?;
+        empty &= remove_child(&directory, name, &path.join(name), &walk, 0, &mut removed)?;
     }
     // Something stayed, so the marker must stay too: the folder is still owned
     // trash that the next pass can finish.
@@ -295,9 +308,8 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
         &directory,
         marker,
         &path.join(marker),
-        root_device,
+        &walk,
         0,
-        device,
         &mut removed,
     )? {
         removed.skipped.push(path);
@@ -325,28 +337,21 @@ fn names_opened(directory: &File, path: &Path) -> bool {
 fn remove_contents(
     directory: &File,
     path: &Path,
-    root_device: u64,
+    walk: &Walk<'_>,
     depth: usize,
-    device: DeviceFn<'_>,
     removed: &mut Removed,
 ) -> Result<bool> {
     if depth >= MAX_DEPTH {
         removed.skipped.push(path.to_path_buf());
         return Ok(false);
     }
-    let entries =
-        read_names(directory).map_err(|source| Error::io("cannot list", path, &source))?;
+    let entries = walk
+        .recovery
+        .read_names(directory, path)
+        .map_err(|source| Error::io("cannot list", path, &source))?;
     let mut empty = true;
     for name in entries {
-        empty &= remove_child(
-            directory,
-            &name,
-            &path.join(&name),
-            root_device,
-            depth,
-            device,
-            removed,
-        )?;
+        empty &= remove_child(directory, &name, &path.join(&name), walk, depth, removed)?;
     }
     Ok(empty)
 }
@@ -355,9 +360,8 @@ fn remove_child(
     directory: &File,
     name: &OsStr,
     path: &Path,
-    root_device: u64,
+    walk: &Walk<'_>,
     depth: usize,
-    device: DeviceFn<'_>,
     removed: &mut Removed,
 ) -> Result<bool> {
     let metadata = match stat_at(directory, name) {
@@ -370,23 +374,32 @@ fn remove_child(
         if kind != libc::S_IFLNK {
             removed.bytes = removed.bytes.saturating_add(allocated_bytes(&metadata));
         }
-        unlink_at(directory, name, 0)
+        walk.recovery
+            .unlink(directory, name, 0, path)
             .map_err(|source| Error::io("cannot remove", path, &source))?;
         return Ok(true);
     }
-    let nested = match open_at(Some(directory), name) {
-        Ok(nested) => nested,
+    if (walk.device)(path, metadata.st_dev as u64) != walk.root_device {
+        removed.skipped.push(path.to_path_buf());
+        return Ok(false);
+    }
+    let nested = match walk.recovery.open_child(directory, name, &metadata) {
+        Ok(Some(nested)) => nested,
+        Ok(None) => {
+            removed.skipped.push(path.to_path_buf());
+            return Ok(false);
+        }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(source) => return Err(Error::io("cannot open", path, &source)),
     };
     // Decide from the opened descriptor, so a replacement mount is left alone.
     let nested_device =
         device_of(&nested).map_err(|source| Error::io("cannot inspect", path, &source))?;
-    if device(path, nested_device) != root_device {
+    if (walk.device)(path, nested_device) != walk.root_device {
         removed.skipped.push(path.to_path_buf());
         return Ok(false);
     }
-    if !remove_contents(&nested, path, root_device, depth + 1, device, removed)? {
+    if !remove_contents(&nested, path, walk, depth + 1, removed)? {
         return Ok(false);
     }
     // Remove this folder only while its name still identifies the opened one.
@@ -398,7 +411,8 @@ fn remove_child(
         removed.skipped.push(path.to_path_buf());
         return Ok(false);
     }
-    unlink_at(directory, name, libc::AT_REMOVEDIR)
+    walk.recovery
+        .unlink(directory, name, libc::AT_REMOVEDIR, path)
         .map_err(|source| Error::io("cannot remove", path, &source))?;
     Ok(true)
 }
@@ -545,6 +559,10 @@ fn read_names(directory: &File) -> std::io::Result<Vec<OsString>> {
         unsafe { libc::close(duplicate) };
         return Err(source);
     }
+    // dup shares the offset: an earlier holds_only or a partial read can leave
+    // this descriptor past entries a subsequent walk must see.
+    // SAFETY: stream is a valid directory stream.
+    unsafe { libc::rewinddir(stream) };
     let mut names = Vec::new();
     loop {
         clear_errno();
@@ -702,6 +720,81 @@ mod tests {
             expires_unix_ms: None,
             folder: None,
         }
+    }
+
+    #[test]
+    fn trash_removal_repairs_owned_directories_without_following_links() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = crate::testing::TempDir::new("tree-permissions").unwrap();
+        let root = temp.path().join("trash-entry");
+        let outside = temp.path().join("outside");
+        for name in ["parent/locked", "readonly", "unreadable"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("file"), b"data").unwrap();
+        }
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(outside.as_path(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+        std::fs::set_permissions(
+            root.join("readonly/file"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        for (name, mode) in [
+            ("parent/locked", 0),
+            ("readonly", 0o555),
+            ("unreadable", 0o300),
+        ] {
+            std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        let result = Tree::open(&root).unwrap().remove();
+        let outside_mode = std::fs::symlink_metadata(&outside).unwrap().mode() & 0o777;
+        // Restore surviving fixtures even if removal failed, before asserting.
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["parent/locked", "readonly", "unreadable"] {
+            let path = root.join(name);
+            if path.exists() {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        assert!(result.unwrap().removed);
+        assert!(!root.exists());
+        assert_eq!(outside_mode, 0);
+    }
+
+    #[test]
+    fn removal_lists_a_tree_after_holds_only() {
+        let temp = crate::testing::TempDir::new("tree-list-twice").unwrap();
+        let root = temp.folder("root").unwrap();
+        std::fs::write(root.join("file"), b"data").unwrap();
+        let tree = Tree::open(&root).unwrap();
+        assert!(tree.holds_only(&[OsStr::new("file")]).unwrap());
+        assert!(tree.remove().unwrap().removed);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn entry_removal_does_not_repair_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::os::running_as_root() {
+            return;
+        }
+        let temp = crate::testing::TempDir::new("tree-entry-permissions").unwrap();
+        let root = temp.folder("root").unwrap();
+        let nested = root.join("readonly");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("file"), b"data").unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = Tree::open(&root)
+            .unwrap()
+            .remove_entry(Path::new("readonly"));
+        let mode = std::fs::symlink_metadata(&nested).unwrap().mode() & 0o777;
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(mode, 0o555);
+        assert!(nested.join("file").exists());
     }
 
     #[test]

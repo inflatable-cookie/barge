@@ -46,8 +46,9 @@ Everything Barge prunes can be rebuilt. The guarantee is sized to match:
   descriptor-relative — `openat` with `O_NOFOLLOW`, `fstatat`, `unlinkat` — and
   both the marker that proves ownership and the filesystem each folder is on are
   read from the descriptor that was opened, never from a path or an entry seen a
-  moment earlier. A folder swapped for a symlink, or a mount swapped for a plain
-  folder, therefore cannot redirect the walk; a folder a racing writer puts at
+  moment earlier. During trash removal only, owned directories that block the
+  walk gain missing owner permissions before one retry. A folder swapped for a
+  symlink, or a mount swapped for a plain folder, therefore cannot redirect the walk; a folder a racing writer puts at
   the path after it is opened is never walked. Measuring a root uses the same
   walk, holds the same boundary and stops at the same depth. A trash entry is
   deleted only when its marker still matches the area; being inside `.trash/`
