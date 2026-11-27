@@ -1056,53 +1056,6 @@ fn a_failed_spawn_drops_the_hold() {
 }
 
 #[test]
-fn a_hold_is_taken_once_a_spawn_in_another_thread_lets_go_of_its_descriptor() {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
-
-    let (fixture, origin) = setup("origin-spawn-fork-window", 2, json!([]), &[]);
-    let leased = lease(&fixture, &origin, "req-1", "task/one");
-    let area = pool_area(&fixture, &leased);
-    let fence = area
-        .try_hold(&leased.root_id, Mode::Exclusive)
-        .unwrap()
-        .expect("the root is free to fence");
-
-    // Another thread's spawn forks while the fence is open. The child keeps its
-    // copy of the descriptor until it execs. It reports the fork, then pauses
-    // briefly before it execs, which keeps the copy alive past the drop below.
-    let (mut forked, forked_writer) = std::io::pipe().unwrap();
-    let spawner = std::thread::spawn(move || {
-        let mut command = Command::new("true");
-        // SAFETY: the hook calls only `write` and `nanosleep`, both
-        // async-signal-safe, on a descriptor it owns and on stack values. It
-        // allocates nothing.
-        #[allow(unsafe_code)]
-        unsafe {
-            command.pre_exec(move || {
-                let mark = *b"f";
-                libc::write(forked_writer.as_raw_fd(), mark.as_ptr().cast(), 1);
-                let pause = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 50_000_000,
-                };
-                libc::nanosleep(&pause, std::ptr::null_mut());
-                Ok(())
-            });
-        }
-        command.spawn().unwrap().wait().unwrap()
-    });
-    let mut mark = [0u8];
-    forked.read_exact(&mut mark).unwrap();
-    drop(fence);
-
-    // The hold lands once the child has execed and let go of its copy.
-    let hold = area.try_hold(&leased.root_id, Mode::Exclusive).unwrap();
-    assert!(spawner.join().unwrap().success());
-    assert!(hold.is_some(), "the hold must land once the spawn lets go");
-}
-
-#[test]
 fn prune_previews_and_prepares_a_fresh_pool_at_the_origins_default_branch() {
     let (fixture, origin) = setup("origin-prune-grow", 2, json!([]), &[]);
     git(&origin.path, &["branch", "-m", "trunk"]);

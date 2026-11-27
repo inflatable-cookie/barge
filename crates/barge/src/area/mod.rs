@@ -493,11 +493,13 @@ impl Area {
     /// Try to hold a root without waiting. `None` means something else holds it.
     ///
     /// A refusal can be transient. A listing probes a lock exclusively for a
-    /// moment. A child that another thread of this process spawns holds a copy
-    /// of every descriptor open at its fork until it execs, so a lock its holder
-    /// has just dropped can stay taken for that long. A refusal is therefore
-    /// retried for at most `HOLD_RETRY_WINDOW`. A real holder still wins, and it
-    /// is refused after that window, never awaited.
+    /// moment, and a child that another thread of this process spawns keeps a
+    /// copy of every descriptor open at its fork until it execs. So a refusal is
+    /// retried for at most `HOLD_RETRY_WINDOW`. The hold lands if contention
+    /// clears inside that window, including a return that releases early. A
+    /// holder still present when the window ends gets `None`. The caller waits
+    /// only milliseconds and does not wait for a return to finish. Callers
+    /// recheck lease state under the hold they get.
     pub fn try_hold(&self, id: &str, mode: Mode) -> Result<Option<Hold>> {
         self.core.ensure_writable()?;
         let deadline = Instant::now() + HOLD_RETRY_WINDOW;

@@ -2,7 +2,7 @@
 //! crate's test seams without widening the library's surface.
 
 use super::*;
-use crate::hold::{hold_lock_path, push_lock_hook, push_lock_open_hook};
+use crate::hold::{hold_lock_path, lock_root_try, push_lock_hook, push_lock_open_hook};
 use crate::{Barge, ManualClock, VolumeRegistration};
 use std::cell::RefCell;
 use std::os::unix::fs::MetadataExt;
@@ -804,4 +804,58 @@ fn eviction_retries_a_transient_lock_probe_but_respects_a_holder() {
         .contains("held"));
     assert!(held_root.path.exists());
     drop(hold);
+}
+
+#[test]
+fn a_hold_lands_once_a_spawn_in_another_thread_lets_go_of_the_lock() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let (_temp, barge) = fixture();
+    let area = barge.area(AreaSpec::new("test", "roots", "disk")).unwrap();
+    let root = area.create_root("slot").unwrap();
+    let lock_path = hold_lock_path(root.path.parent().unwrap(), &root.id);
+    let fence = area
+        .try_hold(&root.id, Mode::Exclusive)
+        .unwrap()
+        .expect("the root is free to fence");
+
+    // Another thread's spawn forks while the fence is open. The child keeps a
+    // copy of the lock descriptor until it execs, and it blocks on `go` before
+    // then, so the copy lives exactly as long as the steps below need it.
+    let (mut forked, forked_writer) = std::io::pipe().unwrap();
+    let (go_reader, mut go) = std::io::pipe().unwrap();
+    let spawner = std::thread::spawn(move || {
+        let mut command = std::process::Command::new("true");
+        // SAFETY: the hook calls only `write` and `read` on descriptors it owns,
+        // with pointers to one-byte arrays that live across each call. Both are
+        // async-signal-safe, and the hook allocates nothing.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(move || {
+                let reported = *b"f";
+                libc::write(forked_writer.as_raw_fd(), reported.as_ptr().cast(), 1);
+                let mut released = [0u8];
+                libc::read(go_reader.as_raw_fd(), released.as_mut_ptr().cast(), 1);
+                Ok(())
+            });
+        }
+        command.spawn().unwrap().wait().unwrap()
+    });
+    let mut reported = [0u8];
+    forked.read_exact(&mut reported).unwrap();
+    drop(fence);
+
+    // The child still holds its copy, so a single attempt is refused. This is
+    // the state under test, and it holds for as long as the child is blocked.
+    assert!(lock_root_try(&lock_path, Mode::Exclusive)
+        .unwrap()
+        .is_none());
+
+    // Release the child. The retried hold lands once it has execed.
+    go.write_all(b"g").unwrap();
+    let hold = area.try_hold(&root.id, Mode::Exclusive).unwrap();
+    assert!(spawner.join().unwrap().success());
+    assert!(hold.is_some(), "the hold must land once the spawn lets go");
 }
