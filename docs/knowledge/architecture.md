@@ -352,11 +352,10 @@ the block is stale or missing.
 
 ## Platforms
 
-macOS on APFS first. The OS layer is deliberately small: volume identity (UUID
-at a mount), free space, and the descriptor-relative open, lock and rename
-helpers every other module calls instead of naming a syscall itself. Markers are
-portable, so Linux support is a new identity and space implementation, not a
-redesign.
+macOS and Linux provide volume identity and free space. The OS layer also owns
+the descriptor-relative open, lock and rename helpers. Linux reads mountinfo and
+resolves the source device through `/dev/disk/by-uuid`; free space uses `statvfs`.
+See [volume registration](resources.md#volume-registration) for its mount limits.
 
 `barged` targets Linux: its power backend is logind over D-Bus, so sleep,
 restart and shutdown exist only there. The daemon and its tests still build and
@@ -405,7 +404,7 @@ Two test affordances exist and no others. `barge::testing` is behind the
 library a consumer links. `BARGE_TEST_VOLUME_UUID` is the one hook in the shipped
 library: it replaces the real volume identity, and only for a path inside the
 process's own temporary directory, so the CLI contract tests can register a
-fixture folder on a platform whose identity Barge cannot read yet.
+fixture folder that is not a real mount point.
 
 ## Boundary with Oxide
 
