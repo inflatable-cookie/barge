@@ -41,6 +41,10 @@ pub(crate) const LOCKS_DIR: &str = "locks";
 pub(crate) const PINS_DIR: &str = "pins";
 pub(crate) const ACTIVITY_DIR: &str = "activity";
 const AREA_LOCK: &str = "area.lock";
+/// How long a non-waiting hold keeps retrying a refusal that may be transient,
+/// and the pause between those attempts.
+const HOLD_RETRY_WINDOW: Duration = Duration::from_millis(200);
+const HOLD_RETRY_STEP: Duration = Duration::from_millis(2);
 
 /// Where an area's roots live right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,22 +491,28 @@ impl Area {
     }
 
     /// Try to hold a root without waiting. `None` means something else holds it.
+    ///
+    /// A refusal can be transient. A listing probes a lock exclusively for a
+    /// moment. A child that another thread of this process spawns holds a copy
+    /// of every descriptor open at its fork until it execs, so a lock its holder
+    /// has just dropped can stay taken for that long. A refusal is therefore
+    /// retried for at most `HOLD_RETRY_WINDOW`. A real holder still wins, and it
+    /// is refused after that window, never awaited.
     pub fn try_hold(&self, id: &str, mode: Mode) -> Result<Option<Hold>> {
         self.core.ensure_writable()?;
-        for _ in 0..2 {
+        let deadline = Instant::now() + HOLD_RETRY_WINDOW;
+        loop {
             let root = self.resolve(id)?;
             let directory = self.hold_directory(&root)?;
             let lock_path = hold::hold_lock_path(&directory, &root.id);
-            let Some(file) = hold::lock_root_try(&lock_path, mode)? else {
-                // Listing a root probes its lock exclusively to report it as held,
-                // so a probe running right now can make one non-waiting attempt
-                // fail spuriously. The second attempt covers that window; a real
-                // holder still wins.
-                continue;
-            };
-            return self.begin_hold(root, directory, file, mode).map(Some);
+            if let Some(file) = hold::lock_root_try(&lock_path, mode)? {
+                return self.begin_hold(root, directory, file, mode).map(Some);
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(HOLD_RETRY_STEP);
         }
-        Ok(None)
     }
 
     /// The directory a root's hold lock and activity records live in.

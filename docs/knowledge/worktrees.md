@@ -117,7 +117,10 @@ child that keeps the descriptor. Barge stays out of the process tree.
 
 - Refused before the command starts when the lease is not `leased` (unknown,
   `returning`, `returned` or `interrupted`), or when a return holds the root.
-  A run never waits for a return: the error says so, and nothing runs.
+  A run never waits for a return: the error says so, and nothing runs. Before
+  it refuses, the attempt retries for up to 200 ms, because a child that another
+  thread of the same process is spawning keeps a copy of the lock descriptor
+  until it execs. A real holder still refuses.
 - A return started while the command runs is refused until the hold is gone,
   so a return that needs the root retries after the run exits.
 - Errors before the command starts use the CLI's error contract under
