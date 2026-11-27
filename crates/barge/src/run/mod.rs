@@ -98,14 +98,6 @@ impl Capabilities {
     fn needs_gpu(&self) -> bool {
         self.gpu || self.min_vram_bytes.unwrap_or_default() > 0
     }
-
-    fn met_by_container(&self) -> bool {
-        // Runtime profiles declare platform and slot count, and supply no
-        // evidence about the resources available inside the container.
-        self.min_cores.unwrap_or_default() == 0
-            && self.min_memory_bytes.unwrap_or_default() == 0
-            && !self.needs_gpu()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,7 +282,7 @@ impl Barge {
         }
         let container = targets::profile(self.state_dir(), &request.platform)?;
         let reason = match container {
-            Some(profile) if request.needs.met_by_container() => {
+            Some(profile) if !request.needs.needs_gpu() => {
                 return Ok(RunPreview::LocalContainer { profile });
             }
             Some(_) => DenyReason::UnmetCapability,

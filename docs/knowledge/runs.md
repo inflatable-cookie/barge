@@ -11,11 +11,11 @@ resolver tries the native host first, then a declared local container. A
 remote-only request is denied because it forbids either local resolution.
 
 Native matching uses the OS and architecture of the running Barge binary.
-Minimum cores are compared with the parallelism available to the process.
-Minimum memory is compared with total host memory. An unavailable measurement
-cannot satisfy a minimum. GPU and positive VRAM requirements are unmet locally.
-Container declarations cover platform and worker capacity. A container cannot
-satisfy a positive core or memory minimum through these declarations.
+For native placement, Barge compares minimum cores with the parallelism
+available to the process and minimum memory with total host memory.
+An unavailable measurement cannot satisfy a minimum. Container placement uses
+the declared platform and worker capacity. GPU and positive VRAM requirements
+are unmet for both local paths.
 
 ## Local container targets
 

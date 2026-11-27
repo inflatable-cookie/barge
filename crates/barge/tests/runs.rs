@@ -203,6 +203,23 @@ fn container_takes_a_worker_lease_for_each_run_and_reports_a_full_profile() {
 }
 
 #[test]
+fn container_leases_accept_cpu_and_memory_minimums() {
+    let fixture = Fixture::new();
+    declare_target(&fixture, &[format!("{CONTAINER_OS}-any")]);
+    declare_profile(&fixture);
+    let mut requested = request(&fixture, PlatformConstraint::Os(CONTAINER_OS.to_owned()));
+    requested.needs.min_cores = Some(1);
+    requested.needs.min_memory_bytes = Some(common::GIB);
+
+    let Resolution::LocalContainer { lease } = resolve(&fixture, &requested) else {
+        panic!("expected a container lease for a request with CPU and memory minimums");
+    };
+    assert_eq!(lease.profile(), PROFILE);
+    assert!(lease.is_held());
+    fixture.barge.container_return(lease.id()).unwrap();
+}
+
+#[test]
 fn os_only_container_target_needs_a_managed_profile_and_proves_no_architecture() {
     let fixture = Fixture::new();
     declare_target(&fixture, &[format!("{CONTAINER_OS}-any")]);
@@ -218,13 +235,16 @@ fn os_only_container_target_needs_a_managed_profile_and_proves_no_architecture()
         panic!("expected a lease for an OS-only request");
     };
     fixture.barge.container_return(lease.id()).unwrap();
-    requested.needs.gpu = true;
-    assert!(matches!(
-        resolve(&fixture, &requested),
-        Resolution::Denied {
-            reason: DenyReason::UnmetCapability
-        }
-    ));
+    for (gpu, min_vram_bytes) in [(true, None), (false, Some(1))] {
+        requested.needs.gpu = gpu;
+        requested.needs.min_vram_bytes = min_vram_bytes;
+        assert!(matches!(
+            resolve(&fixture, &requested),
+            Resolution::Denied {
+                reason: DenyReason::UnmetCapability
+            }
+        ));
+    }
     requested.platform = PlatformConstraint::Exact {
         os: CONTAINER_OS.to_owned(),
         arch: "aarch64".to_owned(),
