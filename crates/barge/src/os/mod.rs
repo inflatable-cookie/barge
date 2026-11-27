@@ -49,6 +49,12 @@ pub(crate) fn path_identity(path: &Path) -> std::io::Result<Option<(u64, u64)>> 
     }
 }
 
+/// The filesystem device of a path, following symlinks.
+pub(crate) fn path_device(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map(|metadata| metadata.dev())
+}
+
 /// Whether the test process runs as root, which ignores file modes. A test that
 /// relies on a mode denying access has nothing to test there and skips.
 #[cfg(test)]

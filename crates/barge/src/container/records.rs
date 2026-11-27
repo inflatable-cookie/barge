@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{ContainerClass, ContainerLeaseRequest, ContainerOwner};
+use super::{CheckoutLocation, ContainerClass, ContainerLeaseRequest, ContainerOwner};
 use crate::state::{publish, validate_name};
 use crate::{os, root, Error, Mode, Result};
 
@@ -23,10 +23,15 @@ pub(super) struct LeaseRecord {
     pub(super) owner: ContainerOwner,
     pub(super) class: ContainerClass,
     pub(super) hold: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) checkout_location: Option<CheckoutLocation>,
 }
 
 impl LeaseRecord {
-    pub(super) fn new(request: &ContainerLeaseRequest) -> Result<Self> {
+    pub(super) fn new(
+        request: &ContainerLeaseRequest,
+        checkout_location: Option<CheckoutLocation>,
+    ) -> Result<Self> {
         Ok(Self {
             schema: SCHEMA.to_owned(),
             id: root::mint_id()?,
@@ -35,6 +40,7 @@ impl LeaseRecord {
             owner: request.owner.clone(),
             class: request.class,
             hold: request.hold,
+            checkout_location,
         })
     }
 

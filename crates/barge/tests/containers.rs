@@ -281,3 +281,90 @@ fn missing_unregistered_checkout_parent_is_unknown() {
         })
     );
 }
+
+// Change the recorded device to model a mounted checkout on a different
+// filesystem without mounting or modifying a real volume.
+fn set_recorded_device(barge: &Barge, id: &str, different: bool) {
+    let path = barge
+        .state_dir()
+        .join("container-leases")
+        .join(format!("{id}.json"));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let device = record["checkout_location"]["device"].as_u64().unwrap();
+    record["checkout_location"]["device"] = json!(if different { device ^ 1 } else { device });
+    fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+}
+
+#[test]
+fn lingering_unregistered_mount_is_unknown_when_device_changes() {
+    let fixture = Fixture::new();
+    let barge = &fixture.barge;
+    declare(barge, &[("effigy", 1)]);
+    let checkout = fixture.mount.join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let held = lease(barge, &request("mount", &checkout));
+    set_recorded_device(barge, held.id(), true);
+    fs::remove_dir(&checkout).unwrap();
+    assert!(fixture.mount.is_dir());
+    assert!(barge.container_status().unwrap()[0].ended.is_none());
+    set_recorded_device(barge, held.id(), true);
+    assert_eq!(
+        barge.container_status().unwrap()[0].ended,
+        Some(ContainerEnding {
+            reason: ContainerEndReason::OwnerEnded,
+            remove_volumes: true,
+        })
+    );
+}
+
+#[test]
+fn dangling_checkout_symlink_uses_the_resolved_device() {
+    let fixture = Fixture::new();
+    let barge = &fixture.barge;
+    declare(barge, &[("effigy", 1)]);
+    let checkout = fixture.mount.join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let link = fixture.home.join("checkout-link");
+    std::os::unix::fs::symlink(&checkout, &link).unwrap();
+    let held = lease(barge, &request("link", &link));
+    set_recorded_device(barge, held.id(), true);
+    fs::remove_dir(&checkout).unwrap();
+    assert!(barge.container_status().unwrap()[0].ended.is_none());
+    set_recorded_device(barge, held.id(), true);
+    assert_eq!(
+        barge.container_status().unwrap()[0].ended,
+        Some(ContainerEnding {
+            reason: ContainerEndReason::OwnerEnded,
+            remove_volumes: true,
+        })
+    );
+}
+
+#[test]
+fn old_records_remain_readable_and_unknown_new_owners_are_refused() {
+    let fixture = Fixture::new();
+    let barge = &fixture.barge;
+    declare(barge, &[("effigy", 2)]);
+    let checkout = fixture.temp.folder("legacy").unwrap();
+    let held = lease(barge, &request("legacy", &checkout));
+    let path = barge
+        .state_dir()
+        .join("container-leases")
+        .join(format!("{}.json", held.id()));
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("checkout_location");
+    fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::remove_dir(&checkout).unwrap();
+    assert_eq!(
+        barge.container_status().unwrap()[0].ended.unwrap().reason,
+        ContainerEndReason::OwnerEnded
+    );
+    let missing = fixture.home.join("missing-parent").join("checkout");
+    assert_eq!(
+        barge
+            .container_lease(&request("unknown", &missing))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Refused
+    );
+}
