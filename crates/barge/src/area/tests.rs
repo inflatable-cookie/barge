@@ -855,6 +855,8 @@ fn a_hold_lands_only_after_failed_attempts_while_a_spawn_lets_go_of_the_lock() {
     // attempt before its lock is tried. The first two attempts run while the
     // child still holds its copy. The third releases the child and waits until
     // its exec has closed that copy, so only the third attempt can land.
+    // try_hold counts its attempts rather than timing them, so this sequence
+    // does not depend on how long the test thread is descheduled.
     let attempts = Rc::new(Cell::new(0));
     let release = Rc::new(RefCell::new(Some((go, spawned_rx))));
     for attempt in (1..=3).rev() {

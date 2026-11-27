@@ -41,9 +41,10 @@ pub(crate) const LOCKS_DIR: &str = "locks";
 pub(crate) const PINS_DIR: &str = "pins";
 pub(crate) const ACTIVITY_DIR: &str = "activity";
 const AREA_LOCK: &str = "area.lock";
-/// How long a non-waiting hold keeps retrying a refusal that may be transient,
-/// and the pause between those attempts.
-const HOLD_RETRY_WINDOW: Duration = Duration::from_millis(200);
+/// How many attempts a non-waiting hold makes at a refusal that may be transient,
+/// and the pause between them. The count is what bounds the retry, not a clock:
+/// a scheduler delay stretches the wait but never cuts the attempts short.
+const HOLD_ATTEMPTS: u32 = 100;
 const HOLD_RETRY_STEP: Duration = Duration::from_millis(2);
 
 /// Where an area's roots live right now.
@@ -495,26 +496,26 @@ impl Area {
     /// A refusal can be transient. A listing probes a lock exclusively for a
     /// moment, and a child that another thread of this process spawns keeps a
     /// copy of every descriptor open at its fork until it execs. So a refusal is
-    /// retried for at most `HOLD_RETRY_WINDOW`. The hold lands if contention
-    /// clears inside that window, including a return that releases early. A
-    /// holder still present when the window ends gets `None`. The caller waits
-    /// only milliseconds and does not wait for a return to finish. Callers
-    /// recheck lease state under the hold they get.
+    /// retried up to `HOLD_ATTEMPTS` times, `HOLD_RETRY_STEP` apart, which is
+    /// about 200 ms on an idle machine. The hold lands if contention clears
+    /// within those attempts, including a return that releases early. A holder
+    /// still present after the last attempt gets `None`. The caller waits only
+    /// that long and does not wait for a return to finish. Callers recheck lease
+    /// state under the hold they get.
     pub fn try_hold(&self, id: &str, mode: Mode) -> Result<Option<Hold>> {
         self.core.ensure_writable()?;
-        let deadline = Instant::now() + HOLD_RETRY_WINDOW;
-        loop {
+        for attempt in 1..=HOLD_ATTEMPTS {
             let root = self.resolve(id)?;
             let directory = self.hold_directory(&root)?;
             let lock_path = hold::hold_lock_path(&directory, &root.id);
             if let Some(file) = hold::lock_root_try(&lock_path, mode)? {
                 return self.begin_hold(root, directory, file, mode).map(Some);
             }
-            if Instant::now() >= deadline {
-                return Ok(None);
+            if attempt < HOLD_ATTEMPTS {
+                std::thread::sleep(HOLD_RETRY_STEP);
             }
-            std::thread::sleep(HOLD_RETRY_STEP);
         }
+        Ok(None)
     }
 
     /// The directory a root's hold lock and activity records live in.
