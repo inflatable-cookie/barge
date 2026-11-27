@@ -153,9 +153,8 @@ impl Tree {
                 &directory,
                 name,
                 &path,
-                root_device,
+                (root_device, &same_device),
                 0,
-                &same_device,
                 false,
                 &mut removed,
             )?;
@@ -278,9 +277,8 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
             &directory,
             name,
             &path.join(name),
-            root_device,
+            (root_device, device),
             0,
-            device,
             true,
             &mut removed,
         )?;
@@ -298,9 +296,8 @@ fn remove_opened(tree: Tree, device: DeviceFn<'_>) -> Result<Removed> {
         &directory,
         marker,
         &path.join(marker),
-        root_device,
+        (root_device, device),
         0,
-        device,
         true,
         &mut removed,
     )? {
@@ -347,9 +344,8 @@ fn remove_contents(
             directory,
             &name,
             &path.join(&name),
-            root_device,
+            (root_device, device),
             depth,
-            device,
             repair,
             removed,
         )?;
@@ -361,12 +357,12 @@ fn remove_child(
     directory: &File,
     name: &OsStr,
     path: &Path,
-    root_device: u64,
+    boundary: (u64, DeviceFn<'_>),
     depth: usize,
-    device: DeviceFn<'_>,
     repair: bool,
     removed: &mut Removed,
 ) -> Result<bool> {
+    let (root_device, device) = boundary;
     let metadata = match stat_at(directory, name) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
@@ -385,9 +381,11 @@ fn remove_child(
         removed.skipped.push(path.to_path_buf());
         return Ok(false);
     }
+    let mut repaired = false;
     let opened = open_at(Some(directory), name).or_else(|source| {
         if repair && permission_error(&source) {
             if repair_unopened(directory, name, &metadata, root_device, path, device).is_ok() {
+                repaired = true;
                 open_at(Some(directory), name)
             } else {
                 Err(source)
@@ -399,7 +397,19 @@ fn remove_child(
     let nested = match opened {
         Ok(nested) => nested,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(source) => return Err(Error::io("cannot open", path, &source)),
+        Err(source) => {
+            if repaired
+                && stat_at(directory, name).is_ok_and(|current| {
+                    current.st_dev != metadata.st_dev
+                        || current.st_ino != metadata.st_ino
+                        || current.st_mode & libc::S_IFMT != libc::S_IFDIR
+                })
+            {
+                removed.skipped.push(path.to_path_buf());
+                return Ok(false);
+            }
+            return Err(Error::io("cannot open", path, &source));
+        }
     };
     // A name repaired before opening must still identify the same directory.
     let opened = nested
@@ -458,8 +468,10 @@ fn repair_opened(directory: &File, path: &Path) -> std::io::Result<()> {
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?,
     )?;
     let opened = directory.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
     if status.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || status.st_uid != unsafe { libc::geteuid() }
+        || status.st_uid != effective_uid
         || opened.dev() != status.st_dev as u64
         || opened.ino() != status.st_ino as u64
     {
@@ -538,7 +550,7 @@ fn repair_unopened(
         {
             return Err(std::io::Error::last_os_error());
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     {
@@ -892,7 +904,8 @@ mod tests {
             std::fs::write(root.join(name).join("file"), b"data").unwrap();
         }
         std::fs::create_dir(&outside).unwrap();
-        std::fs::set_permissions(outside.as_path(), std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(outside.as_path(), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
         symlink(&outside, root.join("link")).unwrap();
         std::fs::set_permissions(
             root.join("readonly/file"),
@@ -916,6 +929,28 @@ mod tests {
         assert!(result.unwrap().removed);
         assert!(!root.exists());
         assert_eq!(outside_mode, 0);
+    }
+
+    #[test]
+    fn entry_removal_does_not_repair_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::os::running_as_root() {
+            return;
+        }
+        let temp = crate::testing::TempDir::new("tree-entry-permissions").unwrap();
+        let root = temp.folder("root").unwrap();
+        let nested = root.join("readonly");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("file"), b"data").unwrap();
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = Tree::open(&root)
+            .unwrap()
+            .remove_entry(Path::new("readonly"));
+        let mode = std::fs::symlink_metadata(&nested).unwrap().mode() & 0o777;
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(mode, 0o555);
+        assert!(nested.join("file").exists());
     }
 
     #[test]
