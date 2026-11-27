@@ -90,11 +90,48 @@ below read `_name`, `_key` and `_state`.
 | `barge.worktree-prune/1` | `dry_run: bool`, `worktree_prune: [worktree-prune]` | worktree prune |
 | `barge.container-status/1` | `leases: [container-lease-status]` | container status |
 | `barge.container-return/1` | `id: string` | container return |
+| `barge.run-resolution/1` | `resolution: run-resolution` | run resolve |
 
 Survey items use `bytes: null` by default. The CLI measures non-system items
 only when `barge survey <volume> --bytes` is requested; that walks every
 non-system item and can take minutes on a large drive. System items always
 have `bytes: null`.
+
+## Run documents
+
+`barge run resolve` reads a bare request object from stdin. The fields are
+`platform`, `needs`, `source`, `command`, `env`, `budget`, `fallback` and
+`owner`.
+
+- `platform` is `{"exact":{"os":"linux","arch":"aarch64"}}`,
+  `{"os":"linux"}` or `"any"`.
+- `needs` can include `min_cores`, `min_memory_bytes`, `gpu`, and
+  `min_vram_bytes`. Omitted minimums and an omitted or false `gpu` add no
+  requirements. An omitted `needs` is equivalent to `{}`.
+- `source` has string fields `repo` (URL), `base` (commit), and `tree`
+  (expected tree ID). The optional `bundle` and `patch` are initiator-local
+  path strings.
+- `command` is an array of argument strings. `env` maps names to string
+  values and defaults to `{}`. `budget` is an object with integer `secs`
+  and `nanos`.
+- `fallback` is `"local_allowed"` or `"remote_only"`. `owner` has the
+  [container-owner shape](#shapes).
+
+The preview uses `kind: "local_native"`, `kind: "local_container"` with
+`profile`, or `kind: "denied"` with `reason`. Denial is a successful preview.
+Its reason has a `kind` of `"no_matching_platform"`, `"unmet_capability"`, or
+`"fallback_forbidden"`. The library's leased resolution can also report
+`"profile_full"` with `profile`, `max`, and `active`.
+
+Initiators store the [result record](../runs.md#result-record) as a bare object
+with `machine`, `platform` (an `os` and `arch` object), `repo`, `base`,
+`patch_digest`, `tree`, `toolchain`, `command`, `started_ms`, `finished_ms`,
+`waking_ms`, `outcome`, `log` (`digest` and `location`), and `area` (`id` and
+`bytes`). `patch_digest`, `toolchain`, `waking_ms`, and `area` are nullable.
+The outcome object has a `kind` of `"exited"` with `code`, `"signalled"`
+with `signal`, `"infrastructure"` with `stage` and `reason`, `"cancelled"`,
+or `"budget_expired"`. The infrastructure stage is `"waking"`, `"syncing"`,
+`"toolchain"`, or `"running"`.
 
 ## Error documents
 
@@ -165,6 +202,8 @@ or from standard input (`-`). Input that cannot be read is `usage`.
 | `container-lease-status` | `id: string`, `profile: string`, `project: string`, `owner: container-owner`, `class: string`, `ended: container-ending?` |
 | `container-owner` | `worktree?: string`, `checkout?: string` |
 | `container-ending` | `reason: string`, `remove_volumes: bool` |
+| `run-resolution` | `kind: string`, `profile?: string`, `reason?: run-denial` |
+| `run-denial` | `kind: string` |
 
 `doctor` and `init --check` can exit 1 while emitting their success document when they detect drift.
 

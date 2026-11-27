@@ -14,7 +14,9 @@
 
 mod support;
 
+use std::fs::{self, File};
 use std::path::PathBuf;
+use std::process::Output;
 
 use support::{
     parse_document, register_machine, stderr, stdout, stub_daemon_routes, Contract, Fixture,
@@ -52,6 +54,79 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(fixture.mount.join("caches/cargo/registry")).unwrap();
     std::fs::create_dir_all(fixture.mount.join("archives")).unwrap();
     fixture
+}
+
+fn preview_run(fixture: &Fixture, input: &str) -> Output {
+    let path = fixture.temp.child("run-request.json");
+    fs::write(&path, input).unwrap();
+    fixture
+        .barge(&["run", "resolve", "--json"])
+        .stdin(File::open(path).unwrap())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn run_resolve_previews_native_container_and_denied_without_writing_state() {
+    let fixture = Fixture::new();
+    let mut request = json!({
+        "platform": "any",
+        "source": {"repo": "https://example.test/project.git", "base": "base", "tree": "tree"},
+        "command": ["not-run"],
+        "budget": {"secs": 30, "nanos": 0},
+        "fallback": "local_allowed",
+        "owner": {"checkout": fixture.home}
+    });
+    let check = |request: &Value, expected| {
+        let output = preview_run(&fixture, &request.to_string());
+        assert!(output.status.success(), "{}", stderr(&output));
+        let document = parse_document(&output);
+        assert_eq!(document["schema"], "barge.run-resolution/1");
+        assert_eq!(document["data"]["resolution"], expected);
+    };
+    check(&request, json!({ "kind": "local_native" }));
+
+    let os = if cfg!(target_os = "linux") {
+        "macos"
+    } else {
+        "linux"
+    };
+    request["platform"] = json!({ "os": os });
+    fs::write(
+        fixture.state.join("run-targets.json"),
+        json!({"local_container": [{"profile": "preview", "platforms": [format!("{os}-any")]}]})
+            .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.state.join("container-profiles.json"),
+        r#"{"profiles":[{"name":"preview","max":0}]}"#,
+    )
+    .unwrap();
+    check(
+        &request,
+        json!({ "kind": "local_container", "profile": "preview" }),
+    );
+
+    request["fallback"] = json!("remote_only");
+    check(
+        &request,
+        json!({ "kind": "denied", "reason": {"kind": "fallback_forbidden"} }),
+    );
+    assert!(!fixture.state.join("areas").exists());
+    assert!(!fixture.state.join("lock").exists());
+    assert!(!fixture.state.join("container-leases").exists());
+}
+
+#[test]
+fn run_resolve_rejects_malformed_stdin_as_usage() {
+    let fixture = Fixture::new();
+    let output = preview_run(&fixture, "not JSON");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["schema"], "barge.error/1");
+    assert_eq!(error["error"]["kind"], "usage");
 }
 
 #[test]

@@ -10,6 +10,24 @@ use crate::error::{Error, Result};
 
 use super::canonical_uuid;
 
+/// Total physical memory in bytes.
+pub(super) fn memory_bytes() -> Option<u64> {
+    let mut bytes = 0_u64;
+    let mut len = size_of::<u64>();
+    // SAFETY: the name is NUL-terminated, the output has room for len bytes,
+    // and a null new value makes this a read.
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut bytes).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && len == size_of::<u64>()).then_some(bytes)
+}
+
 /// The volume UUID that owns `mount`.
 ///
 /// `Ok(None)` means the fact could not be read: the path is absent, or the

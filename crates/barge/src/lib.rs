@@ -1,7 +1,7 @@
 //! Barge's storage library: every mechanic, no argv.
 //!
-//! Volume identity and free space are the only platform-specific facts; they sit
-//! behind [`os::Os`], which tests replace with a fake. State lives in small files
+//! Volume identity and free space sit behind [`os::Os`], which tests replace
+//! with a fake. State lives in small files
 //! under the account state directory, written under one lock and published by
 //! atomic rename. There is no daemon, no journal and no process scanning:
 //! cooperative `flock` holds and pins protect a root, eviction renames a root into
@@ -26,6 +26,7 @@ pub mod move_plan;
 pub mod os;
 pub mod pin;
 pub mod root;
+pub mod run;
 pub mod scratch;
 pub mod space;
 pub mod state;

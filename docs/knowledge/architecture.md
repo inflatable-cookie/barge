@@ -148,6 +148,8 @@ record can be repaired from the authoritative account copy with
 `repair_volume_layout` after an interrupted write. Survey marks macOS system
 entries separately, so doctor does not treat them as unknown.
 
+The [`run` module](runs.md) resolves platform requests and defines the shared
+execution record.
 
 The names below are indicative; the implementation may adjust them where the
 code reads better, as long as the behaviour holds.
@@ -326,6 +328,7 @@ Kept data (VMs, archives) is simply unavailable while its volume is away.
 - `scratch new | scratch sweep`;
 - `worktree lease | lease get | return | run | status | prune` ([worktrees](worktrees.md#on-disk-and-cli));
 - `container status | return <id>` ([containers](containers.md#cli));
+- `run resolve [--json]` ([runs](runs.md));
 - `status`;
 - `layout show | layout set`;
 - `path <class> [--project p]`; `env [--shell zsh|bash|fish]`;
