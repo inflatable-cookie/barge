@@ -169,7 +169,11 @@ sudo sed -i "s/USER/$USER/" /etc/polkit-1/rules.d/50-barged-power.rules
 
 The rule grants `org.freedesktop.login1.suspend`, `…reboot` and `…power-off` to
 every process running as that account, not just `barged`, and leaves every
-other action alone. The daemon never runs a shell command.
+other action alone. The daemon never runs a shell command; opt-in remote runs
+([machines](knowledge/machines.md#remote-runs)) execute explicit argv directly
+as that unprivileged user inside Barge areas on a registered volume. If you
+enable `runs.enabled` for Rust repositories, install user `rustup` in
+`~/.cargo/bin` so `rust-toolchain.toml` is honoured automatically.
 
 ## 6. Register and pair the machine on the Mac
 

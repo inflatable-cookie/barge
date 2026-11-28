@@ -13,9 +13,11 @@ name = "barged"
 path = "src/main.rs"
 
 [dependencies]
+barge = { workspace = true }
 barge-machine = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 httparse.workspace = true
 libc.workspace = true
 

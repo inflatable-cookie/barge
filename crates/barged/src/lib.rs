@@ -1,15 +1,16 @@
-//! `barged`: the machine daemon. It answers `barge machine status` and performs
-//! sleep, restart and shutdown for allowlisted tailnet nodes or paired LAN
-//! clients.
+//! `barged`: the machine daemon. It answers `barge machine status`, performs
+//! sleep, restart and shutdown, and (when `runs.enabled` is configured) runs
+//! platform commands in Barge build areas for allowlisted tailnet nodes or
+//! paired LAN clients.
 //!
 //! Six pieces sit behind seams so tests never need real OS services:
 //! [`PeerLookup`] resolves Tailscale callers, [`PowerBackend`] runs logind
 //! actions on Linux, [`Clock`] supplies time and deadlines, [`NetworkLookup`]
 //! reads interface MAC and broadcast, [`MdnsAdvertiser`] registers
 //! `_barged._tcp` with Avahi on Linux, and [`PairingNotifier`] sends desktop
-//! notifications with Approve/Deny actions. Nothing here runs a shell command,
-//! and [`PowerActionKind`] is the whole set of things the daemon can be asked
-//! to do.
+//! notifications with Approve/Deny actions. Remote runs execute explicit argv
+//! directly (never a shell) as `barged`'s own unprivileged user inside Barge
+//! areas on a registered volume.
 
 use std::fmt;
 
@@ -20,11 +21,15 @@ pub mod notify;
 pub mod pairing;
 pub mod peer;
 pub mod power;
+pub mod runs;
 pub mod server;
 pub mod state;
 pub mod tailnet;
 
-pub use config::{AuthMode, Config, Serving, TailnetListen, TailscaleConfig};
+pub use config::{
+    AuthMode, Config, RunsConfig, Serving, TailnetListen, TailscaleConfig,
+    DEFAULT_RUN_LOG_RETENTION_S,
+};
 #[cfg(target_os = "linux")]
 pub use mdns::AvahiAdvertiser;
 #[cfg(not(target_os = "linux"))]
@@ -45,6 +50,8 @@ pub use power::Logind;
 #[cfg(not(target_os = "linux"))]
 pub use power::Unavailable;
 pub use power::{logind_method, Clock, PowerBackend, PowerController, RequestError, SystemClock};
+pub use runs::exec::HostEnv;
+pub use runs::{RunError, RunManager};
 pub use server::Daemon;
 pub use state::{ClientRecord, DaemonState, LEGACY_CLIENT_ID};
 pub use tailnet::{TailnetSelf, TailnetStatus, TailscaleStatus, Timing};

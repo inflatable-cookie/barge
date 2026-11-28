@@ -2,6 +2,7 @@
 #![deny(missing_docs)]
 
 pub mod auth;
+pub mod base64;
 pub mod daemon;
 pub mod discover;
 pub mod link;
@@ -24,7 +25,9 @@ pub use protocol::{
     Cancel, CancelResult, ClientList, ClientRevoked, DaemonError, PairApproved, PairDecision,
     PairDenied, PairRequest, PairResponse, PairStatus, PairStatusResponse, PairedClient, Pending,
     PendingPairList, PendingPairRequest, PowerActionKind, PowerRequest, PowerResult, PowerState,
-    State,
+    RunCancelRequest, RunCancelResponse, RunFinishResponse, RunHaveRequest, RunHaveResponse,
+    RunLogResponse, RunOutputStream, RunStartRequest, RunStartResponse, RunStreamEvent,
+    RunStreamEventKind, RunUploadRequest, RunUploadResponse, State,
 };
 pub use registry::{sanitize_machine_name, ClientCredentials, Machine, Path, Registry};
 #[cfg(not(unix))]
@@ -63,6 +66,28 @@ pub const PAIR_DENIED_SCHEMA: &str = "barge.pair-denied/1";
 pub const CLIENTS_SCHEMA: &str = "barge.clients/1";
 /// The schema of `barged`'s response to `DELETE /v1/clients/<id>`.
 pub const CLIENT_REVOKED_SCHEMA: &str = "barge.client-revoked/1";
+/// The schema of a `POST /v1/runs/have` request.
+pub const RUN_HAVE_REQUEST_SCHEMA: &str = "barge.run-have-request/1";
+/// The schema of `barged`'s response to `POST /v1/runs/have`.
+pub const RUN_HAVE_RESPONSE_SCHEMA: &str = "barge.run-have-response/1";
+/// The schema of a `POST /v1/runs/upload` request.
+pub const RUN_UPLOAD_REQUEST_SCHEMA: &str = "barge.run-upload-request/1";
+/// The schema of `barged`'s response to `POST /v1/runs/upload`.
+pub const RUN_UPLOAD_RESPONSE_SCHEMA: &str = "barge.run-upload-response/1";
+/// The schema of a `POST /v1/runs/start` request.
+pub const RUN_START_REQUEST_SCHEMA: &str = "barge.run-start-request/1";
+/// The schema of `barged`'s response to `POST /v1/runs/start`.
+pub const RUN_START_RESPONSE_SCHEMA: &str = "barge.run-start-response/1";
+/// The schema of one event line on `GET /v1/runs/<id>/stream`.
+pub const RUN_STREAM_EVENT_SCHEMA: &str = "barge.run-stream-event/1";
+/// The schema of a `POST /v1/runs/<id>/cancel` request.
+pub const RUN_CANCEL_REQUEST_SCHEMA: &str = "barge.run-cancel-request/1";
+/// The schema of `barged`'s response to `POST /v1/runs/<id>/cancel`.
+pub const RUN_CANCEL_RESPONSE_SCHEMA: &str = "barge.run-cancel-response/1";
+/// The schema of `barged`'s response to `GET /v1/runs/<id>/result`.
+pub const RUN_FINISH_RESPONSE_SCHEMA: &str = "barge.run-finish/1";
+/// The schema of `barged`'s response to `GET /v1/runs/logs/<id>`.
+pub const RUN_LOG_RESPONSE_SCHEMA: &str = "barge.run-log/1";
 /// The schema of the error document every `barged` refusal carries.
 pub const DAEMON_ERROR_SCHEMA: &str = "barge.daemon-error/1";
 pub(crate) const DEFAULT_BROADCAST: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
@@ -486,6 +511,121 @@ mod tests {
         assert_eq!(serde_json::to_value(cancel).unwrap(), docs[4]);
         assert_eq!(serde_json::to_value(cancelled).unwrap(), docs[5]);
         assert_eq!(serde_json::to_value(error).unwrap(), docs[6]);
+    }
+
+    #[test]
+    fn run_protocol_documents_round_trip_with_schema() {
+        use barge::run::{AreaUse, LogRef, Platform, RunOutcome, RunOwner, RunResult, RunStage};
+        use std::collections::BTreeMap;
+
+        let have_req =
+            RunHaveRequest::new("https://example.invalid/repo.git", vec!["a".repeat(40)]);
+        let have_res =
+            RunHaveResponse::new("https://example.invalid/repo.git", vec!["a".repeat(40)]);
+        let upload_req = RunUploadRequest::new(
+            "run-1",
+            "https://example.invalid/repo.git",
+            Some(base64::encode(b"bundle-bytes")),
+            Some(base64::encode(b"patch-bytes")),
+        );
+        let upload_res = RunUploadResponse::new(
+            "run-1",
+            "https://example.invalid/repo.git",
+            true,
+            Some("sha256:abcd".to_string()),
+        );
+        let mut env = BTreeMap::new();
+        env.insert("RUST_BACKTRACE".to_string(), "1".to_string());
+        let start_req = RunStartRequest::new(
+            "run-1",
+            "https://example.invalid/repo.git",
+            "a".repeat(40),
+            "b".repeat(40),
+            vec!["cargo".to_string(), "test".to_string()],
+            env,
+            60_000,
+            2,
+            RunOwner::Worktree("wt-123".to_string()),
+        );
+        let start_res = RunStartResponse::new("run-1");
+        let run_result = RunResult {
+            machine: "bazzite".to_string(),
+            platform: Platform {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+            },
+            repo: "https://example.invalid/repo.git".to_string(),
+            base: "a".repeat(40),
+            patch_digest: Some("sha256:abcd".to_string()),
+            tree: "b".repeat(40),
+            toolchain: Some("rustc 1.100.0".to_string()),
+            command: vec!["cargo".to_string(), "test".to_string()],
+            started_ms: 1_000,
+            finished_ms: 2_500,
+            waking_ms: None,
+            outcome: RunOutcome::Exited { code: 0 },
+            log: LogRef {
+                digest: "sha256:1234".to_string(),
+                location: "/v1/runs/logs/run-1".to_string(),
+            },
+            area: Some(AreaUse {
+                id: "slot-0123456789abcdef-2".to_string(),
+                bytes: 4096,
+            }),
+        };
+        let stage_ev = RunStreamEvent::new(
+            1,
+            1_000,
+            RunStreamEventKind::Stage {
+                stage: RunStage::Syncing,
+            },
+        );
+        let out_ev = RunStreamEvent::new(
+            2,
+            1_100,
+            RunStreamEventKind::Output {
+                stream: RunOutputStream::Stdout,
+                data_base64: base64::encode(b"ok\n"),
+            },
+        );
+        let fin_ev = RunStreamEvent::new(
+            3,
+            2_500,
+            RunStreamEventKind::Finished {
+                result: Box::new(run_result.clone()),
+            },
+        );
+        let cancel_req = RunCancelRequest::default();
+        let cancel_res = RunCancelResponse::new("run-1", true);
+        let finish_res = RunFinishResponse::new("run-1", run_result.clone());
+        let log_res = RunLogResponse::new(run_result.log.clone(), base64::encode(b"full log\n"));
+
+        fn round_trip<T>(value: &T, expected_schema: &str)
+        where
+            T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            let json = serde_json::to_value(value).unwrap();
+            assert_eq!(
+                json.get("schema").and_then(|s| s.as_str()),
+                Some(expected_schema)
+            );
+            let decoded: T = serde_json::from_value(json).unwrap();
+            assert_eq!(&decoded, value);
+        }
+
+        round_trip(&have_req, RUN_HAVE_REQUEST_SCHEMA);
+        round_trip(&have_res, RUN_HAVE_RESPONSE_SCHEMA);
+        round_trip(&upload_req, RUN_UPLOAD_REQUEST_SCHEMA);
+        round_trip(&upload_res, RUN_UPLOAD_RESPONSE_SCHEMA);
+        round_trip(&start_req, RUN_START_REQUEST_SCHEMA);
+        round_trip(&start_res, RUN_START_RESPONSE_SCHEMA);
+        round_trip(&stage_ev, RUN_STREAM_EVENT_SCHEMA);
+        round_trip(&out_ev, RUN_STREAM_EVENT_SCHEMA);
+        round_trip(&fin_ev, RUN_STREAM_EVENT_SCHEMA);
+        round_trip(&cancel_req, RUN_CANCEL_REQUEST_SCHEMA);
+        round_trip(&cancel_res, RUN_CANCEL_RESPONSE_SCHEMA);
+        round_trip(&finish_res, RUN_FINISH_RESPONSE_SCHEMA);
+        round_trip(&log_res, RUN_LOG_RESPONSE_SCHEMA);
     }
 
     #[test]
