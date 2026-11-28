@@ -237,6 +237,24 @@ pub fn canonical_uuid(text: &str) -> Result<String> {
     Ok(trimmed.to_ascii_uppercase())
 }
 
+/// Normalise a stored volume identity, including a Linux btrfs subvolume ID.
+pub(crate) fn canonical_identity(text: &str) -> Result<String> {
+    let text = text.trim();
+    if let Some((uuid, suffix)) = text.split_once(':') {
+        let uuid = canonical_uuid(uuid)?;
+        let id = suffix
+            .get(..7)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("subvol="))
+            .and_then(|_| suffix.get(7..))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|id| *id > 0 && *id != 5)
+            .ok_or_else(|| Error::usage(format!("invalid volume identity {text:?}")))?;
+        Ok(format!("{uuid}:subvol={id}"))
+    } else {
+        canonical_uuid(text)
+    }
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)] // The two `statvfs` calls below carry their own SAFETY notes.
 fn free_space(path: &Path) -> Result<u64> {
@@ -397,6 +415,20 @@ mod tests {
     fn free_space_is_available_on_a_temporary_directory() {
         let temp = crate::testing::TempDir::new("free-space").unwrap();
         assert!(super::free_space(temp.path()).is_ok());
+    }
+
+    #[test]
+    fn subvolume_identity_is_canonical_and_validated() {
+        assert_eq!(
+            super::canonical_identity("abcdef01-2345-6789-abcd-ef0123456789:SUBVOL=257").unwrap(),
+            "ABCDEF01-2345-6789-ABCD-EF0123456789:subvol=257"
+        );
+        for suffix in ["subvol=5", "subvol=0", "subvol=abc", "subvol=257:extra"] {
+            assert!(super::canonical_identity(&format!(
+                "abcdef01-2345-6789-abcd-ef0123456789:{suffix}"
+            ))
+            .is_err());
+        }
     }
 
     #[test]
