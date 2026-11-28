@@ -82,6 +82,8 @@ below read `_name`, `_key` and `_state`.
 | `barge.machine-clients/1` | `machine_name: string`, `clients: [paired-client]` | machine clients |
 | `barge.machine-client-revoked/1` | `machine_name: string`, `client_id: string` | machine revoke |
 | `barge.machine-status/1` | `machine_name: string`, `mode: string`, `machine_state: machine-state` | machine status |
+| `barge.machine-held/1` | `machine_id: string`, `reason: string?` | machine hold |
+| `barge.machine-released/1` | `machine_id: string` | machine release |
 | `barge.machine-power/1` | `machine_name: string`, `action: string`, `deadline_unix_ms: int` | machine sleep, restart, shutdown |
 | `barge.machine-cancel/1` | `machine_name: string`, `cancelled: bool` | machine cancel |
 | `barge.worktree-lease/1` | `lease: worktree-lease` | worktree lease, worktree lease get |
@@ -91,6 +93,7 @@ below read `_name`, `_key` and `_state`.
 | `barge.container-status/1` | `leases: [container-lease-status]` | container status |
 | `barge.container-return/1` | `id: string` | container return |
 | `barge.run-resolution/1` | `resolution: run-resolution` | run resolve |
+| `barge.run-status/1` | `machine_leases: [machine-lease-status]`, `machine_holds: [machine-hold]` | run status |
 
 Survey items use `bytes: null` by default. The CLI measures non-system items
 only when `barge survey <volume> --bytes` is requested; that walks every
@@ -117,11 +120,17 @@ have `bytes: null`.
 - `fallback` is `"local_allowed"` or `"remote_only"`. `owner` has the
   [container-owner shape](#shapes).
 
-The preview uses `kind: "local_native"`, `kind: "local_container"` with
-`profile`, or `kind: "denied"` with `reason`. Denial is a successful preview.
-Its reason has a `kind` of `"no_matching_platform"`, `"unmet_capability"`, or
-`"fallback_forbidden"`. The library's leased resolution can also report
-`"profile_full"` with `profile`, `max`, and `active`.
+The preview uses `kind: "remote"` with `machine`, `kind: "local_native"`,
+`kind: "local_container"` with `profile`, or `kind: "denied"` with `reason`.
+Denial is a successful preview. Its reason has a `kind` of
+`"no_matching_platform"`, `"unmet_capability"`, `"fallback_forbidden"`,
+`"machines_full"` or `"machines_held"`. The library's leased resolution can
+also report `"profile_full"` with `profile`, `max`, and `active`.
+
+In run status, `slot` starts at zero. A lease's `ended` is `"owner_ended"`,
+`"hold_released"`, or null when an ending has not been established. A hold's
+`reason` is null when omitted. Machine identifiers match the strings in
+[`run-targets.json`](../runs.md#targets).
 
 Initiators store the [result record](../runs.md#result-record) as a bare object
 with `machine`, `platform` (an `os` and `arch` object), `repo`, `base`,
@@ -202,7 +211,9 @@ or from standard input (`-`). Input that cannot be read is `usage`.
 | `container-lease-status` | `id: string`, `profile: string`, `project: string`, `owner: container-owner`, `class: string`, `ended: container-ending?` |
 | `container-owner` | `worktree?: string`, `checkout?: string` |
 | `container-ending` | `reason: string`, `remove_volumes: bool` |
-| `run-resolution` | `kind: string`, `profile?: string`, `reason?: run-denial` |
+| `machine-lease-status` | `id: string`, `machine: string`, `slot: int`, `repo: string`, `owner: container-owner`, `ended: string?` |
+| `machine-hold` | `machine: string`, `reason: string?` |
+| `run-resolution` | `kind: string`, `machine?: string`, `profile?: string`, `reason?: run-denial` |
 | `run-denial` | `kind: string` |
 
 `doctor` and `init --check` can exit 1 while emitting their success document when they detect drift.

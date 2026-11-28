@@ -21,6 +21,7 @@ Remote menu-bar app ([vision](vision.md#direction)).
   covering machines and storage first ([app](app.md)).
 
 The storage library stays daemon-free: Oxide never depends on `barged` or the UI.
+See [Platform runs](runs.md#machine-leases) for machine leases and operator holds.
 
 ## Behaviour
 

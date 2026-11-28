@@ -83,6 +83,8 @@ usage: barge container return [--json] <id>
 usage: barge run <command>
 usage: barge run resolve [--json]
   run resolve                           preview placement for a JSON request on stdin
+usage: barge run status [--json]
+  run status                            show machine leases and operator holds
 usage: barge scratch <command>
   scratch new --volume V --project P --label L [--ttl SECONDS]
   scratch sweep --volume V [--project P]  delete expired idle scratch roots
@@ -95,6 +97,10 @@ usage: barge machine <command>
   machine pair <name> [--client-name N] | unpair <name>
   machine clients <name> | revoke <name> <client-id>
   machine status <name>                   what barged on that machine reports
+usage: barge machine hold [--json] <id> [--reason TEXT]
+  machine hold <id> [--reason TEXT]       stop new run leases on a machine
+usage: barge machine release [--json] <id>
+  machine release <id>                   allow new run leases on a machine
   machine sleep <name> [--delay SECONDS]  start the countdown at once
   machine restart <name> [--delay S] [--yes]
   machine shutdown <name> [--delay S] [--yes]
@@ -302,11 +308,14 @@ mod tests {
             &["container", "return", "ID"],
             &["run"],
             &["run", "resolve"],
+            &["run", "status"],
             &["scratch"],
             &["scratch", "new"],
             &["doctor"],
             &["machine"],
             &["machine", "status", "pc"],
+            &["machine", "hold", "pc", "--reason", "gaming"],
+            &["machine", "release", "pc"],
             &["layout"],
             &["layout", "show"],
             &["path", "caches"],
@@ -385,9 +394,18 @@ mod tests {
             ),
             (&["run"], "usage: barge run <command>"),
             (&["run", "resolve"], "usage: barge run resolve [--json]"),
+            (&["run", "status"], "usage: barge run status [--json]"),
             (&["scratch"], "usage: barge scratch <command>"),
             (&["doctor"], "usage: barge doctor [--json]"),
             (&["machine"], "usage: barge machine <command>"),
+            (
+                &["machine", "hold", "pc"],
+                "usage: barge machine hold [--json] <id> [--reason TEXT]",
+            ),
+            (
+                &["machine", "release", "pc"],
+                "usage: barge machine release [--json] <id>",
+            ),
             (&["layout"], "usage: barge layout <command>"),
             (
                 &["path"],

@@ -22,6 +22,7 @@ pub mod error;
 pub mod hold;
 pub mod known_links;
 pub mod layout;
+mod lease_owner;
 pub mod move_plan;
 pub mod os;
 pub mod pin;

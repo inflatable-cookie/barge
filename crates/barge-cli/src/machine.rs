@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use barge::{Error, ErrorKind, Result};
+use barge::{Barge, Error, ErrorKind, Result};
 use barge_machine::{
     backfill, follow_addresses, local_hostname, match_registered_with, parse_public_key,
     remember_path, sanitize_machine_name, AssumeYes, Confirmation, DaemonClient, DatagramSender,
@@ -15,7 +15,7 @@ use crate::args::{expect_no_positionals, Options};
 use crate::human;
 use crate::output::document;
 
-const VERBS: &str = "discover, add, list, remove, wake, pair, unpair, clients, revoke, status, sleep, restart, shutdown or cancel";
+const VERBS: &str = "discover, add, list, remove, wake, pair, unpair, clients, revoke, status, hold, release, sleep, restart, shutdown or cancel";
 const PAIR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_PAIR_TIMEOUT: Duration = Duration::from_secs(125);
 
@@ -101,6 +101,8 @@ fn machine_dispatch<S: DatagramSender, B: MdnsBrowser>(
         "clients" => clients(rest, json, env),
         "revoke" => revoke(rest, json, env),
         "status" => status(rest, json, env),
+        "hold" => hold(rest, json),
+        "release" => release(rest, json),
         "sleep" => machine_power(PowerActionKind::Sleep, rest, json, env),
         "restart" => machine_power(PowerActionKind::Restart, rest, json, env),
         "shutdown" => machine_power(PowerActionKind::Shutdown, rest, json, env),
@@ -109,6 +111,37 @@ fn machine_dispatch<S: DatagramSender, B: MdnsBrowser>(
             "unknown machine command {other:?}; use {VERBS}"
         ))),
     }
+}
+
+fn hold(rest: &[String], json: bool) -> Result<()> {
+    let options = Options::parse(rest, &["reason"], &[])?;
+    let machine = options.single("machine hold", "id")?;
+    let reason = options.get("reason");
+    Barge::open()?.machine_hold(&machine, reason.clone())?;
+    if json {
+        document(
+            "barge.machine-held/1",
+            vec![("machine_id", json!(machine)), ("reason", json!(reason))],
+        )?;
+    } else {
+        println!("held machine {machine} for new runs");
+    }
+    Ok(())
+}
+
+fn release(rest: &[String], json: bool) -> Result<()> {
+    let options = Options::parse(rest, &[], &[])?;
+    let machine = options.single("machine release", "id")?;
+    Barge::open()?.machine_release(&machine)?;
+    if json {
+        document(
+            "barge.machine-released/1",
+            vec![("machine_id", json!(machine))],
+        )?;
+    } else {
+        println!("released machine hold for {machine}");
+    }
+    Ok(())
 }
 
 fn discover_machines<S: DatagramSender, B: MdnsBrowser>(
