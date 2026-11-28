@@ -13,10 +13,16 @@ Remote menu-bar app ([vision](vision.md#direction)).
   [architecture](architecture.md#cli). Wake-on-LAN is a client operation and
   needs nothing running on the PC. JSON restart and shutdown requests require
   `--yes` rather than prompting.
-- **`barged` on the PC:** a small Rust daemon. It reports state and performs
-  power actions. On Linux it runs as a systemd user unit and asks logind over
-  D-Bus for sleep, restart and shutdown, with a polkit rule granting only those
-  actions. It never runs a shell command it was sent. It serves its LAN address and, when configured, its tailnet address at once: paired LAN clients on the LAN, and paired clients or allowlisted nodes on the tailnet. [Install guide](../install-barged.md).
+- **`barged` on the PC:** a small Rust daemon. It reports state, performs
+  power actions, and (when `runs.enabled` is configured) executes remote
+  platform runs inside Barge areas on a registered volume
+  ([remote runs](#remote-runs)). On Linux it runs as a systemd user unit and
+  asks logind over D-Bus for sleep, restart and shutdown, with a polkit rule
+  granting only those actions. It never runs a shell command; remote runs invoke
+  explicit argv directly as `barged`'s own unprivileged user. It serves its LAN
+  address and, when configured, its tailnet address at once: paired LAN clients
+  on the LAN, and paired clients or allowlisted nodes on the tailnet.
+  [Install guide](../install-barged.md).
 - **Barge app:** a menu-bar Tauri app built with Poodle and Longhorn,
   covering machines and storage first ([app](app.md)).
 
@@ -178,21 +184,75 @@ LAN address first with a connect timeout of 1.5 seconds, then the tailnet name.
   `allow_wildcard` and produces a warning.
 - Endpoints: `GET /v1/state` (`barge.machine-state/2`, reporting `machine_id`
   and the bound interface's `mac` and `broadcast` when known), `POST /v1/power`
-  (`{action, delay_s}`), `POST /v1/power/cancel`, plus the LAN pairing and
-  client endpoints (`POST /v1/pair`, `GET /v1/pair/<id>`, `GET /v1/pair/pending`,
+  (`{action, delay_s}`), `POST /v1/power/cancel`, the LAN pairing and client
+  endpoints (`POST /v1/pair`, `GET /v1/pair/<id>`, `GET /v1/pair/pending`,
   `POST /v1/pair/<id>/approve`, `POST /v1/pair/<id>/deny`, `GET /v1/clients`,
-  `DELETE /v1/clients/<id>`). Every response carries a `schema` field, under the
-  same contract as the CLI's JSON; a non-2xx response is a
-  `barge.daemon-error/1` document. State reports the action counting down and
-  its deadline when one is pending, and a second action is refused `409` until
-  that countdown fires or is cancelled. The daemon's default port is `9777`, and
-  a registered machine records its own `daemon_port`.
+  `DELETE /v1/clients/<id>`), and the opt-in remote-run endpoints
+  (`POST /v1/runs/have`, `POST /v1/runs/upload`, `POST /v1/runs/start`,
+  `GET /v1/runs/<id>/stream`, `POST /v1/runs/<id>/cancel`,
+  `GET /v1/runs/<id>/result`, `GET /v1/runs/logs/<id>`). Every response carries
+  a `schema` field, under the same contract as the CLI's JSON; a non-2xx
+  response is a `barge.daemon-error/1` document. State reports the action
+  counting down and its deadline when one is pending, and a second action is
+  refused `409` until that countdown fires or is cancelled. The daemon's default
+  port is `9777`, and a registered machine records its own `daemon_port`.
 - Power never names a method: a request carries one of sleep, restart or
   shutdown, and the daemon maps that closed set onto logind's `Suspend`,
   `Reboot` and `PowerOff`. Countdowns are bounded at one hour.
 - Wake-on-LAN goes out on the LAN broadcast. Waking over Tailscale from
   outside the LAN is out of scope until a relay exists, for example another
   always-on device.
+
+## Remote runs
+
+Tom's ruling (2026-11-27, decision `d-4225fcad`): `barged` may receive remote
+platform runs and execute commands it is sent, strictly within these limits:
+
+- **Callers:** only callers `barged` already trusts — signed paired clients, or
+  Tailscale `whois` on `allowed_nodes`, as for existing actions. Remote runs are
+  guarded by their own config block (`runs.enabled`, off by default) and return
+  `403 runs_disabled` when off.
+- **User:** only as `barged`'s own unprivileged user (`barged` is a systemd
+  *user* unit). Never use `sudo`, polkit or root.
+- **Command:** explicit `argv` only, with no shell.
+- **Environment:** only the explicit allowlist from the request, plus `HOME`,
+  `PATH` (with `~/.cargo/bin` prepended so `rustup` honours the repository's own
+  `rust-toolchain.toml`) and `USER`, and executor-managed build-area variables
+  (`CARGO_TARGET_DIR`, `TMPDIR`, `TMP`, `TEMP`). Nothing else is inherited, and
+  the request allowlist cannot override any executor-managed variable.
+- **Placement:** mirrors (`barged/mirrors`), build areas (`barged/builds`, keyed
+  by repo plus slot) and retained logs (`barged/logs`) live only in Barge areas
+  on the configured registered volume (`runs.volume`), so they count against the
+  volume's budget and never fall back to the internal drive.
+
+Each run flows through versioned JSON endpoints (`barge.run-have-request/1`,
+`barge.run-upload-request/1`, `barge.run-start-request/1`,
+`barge.run-stream-event/1`, `barge.run-cancel-request/1`, `barge.run-finish/1`,
+`barge.run-log/1`):
+
+1. `POST /v1/runs/have` checks which commits the repo's bare mirror already has.
+2. `POST /v1/runs/upload` ingests a base64-encoded git bundle into the bare
+   mirror and stages an optional binary patch for the request ID.
+3. `POST /v1/runs/start` enforces slot exclusivity (refusing a second concurrent
+   run on the same repo plus slot with `409 slot_busy`), holds the slot's build
+   area root exclusively, checks out `base`, applies any staged patch with
+   `git apply --index`, rejects submodules (`.gitmodules` or gitlink entries)
+   and Git LFS pointers as `Infrastructure` at `Syncing`, and verifies `HEAD`
+   plus `git write-tree` matches `expected_tree`.
+4. `GET /v1/runs/<id>/stream` streams stage changes (`Syncing`, `Toolchain`,
+   `Running`), live stdout/stderr chunks and the terminal `Finished` event as
+   chunked HTTP NDJSON on a dedicated connection thread so the main accept loop
+   stays responsive. Caller disconnect or `POST /v1/runs/<id>/cancel` signals
+   the run's own process group (`SIGTERM` then `SIGKILL`) and reports
+   `Cancelled`; exceeding `budget_ms` reports `BudgetExpired`.
+5. `GET /v1/runs/<id>/result` returns the final `RunResult`, and
+   `GET /v1/runs/logs/<id>` fetches the retained full log by `LogRef`. Logs are
+   retained for `runs.log_retention_s` (default 7 days) and pruned automatically.
+
+**Machine prerequisite:** repositories with `rust-toolchain.toml` or Rust
+commands require a user `rustup` install in `~/.cargo/bin`. Provisioning
+`rustup` itself is out of scope for `barged`; a missing `rustup` or toolchain
+installation failure is reported as `Infrastructure` at the `Toolchain` stage.
 
 ## Discovery and pairing
 

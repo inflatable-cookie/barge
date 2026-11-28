@@ -26,6 +26,8 @@ use crate::{Error, Result};
 
 /// Where tailscaled's local API socket lives on a Linux install.
 pub const DEFAULT_TAILSCALE_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
+/// Default retention period for completed remote-run logs (7 days).
+pub const DEFAULT_RUN_LOG_RETENTION_S: u64 = 7 * 24 * 60 * 60;
 
 /// `barged`'s config document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +63,43 @@ pub struct Config {
     /// The tailnet listener of the combined shape.
     #[serde(default)]
     pub tailscale: Option<TailscaleConfig>,
+    /// Remote platform run execution settings; disabled by default.
+    #[serde(default)]
+    pub runs: RunsConfig,
+}
+
+/// Configuration for remote platform runs (`runs` block in `config.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunsConfig {
+    /// Whether remote run endpoints are enabled. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Name of the registered Barge volume where mirrors, build areas and logs
+    /// live. Required when `enabled` is true.
+    #[serde(default)]
+    pub volume: Option<String>,
+    /// Optional override for Barge's account state directory.
+    #[serde(default)]
+    pub barge_state_dir: Option<PathBuf>,
+    /// How long to retain completed run logs, in seconds (default 7 days).
+    #[serde(default = "default_run_log_retention_s")]
+    pub log_retention_s: u64,
+}
+
+impl Default for RunsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            volume: None,
+            barge_state_dir: None,
+            log_retention_s: DEFAULT_RUN_LOG_RETENTION_S,
+        }
+    }
+}
+
+fn default_run_log_retention_s() -> u64 {
+    DEFAULT_RUN_LOG_RETENTION_S
 }
 
 /// The tailnet half of a combined config.
@@ -176,6 +215,17 @@ impl Config {
             if name.trim().is_empty() {
                 return Err(Error::new("name must not be empty"));
             }
+        }
+        if self.runs.enabled
+            && self
+                .runs
+                .volume
+                .as_deref()
+                .is_none_or(|volume| volume.trim().is_empty())
+        {
+            return Err(Error::new(
+                "runs.volume is required when runs.enabled is true",
+            ));
         }
         match &self.tailscale {
             Some(block) => self.validate_both(block),
@@ -431,6 +481,24 @@ mod tests {
             config.tailscale_socket,
             PathBuf::from(DEFAULT_TAILSCALE_SOCKET)
         );
+    }
+
+    #[test]
+    fn runs_is_disabled_by_default_and_requires_a_volume_when_enabled() {
+        let minimal_lan = br#"{"listen":"192.0.2.20:9777","mode":"lan"}"#;
+        let config = Config::parse(minimal_lan).unwrap();
+        assert!(!config.runs.enabled);
+        assert_eq!(config.runs.log_retention_s, DEFAULT_RUN_LOG_RETENTION_S);
+
+        let missing_volume =
+            br#"{"listen":"192.0.2.20:9777","mode":"lan","runs":{"enabled":true}}"#;
+        assert!(Config::parse(missing_volume).is_err());
+
+        let enabled = br#"{"listen":"192.0.2.20:9777","mode":"lan","runs":{"enabled":true,"volume":"Builds","log_retention_s":3600}}"#;
+        let config = Config::parse(enabled).unwrap();
+        assert!(config.runs.enabled);
+        assert_eq!(config.runs.volume.as_deref(), Some("Builds"));
+        assert_eq!(config.runs.log_retention_s, 3600);
     }
 
     #[test]

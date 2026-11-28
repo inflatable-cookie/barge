@@ -15,8 +15,10 @@ use std::time::{Duration, Instant};
 
 use barge_machine::{
     auth, Cancel, CancelResult, ClientList, ClientRevoked, DaemonError, PairApproved, PairDecision,
-    PairDenied, PairRequest, PairStatus, PowerRequest, PowerResult, PowerState, State,
-    CANCEL_SCHEMA, PAIR_DECISION_SCHEMA, PAIR_REQUEST_SCHEMA, POWER_REQUEST_SCHEMA,
+    PairDenied, PairRequest, PairStatus, PowerRequest, PowerResult, PowerState, RunCancelRequest,
+    RunHaveRequest, RunStartRequest, RunUploadRequest, State, CANCEL_SCHEMA, PAIR_DECISION_SCHEMA,
+    PAIR_REQUEST_SCHEMA, POWER_REQUEST_SCHEMA, RUN_CANCEL_REQUEST_SCHEMA, RUN_HAVE_REQUEST_SCHEMA,
+    RUN_START_REQUEST_SCHEMA, RUN_UPLOAD_REQUEST_SCHEMA,
 };
 
 use crate::config::{Serving, TailnetListen};
@@ -24,15 +26,21 @@ use crate::mdns::{MdnsAdvertiser, MdnsRegistration, ServiceAdvertisement};
 use crate::net::{NetworkLookup, SystemNetworkLookup};
 use crate::notify::{PairAction, PairNotification, PairingNotifier};
 use crate::pairing::{PairDecisionError, PairStartError, PairingStore};
+use crate::runs::{RunError, RunHandle, RunManager};
 use crate::state::{DaemonState, LEGACY_CLIENT_ID};
 use crate::tailnet::{TailnetSelf, TailnetSide, TailnetStatus, TailscaleStatus, Timing};
 use crate::{Allowlist, Clock, Config, Error, PeerLookup, PeerNode, PowerController, RequestError};
 
-/// The largest request body the daemon reads; the documents are a few lines.
+/// The largest request body the daemon reads for control endpoints.
 const MAX_BODY: u64 = 16 * 1024;
+/// The largest request body accepted on `POST /v1/runs/upload` (64 MiB).
+const MAX_UPLOAD_BODY: u64 = 64 * 1024 * 1024;
 /// How long a blocked accept waits before the stop flag is checked again.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
+const UPLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_POLL: Duration = Duration::from_millis(100);
+const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADERS: usize = 16 * 1024;
 
 /// Which listener a request came in on. Pairing and client management are a
@@ -63,6 +71,7 @@ pub struct Daemon {
     tailnet_listen: Option<TailnetListen>,
     tailnet: Option<Mutex<TailnetSide>>,
     nonces: Mutex<HashMap<String, u64>>,
+    runs: Arc<RunManager>,
 }
 
 impl fmt::Debug for Daemon {
@@ -73,6 +82,7 @@ impl fmt::Debug for Daemon {
             .field("allowlist", &self.allowlist)
             .field("serving", &self.serving)
             .field("pending", &self.controller.pending())
+            .field("runs_enabled", &self.runs.is_enabled())
             .finish_non_exhaustive()
     }
 }
@@ -80,6 +90,13 @@ impl fmt::Debug for Daemon {
 /// A refusal: the HTTP status and the error document to send.
 type Refusal = (u16, String);
 type Answer = std::result::Result<(u16, String), Refusal>;
+
+enum Handled {
+    Json(u16, String),
+    Stream(Arc<RunHandle>),
+}
+
+type RouteOutcome = std::result::Result<Handled, Refusal>;
 
 impl Daemon {
     pub fn new(
@@ -93,10 +110,16 @@ impl Daemon {
             config.key_path().as_deref(),
             clock.now_unix_ms(),
         )?;
+        let display_name = config.display_name();
+        let runs = Arc::new(RunManager::new(
+            &config.runs,
+            display_name.clone(),
+            Arc::clone(&clock),
+        ));
         let tailnet_listen = config.tailscale.as_ref().map(|block| block.listen);
         let mut daemon = Self {
             listen: config.listen,
-            display_name: config.display_name(),
+            display_name,
             controller,
             peers,
             allowlist: config.allowlist(),
@@ -110,6 +133,7 @@ impl Daemon {
             tailnet_listen,
             tailnet: None,
             nonces: Mutex::new(HashMap::new()),
+            runs,
         };
         daemon.tailnet = tailnet_listen.map(|listen| {
             Mutex::new(TailnetSide::new(
@@ -172,6 +196,13 @@ impl Daemon {
 
     pub fn with_advertiser(mut self, advertiser: Arc<dyn MdnsAdvertiser>) -> Self {
         self.advertiser = advertiser;
+        self
+    }
+
+    /// Replace the remote-run executor. Tests use this to inject a temporary
+    /// Barge account and host environment.
+    pub fn with_runs(mut self, runs: Arc<RunManager>) -> Self {
+        self.runs = runs;
         self
     }
 
@@ -338,15 +369,38 @@ impl Daemon {
             .and_then(|()| stream.set_write_timeout(Some(READ_TIMEOUT)))
             .map_err(|e| (400, failure("bad_request", e.to_string())))
             .and_then(|()| read_request(&mut stream))
-            .and_then(|request| self.route(&request, Some(peer), surface));
-        let (status, body) = result.unwrap_or_else(|refusal| refusal);
-        let response = format!("HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", reason(status), body.len());
-        if let Err(error) = stream.write_all(response.as_bytes()) {
-            eprintln!("barged: cannot answer the client: {error}");
+            .and_then(|request| self.dispatch(&request, Some(peer), surface));
+        match result {
+            Ok(Handled::Stream(run_handle)) => {
+                std::thread::spawn(move || stream_run_response(stream, run_handle));
+            }
+            Ok(Handled::Json(status, body)) | Err((status, body)) => {
+                let response = format!(
+                    "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    reason(status),
+                    body.len()
+                );
+                if let Err(error) = stream.write_all(response.as_bytes()) {
+                    eprintln!("barged: cannot answer the client: {error}");
+                }
+            }
         }
     }
 
+    #[cfg(test)]
     fn route(&self, request: &Request, peer: Option<SocketAddr>, surface: Surface) -> Answer {
+        match self.dispatch(request, peer, surface)? {
+            Handled::Json(status, body) => Ok((status, body)),
+            Handled::Stream(_) => Ok((200, String::new())),
+        }
+    }
+
+    fn dispatch(
+        &self,
+        request: &Request,
+        peer: Option<SocketAddr>,
+        surface: Surface,
+    ) -> RouteOutcome {
         let body = &request.body;
         let url = request.url.to_string();
         let path = url.split(['?', '#']).next().unwrap_or("").to_string();
@@ -355,7 +409,7 @@ impl Daemon {
         if path == "/v1/pair" {
             require_lan_surface(surface)?;
             return match method {
-                "POST" => self.pair_start(body),
+                "POST" => self.pair_start(body).map(|(s, b)| Handled::Json(s, b)),
                 _ => Err(method_not_allowed(path, method)),
             };
         }
@@ -364,7 +418,7 @@ impl Daemon {
             require_lan_surface(surface)?;
             self.authorize_lan_or_localhost(request, peer)?;
             return match method {
-                "GET" => self.pair_pending(),
+                "GET" => self.pair_pending().map(|(s, b)| Handled::Json(s, b)),
                 _ => Err(method_not_allowed(path, method)),
             };
         }
@@ -380,7 +434,9 @@ impl Daemon {
                 }
                 self.authorize_lan_or_localhost(request, peer)?;
                 return match method {
-                    "POST" => self.pair_approve(id, body),
+                    "POST" => self
+                        .pair_approve(id, body)
+                        .map(|(s, b)| Handled::Json(s, b)),
                     _ => Err(method_not_allowed(path, method)),
                 };
             }
@@ -393,13 +449,13 @@ impl Daemon {
                 }
                 self.authorize_lan_or_localhost(request, peer)?;
                 return match method {
-                    "POST" => self.pair_deny(id, body),
+                    "POST" => self.pair_deny(id, body).map(|(s, b)| Handled::Json(s, b)),
                     _ => Err(method_not_allowed(path, method)),
                 };
             }
             if valid_segment(rest) {
                 return match method {
-                    "GET" => self.pair_status(rest),
+                    "GET" => self.pair_status(rest).map(|(s, b)| Handled::Json(s, b)),
                     _ => Err(method_not_allowed(path, method)),
                 };
             }
@@ -410,7 +466,7 @@ impl Daemon {
         if path == "/v1/clients" {
             require_lan_surface(surface)?;
             return match method {
-                "GET" => self.list_clients(),
+                "GET" => self.list_clients().map(|(s, b)| Handled::Json(s, b)),
                 _ => Err(method_not_allowed(path, method)),
             };
         }
@@ -419,13 +475,19 @@ impl Daemon {
             if valid_segment(client_id) {
                 require_lan_surface(surface)?;
                 return match method {
-                    "DELETE" => self.revoke_client(client_id),
+                    "DELETE" => self
+                        .revoke_client(client_id)
+                        .map(|(s, b)| Handled::Json(s, b)),
                     _ => Err(method_not_allowed(path, method)),
                 };
             }
         }
 
-        match (method, path.as_str()) {
+        if let Some(outcome) = self.dispatch_runs(method, &path, body) {
+            return outcome;
+        }
+
+        let answer = match (method, path.as_str()) {
             ("GET", "/v1/state") => self.state_answer(),
             ("POST", "/v1/power") => self.power(body, &caller),
             ("POST", "/v1/power/cancel") => self.cancel(body),
@@ -436,7 +498,71 @@ impl Daemon {
                 404,
                 failure("not_found", format!("{other} is not an endpoint")),
             )),
+        }?;
+        Ok(Handled::Json(answer.0, answer.1))
+    }
+
+    fn dispatch_runs(&self, method: &str, path: &str, body: &str) -> Option<RouteOutcome> {
+        if path == "/v1/runs/have" {
+            return Some(match method {
+                "POST" => self.runs_have(body).map(|(s, b)| Handled::Json(s, b)),
+                _ => Err(method_not_allowed(path.to_string(), method)),
+            });
         }
+        if path == "/v1/runs/upload" {
+            return Some(match method {
+                "POST" => self.runs_upload(body).map(|(s, b)| Handled::Json(s, b)),
+                _ => Err(method_not_allowed(path.to_string(), method)),
+            });
+        }
+        if path == "/v1/runs/start" {
+            return Some(match method {
+                "POST" => self.runs_start(body).map(|(s, b)| Handled::Json(s, b)),
+                _ => Err(method_not_allowed(path.to_string(), method)),
+            });
+        }
+        if let Some(log_id) = path.strip_prefix("/v1/runs/logs/") {
+            if valid_segment(log_id) {
+                return Some(match method {
+                    "GET" => self
+                        .runs_fetch_log(log_id)
+                        .map(|(s, b)| Handled::Json(s, b)),
+                    _ => Err(method_not_allowed(path.to_string(), method)),
+                });
+            }
+            return None;
+        }
+        if let Some(rest) = path.strip_prefix("/v1/runs/") {
+            if let Some(id) = rest.strip_suffix("/stream") {
+                if valid_segment(id) {
+                    return Some(match method {
+                        "GET" => self
+                            .runs
+                            .stream_handle(id)
+                            .map(Handled::Stream)
+                            .map_err(run_refusal),
+                        _ => Err(method_not_allowed(path.to_string(), method)),
+                    });
+                }
+            }
+            if let Some(id) = rest.strip_suffix("/cancel") {
+                if valid_segment(id) {
+                    return Some(match method {
+                        "POST" => self.runs_cancel(id, body).map(|(s, b)| Handled::Json(s, b)),
+                        _ => Err(method_not_allowed(path.to_string(), method)),
+                    });
+                }
+            }
+            if let Some(id) = rest.strip_suffix("/result") {
+                if valid_segment(id) {
+                    return Some(match method {
+                        "GET" => self.runs_result(id).map(|(s, b)| Handled::Json(s, b)),
+                        _ => Err(method_not_allowed(path.to_string(), method)),
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Who may call, by the surface the request arrived on. On the LAN a
@@ -718,6 +844,54 @@ impl Daemon {
         Ok((200, encode(&ClientRevoked::new(client_id))?))
     }
 
+    fn runs_have(&self, body: &str) -> Answer {
+        let document: RunHaveRequest = self.document(body)?;
+        if document.schema != RUN_HAVE_REQUEST_SCHEMA {
+            return Err(schema_mismatch(RUN_HAVE_REQUEST_SCHEMA, &document.schema));
+        }
+        let response = self.runs.have(&document).map_err(run_refusal)?;
+        Ok((200, encode(&response)?))
+    }
+
+    fn runs_upload(&self, body: &str) -> Answer {
+        let document: RunUploadRequest = self.document(body)?;
+        if document.schema != RUN_UPLOAD_REQUEST_SCHEMA {
+            return Err(schema_mismatch(RUN_UPLOAD_REQUEST_SCHEMA, &document.schema));
+        }
+        let response = self.runs.upload(&document).map_err(run_refusal)?;
+        Ok((200, encode(&response)?))
+    }
+
+    fn runs_start(&self, body: &str) -> Answer {
+        let document: RunStartRequest = self.document(body)?;
+        if document.schema != RUN_START_REQUEST_SCHEMA {
+            return Err(schema_mismatch(RUN_START_REQUEST_SCHEMA, &document.schema));
+        }
+        let response = self.runs.start(document).map_err(run_refusal)?;
+        Ok((202, encode(&response)?))
+    }
+
+    fn runs_cancel(&self, request_id: &str, body: &str) -> Answer {
+        if !body.trim().is_empty() {
+            let document: RunCancelRequest = self.document(body)?;
+            if document.schema != RUN_CANCEL_REQUEST_SCHEMA {
+                return Err(schema_mismatch(RUN_CANCEL_REQUEST_SCHEMA, &document.schema));
+            }
+        }
+        let response = self.runs.cancel(request_id).map_err(run_refusal)?;
+        Ok((200, encode(&response)?))
+    }
+
+    fn runs_result(&self, request_id: &str) -> Answer {
+        let response = self.runs.result(request_id).map_err(run_refusal)?;
+        Ok((200, encode(&response)?))
+    }
+
+    fn runs_fetch_log(&self, request_id: &str) -> Answer {
+        let response = self.runs.fetch_log(request_id).map_err(run_refusal)?;
+        Ok((200, encode(&response)?))
+    }
+
     fn document<T: serde::de::DeserializeOwned>(
         &self,
         body: &str,
@@ -759,6 +933,63 @@ fn require_lan_surface(surface: Surface) -> std::result::Result<(), Refusal> {
 /// state this code cannot use, so a poisoned lock is read through.
 fn lock<T>(side: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     side.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn run_refusal(error: RunError) -> Refusal {
+    (error.status, failure(error.code, error.message))
+}
+
+fn stream_run_response(mut stream: TcpStream, handle: Arc<RunHandle>) {
+    let _ = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT));
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header.as_bytes()).is_err() {
+        handle.cancel();
+        return;
+    }
+
+    let mut cursor = 0usize;
+    loop {
+        let (events, finished) = handle.read_events_from(cursor, STREAM_POLL);
+        for event in events {
+            let Ok(mut line) = serde_json::to_string(&event) else {
+                handle.cancel();
+                return;
+            };
+            line.push('\n');
+            let chunk = format!("{:x}\r\n{line}\r\n", line.len());
+            if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
+                if !handle.is_finished() {
+                    handle.cancel();
+                }
+                return;
+            }
+            cursor += 1;
+        }
+        if finished {
+            let _ = stream.write_all(b"0\r\n\r\n");
+            let _ = stream.flush();
+            return;
+        }
+        if peer_disconnected(&stream) {
+            handle.cancel();
+            return;
+        }
+    }
+}
+
+fn peer_disconnected(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0_u8; 1];
+    let disconnected = match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(_) => true,
+    };
+    let _ = stream.set_nonblocking(false);
+    disconnected
 }
 
 fn decision_refusal(error: PairDecisionError) -> Refusal {
@@ -905,17 +1136,23 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, Refusal>
         Some((_, v)) => v.trim().parse::<usize>().map_err(|_| bad())?,
         None => 0,
     };
-    if length as u64 > MAX_BODY {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let (max_body, body_deadline) = if path == "/v1/runs/upload" {
+        (MAX_UPLOAD_BODY, Instant::now() + UPLOAD_READ_TIMEOUT)
+    } else {
+        (MAX_BODY, deadline)
+    };
+    if length as u64 > max_body {
         return Err((
             413,
             failure(
                 "too_large",
-                format!("the request body is larger than {MAX_BODY} bytes"),
+                format!("the request body is larger than {max_body} bytes"),
             ),
         ));
     }
     while bytes.len() - header_end < length {
-        let remaining = deadline
+        let remaining = body_deadline
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
             .ok_or_else(bad)?;
