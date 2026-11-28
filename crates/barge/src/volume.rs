@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::area::AreaStatus;
 use crate::error::{Error, Result};
-use crate::os::canonical_uuid;
+use crate::os::canonical_identity;
 use crate::state::validate_relative_path;
 use crate::{Barge, Core};
 
@@ -56,7 +56,7 @@ impl VolumeSpec {
     /// Validate every stored field before the record is used as truth.
     pub fn validate(&self) -> Result<()> {
         self.validate_common()?;
-        canonical_uuid(&self.uuid)?;
+        canonical_identity(&self.uuid)?;
         Ok(())
     }
 
@@ -64,7 +64,7 @@ impl VolumeSpec {
     fn validate_pending(&self) -> Result<()> {
         self.validate_common()?;
         if !self.uuid.is_empty() {
-            canonical_uuid(&self.uuid)?;
+            canonical_identity(&self.uuid)?;
         }
         Ok(())
     }
@@ -159,7 +159,7 @@ impl VolumeRegistration {
 
     pub(crate) fn into_spec(self) -> Result<VolumeSpec> {
         let uuid = match self.uuid {
-            Some(uuid) if !uuid.trim().is_empty() => canonical_uuid(&uuid)?,
+            Some(uuid) if !uuid.trim().is_empty() => canonical_identity(&uuid)?,
             _ => String::new(),
         };
         let spec = VolumeSpec {

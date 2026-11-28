@@ -829,6 +829,42 @@ fn registration_reads_and_checks_the_volume_identity() {
 }
 
 #[test]
+fn subvolume_identities_are_stored_and_compared() {
+    let fixture = Fixture::new();
+    let first = format!("{UUID}:subvol=257");
+    fixture.os.set_uuid(&fixture.mount, Some(&first));
+    let volume = fixture
+        .barge
+        .register_volume(
+            VolumeRegistration::new("Home", &fixture.mount).uuid(Some(first.to_ascii_uppercase())),
+        )
+        .unwrap();
+    assert_eq!(volume.spec().uuid, first);
+    assert_eq!(volume.state().unwrap(), barge::volume::VolumeState::Present);
+    let error = fixture
+        .barge
+        .register_volume(VolumeRegistration::new("Duplicate", &fixture.mount))
+        .unwrap_err();
+    assert!(error.message().contains("already registered"));
+    let other = fixture.temp.folder("other-subvolume").unwrap();
+    fixture
+        .os
+        .add_volume(other.clone(), Some(&format!("{UUID}:subvol=258")), TIB);
+    fixture
+        .barge
+        .register_volume(VolumeRegistration::new("Other", other))
+        .unwrap();
+    assert_eq!(fixture.barge.volume("Home").unwrap().spec().uuid, first);
+    fixture
+        .os
+        .set_uuid(&fixture.mount, Some(&format!("{UUID}:subvol=258")));
+    assert!(matches!(
+        volume.state().unwrap(),
+        barge::volume::VolumeState::Mismatch { .. }
+    ));
+}
+
+#[test]
 fn an_absent_volume_with_fail_refuses_new_roots() {
     let fixture = Fixture::new();
     fixture.register();

@@ -7,13 +7,13 @@ not change.
 
 ## Volume registration
 
-On Linux, register a filesystem mounted at its root, with a canonical UUID
-available through `/dev/disk/by-uuid`. Barge refuses subfolder bind mounts and
-mounts whose identity cannot be resolved. It also refuses btrfs subvolume mounts:
-mountinfo alone cannot distinguish one from a bind-mounted subfolder. For
-bazzite's `/var/home`, mount the filesystem root separately and register that
-mount instead; Barge does not configure mounts. Filesystems with noncanonical
-UUIDs, such as short FAT IDs, cannot currently be registered.
+On Linux, register a filesystem root or a btrfs subvolume mounted at its own
+mount point, with a canonical UUID available through `/dev/disk/by-uuid`.
+Btrfs subvolumes use the filesystem UUID and subvolume ID as their identity;
+the top-level subvolume uses the plain UUID. Subvolumes share the filesystem's
+free space. Bazzite's `/var/home` can be registered directly. Barge refuses
+subfolder bind mounts and mounts whose identity cannot be resolved. Filesystems
+with noncanonical UUIDs, such as short FAT IDs, cannot currently be registered.
 
 ## The problem
 
