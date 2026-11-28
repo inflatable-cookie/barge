@@ -771,6 +771,7 @@ fn usage_and_passive_commands_do_not_create_state() {
         vec!["status"],
         vec!["machine", "discover", "--timeout", "0"],
         vec!["machine", "status", "missing"],
+        vec!["run", "status"],
         vec!["volume", "list"],
         vec!["volume", "status", "missing"],
         vec!["root", "list", "missing/area"],

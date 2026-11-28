@@ -109,6 +109,84 @@ fn check_run_resolution_documents() {
     assert!(!fixture.state.join("areas").exists());
     assert!(!fixture.state.join("lock").exists());
     assert!(!fixture.state.join("container-leases").exists());
+
+    check_remote_run_documents(&fixture, &request, os, &check);
+}
+
+fn check_remote_run_documents(
+    fixture: &Fixture,
+    request: &Value,
+    os: &str,
+    check: &dyn Fn(&Value, Value),
+) {
+    use std::sync::Arc;
+
+    use barge::run::{Resolution, RunRequest};
+    use barge::{Barge, FakeOs, ManualClock};
+
+    fs::write(
+        fixture.state.join("run-targets.json"),
+        json!({"remote": [{"machine":"build-pc","platform":format!("{os}-x86_64"),"max":1}]})
+            .to_string(),
+    )
+    .unwrap();
+    check(request, json!({"kind":"remote","machine":"build-pc"}));
+    assert!(!fixture.state.join("machine-leases.json").exists());
+    let status = || parse_document(&fixture.json(&["run", "status"]));
+    assert_eq!(
+        status(),
+        json!({"schema":"barge.run-status/1","data":{"machine_leases":[],"machine_holds":[]}})
+    );
+    assert!(!fixture.state.join("lock").exists());
+
+    let barge = Barge::open_with(
+        &fixture.state,
+        Arc::new(FakeOs::new()),
+        Arc::new(ManualClock::new(0)),
+    )
+    .unwrap();
+    let requested: RunRequest = serde_json::from_value(request.clone()).unwrap();
+    let resolution = barge.run_resolve(&requested, None, &mut |_| {}).unwrap();
+    let Resolution::Remote { lease } = resolution else {
+        panic!("expected a machine lease, got {resolution:?}");
+    };
+    check(
+        request,
+        json!({"kind":"denied","reason":{"kind":"machines_full"}}),
+    );
+    let held =
+        parse_document(&fixture.json(&["machine", "hold", "build-pc", "--reason", "gaming"]));
+    assert_eq!(
+        held,
+        json!({"schema":"barge.machine-held/1","data":{"machine_id":"build-pc","reason":"gaming"}})
+    );
+    check(
+        request,
+        json!({"kind":"denied","reason":{"kind":"machines_held"}}),
+    );
+    let active = status();
+    assert_eq!(
+        active["data"]["machine_leases"],
+        json!([{
+            "id":lease.id(),"machine":"build-pc","slot":0,"repo":requested.source.repo,
+            "owner":request["owner"],"ended":null
+        }])
+    );
+    assert_eq!(
+        active["data"]["machine_holds"],
+        json!([{"machine":"build-pc","reason":"gaming"}])
+    );
+    drop(lease);
+    assert_eq!(
+        status()["data"]["machine_leases"][0]["ended"],
+        "hold_released"
+    );
+    let released = parse_document(&fixture.json(&["machine", "release", "build-pc"]));
+    assert_eq!(
+        released,
+        json!({"schema":"barge.machine-released/1","data":{"machine_id":"build-pc"}})
+    );
+    assert_eq!(status()["data"]["machine_holds"], json!([]));
 }
 
 #[test]

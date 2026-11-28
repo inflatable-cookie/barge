@@ -1,6 +1,8 @@
-//! Platform requests, local placement and execution evidence. The initiator
+//! Platform requests, placement and execution evidence. The initiator
 //! executes a local resolution and records its result.
 
+mod machine_state;
+mod machines;
 mod targets;
 mod wait;
 
@@ -15,7 +17,14 @@ use crate::container::{
 };
 use crate::{os, root, Barge, Result};
 
+use self::machine_state::Unavailable;
+use self::targets::Targets;
+use self::wait::{Queue, Waiter};
+
 pub use crate::container::ContainerOwner as RunOwner;
+pub use machines::{
+    MachineEndReason, MachineHold, MachineLease, MachineLeaseStatus, MachineStatus,
+};
 
 /// A request for a platform and its minimum capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,14 +127,15 @@ pub enum Fallback {
     RemoteOnly,
 }
 
-/// The result of an attempted resolution. A container lease holds a worker
-/// slot. The initiator stops the stack and returns the reservation.
+/// The result of an attempted resolution. A container or machine lease
+/// reserves a slot. The initiator returns it once the work has stopped.
 #[derive(Debug)]
 #[must_use]
 #[non_exhaustive]
 pub enum Resolution {
     LocalNative,
     LocalContainer { lease: ContainerLease },
+    Remote { lease: MachineLease },
     Denied { reason: DenyReason },
 }
 
@@ -135,6 +145,8 @@ pub enum DenyReason {
     NoMatchingPlatform,
     UnmetCapability,
     FallbackForbidden,
+    MachinesFull,
+    MachinesHeld,
     ProfileFull {
         profile: String,
         max: u32,
@@ -142,19 +154,26 @@ pub enum DenyReason {
     },
 }
 
-/// Read-only placement preview. A named profile carries no reservation or
-/// guarantee of worker capacity.
+/// Read-only placement preview. A named machine or profile carries no
+/// reservation or guarantee of worker capacity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunPreview {
     LocalNative,
     LocalContainer { profile: String },
+    Remote { machine: String },
     Denied { reason: DenyReason },
 }
 
-/// Advisory position among this process's waiting runs for a profile, starting
-/// at one. Other processes may compete for capacity independently.
+enum FallbackPlacement {
+    Native,
+    Container(String),
+    Denied(DenyReason),
+}
+
+/// Advisory position among this process's waiting runs for a machine or
+/// profile, starting at one. Other processes compete independently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Waiting {
     pub machine_or_profile: String,
@@ -212,18 +231,25 @@ pub struct AreaUse {
 }
 
 impl Barge {
-    /// Resolve a run and hold a worker lease if it needs a local container.
-    /// `None` returns immediately when full.
+    /// Resolve a run and hold a worker lease for a remote machine or local
+    /// container. `None` returns immediately when full.
     pub fn run_resolve(
         &self,
         request: &RunRequest,
         wait: Option<Duration>,
         progress: &mut dyn FnMut(Waiting),
     ) -> Result<Resolution> {
-        let profile = match self.run_preview(request)? {
-            RunPreview::LocalNative => return Ok(Resolution::LocalNative),
-            RunPreview::Denied { reason } => return Ok(Resolution::Denied { reason }),
-            RunPreview::LocalContainer { profile } => profile,
+        let mut targets = Targets::read(self.state_dir())?;
+        let (remote, waited) =
+            self.resolve_remote(request, &mut targets, wait.unwrap_or_default(), progress)?;
+        let unavailable = match remote {
+            Ok(lease) => return Ok(Resolution::Remote { lease }),
+            Err(unavailable) => unavailable,
+        };
+        let profile = match self.fallback_placement(request, &targets, unavailable)? {
+            FallbackPlacement::Native => return Ok(Resolution::LocalNative),
+            FallbackPlacement::Denied(reason) => return Ok(Resolution::Denied { reason }),
+            FallbackPlacement::Container(profile) => profile,
         };
         let lease_request = ContainerLeaseRequest {
             profile,
@@ -231,22 +257,17 @@ impl Barge {
             owner: request.owner.clone(),
             class: ContainerClass::Worker,
             hold: true,
-            wait,
+            wait: wait.map(|wait| wait.saturating_sub(waited)),
         };
         let mut waiter = None;
-        let mut last_position = 0;
         let outcome = self.container_lease_with_progress(&lease_request, &mut || {
-            let waiter = waiter.get_or_insert_with(|| {
-                wait::Waiter::join(self.state_dir(), &lease_request.profile)
-            });
-            let position = waiter.position();
-            if position != last_position {
-                last_position = position;
-                progress(Waiting {
-                    machine_or_profile: lease_request.profile.clone(),
-                    position,
-                });
-            }
+            Waiter::report(
+                &mut waiter,
+                self.state_dir(),
+                Queue::Profile,
+                &lease_request.profile,
+                progress,
+            );
         })?;
         Ok(match outcome {
             ContainerLeaseOutcome::Leased(lease) => Resolution::LocalContainer { lease },
@@ -267,28 +288,57 @@ impl Barge {
         })
     }
 
-    /// Select the target without taking a lease or inspecting the run's source.
+    /// Preview placement without taking a lease or opening the source files.
     pub fn run_preview(&self, request: &RunRequest) -> Result<RunPreview> {
+        let targets = Targets::read(self.state_dir())?;
+        let unavailable = match self.preview_remote(request, &targets)? {
+            Ok(machine) => {
+                return Ok(RunPreview::Remote {
+                    machine: machine.to_owned(),
+                })
+            }
+            Err(unavailable) => unavailable,
+        };
+        Ok(
+            match self.fallback_placement(request, &targets, unavailable)? {
+                FallbackPlacement::Native => RunPreview::LocalNative,
+                FallbackPlacement::Denied(reason) => RunPreview::Denied { reason },
+                FallbackPlacement::Container(profile) => RunPreview::LocalContainer { profile },
+            },
+        )
+    }
+
+    fn fallback_placement(
+        &self,
+        request: &RunRequest,
+        targets: &Targets,
+        unavailable: Unavailable,
+    ) -> Result<FallbackPlacement> {
+        let remote_denial = unavailable.denial().or_else(|| {
+            targets
+                .remote_platform_matches(&request.platform)
+                .then_some(DenyReason::UnmetCapability)
+        });
         if request.fallback == Fallback::RemoteOnly {
-            return Ok(RunPreview::Denied {
-                reason: DenyReason::FallbackForbidden,
-            });
+            return Ok(FallbackPlacement::Denied(
+                remote_denial.unwrap_or(DenyReason::FallbackForbidden),
+            ));
         }
         let host_matches = request
             .platform
             .matches_target(std::env::consts::OS, Some(std::env::consts::ARCH));
         if host_matches && request.needs.met_by_host() {
-            return Ok(RunPreview::LocalNative);
+            return Ok(FallbackPlacement::Native);
         }
-        let container = targets::profile(self.state_dir(), &request.platform)?;
+        let container = targets.profile(self.state_dir(), &request.platform)?;
         let reason = match container {
             Some(profile) if !request.needs.needs_gpu() => {
-                return Ok(RunPreview::LocalContainer { profile });
+                return Ok(FallbackPlacement::Container(profile));
             }
             Some(_) => DenyReason::UnmetCapability,
             None if host_matches => DenyReason::UnmetCapability,
             None => DenyReason::NoMatchingPlatform,
         };
-        Ok(RunPreview::Denied { reason })
+        Ok(FallbackPlacement::Denied(remote_denial.unwrap_or(reason)))
     }
 }
